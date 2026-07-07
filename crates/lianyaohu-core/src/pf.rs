@@ -76,6 +76,7 @@ pub struct PFGuard {
     enable_token: Option<String>,
     backend: Option<Backend>,
     installed: bool,
+    rules_path: Option<std::path::PathBuf>,
 }
 
 impl PFGuard {
@@ -85,6 +86,7 @@ impl PFGuard {
             enable_token: None,
             backend: None,
             installed: false,
+            rules_path: None,
         }
     }
 
@@ -106,6 +108,11 @@ impl PFGuard {
             self.rule_set.uid, self.rule_set.interface_name
         ));
         fs::write(&rules_path, self.rule_set.render())?;
+        self.rules_path = Some(rules_path.clone());
+
+        // Validate the ruleset before touching PF's enable state, mirroring the
+        // helper path, so a malformed ruleset can't leave PF toggled on.
+        run_sudo_pf(&["-n", "-f", &rules_path.to_string_lossy()])?;
 
         let enable_output = run_sudo_pf(&["-E"])?;
         let token = parse_enable_token(&enable_output);
@@ -118,6 +125,8 @@ impl PFGuard {
             if let Some(token) = &token {
                 let _ = run_sudo_pf(&["-X", token]);
             }
+            let _ = fs::remove_file(&rules_path);
+            self.rules_path = None;
             return Err(error);
         }
 
@@ -143,6 +152,10 @@ impl PFGuard {
                 }
             }
             None => {}
+        }
+
+        if let Some(rules_path) = self.rules_path.take() {
+            let _ = fs::remove_file(rules_path);
         }
 
         self.installed = false;

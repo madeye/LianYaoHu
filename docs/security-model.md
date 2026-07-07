@@ -56,6 +56,26 @@ running.
 
 Raw, route, and system sockets are not allowed by the process sandbox profile.
 
+### DNS resolution
+
+The sandbox profile lets the agent reach the system resolver over the
+mDNSResponder unix socket, so name lookups are performed by **mDNSResponder**,
+not by the agent process. Because the PF rules match the agent's UID, they do
+not apply to mDNSResponder: its DNS queries follow the system's routing table
+rather than being steered by the agent's `route-to` rule.
+
+In the default configuration this is not a leak — the launcher refuses to start
+unless the selected `utun` is already the default IPv4 route, so mDNSResponder's
+queries traverse the same `utun`. The confinement of DNS therefore depends on
+that default-route invariant:
+
+- With `--allow-non-default-route`, the agent's own connections are still pinned
+  to the `utun` by `route-to`, but its DNS lookups can leave over the real
+  default interface. Do not use that flag when DNS metadata must stay inside the
+  tunnel.
+- If the system default route changes while the agent runs, DNS can leave the
+  tunnel even though the agent's sockets remain pinned.
+
 ## Known Limits
 
 LianYaoHu does not use Apple's App Sandbox entitlement because that would compose
