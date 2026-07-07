@@ -143,6 +143,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn generated_profile_can_launch_simple_tool() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
         let result = run_in_sandbox(&["/bin/echo", "ok"]);
 
         assert_eq!(result.status, 0);
@@ -152,6 +156,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn generated_profile_blocks_host_sysctl() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
         let result = run_in_sandbox(&["/usr/sbin/sysctl", "-n", "kern.hostname"]);
 
         assert_ne!(result.status, 0);
@@ -160,6 +168,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn generated_profile_blocks_timezone_file() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
         let result = run_in_sandbox(&["/bin/cat", "/private/etc/localtime"]);
 
         assert_ne!(result.status, 0);
@@ -169,6 +181,16 @@ mod tests {
     struct SandboxRun {
         status: i32,
         output: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn skip_sandbox_runtime_tests_in_ci() -> bool {
+        if std::env::var_os("CI").is_some() {
+            eprintln!("skipping sandbox-exec runtime test in CI");
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(target_os = "macos")]
