@@ -15,21 +15,25 @@ By default it:
 
 - prompts for a VPN `utun` interface at startup;
 - requires the default IPv4 route to use the selected `utun`;
-- runs the agent through `sandbox-exec` with read/write access to `$HOME`,
-  `$PWD`, and an isolated temporary directory;
+- asks the root helper to run the agent as the caller's UID with the dedicated
+  `_lianyaohu` effective GID, then applies `sandbox-exec`;
 - removes host-identifying environment variables and sets `TZ=UTC`;
+- exposes the caller's `$HOME` as read-only, while `--cwd` and a per-launch
+  temporary directory are writable;
 - denies raw/system sockets, socket ioctls, inbound sockets, socket binding,
   and broad `sysctl` reads in the process sandbox;
-- installs a temporary PF anchor under `com.apple/lianyaohu-$uid` to block LAN
-  destinations, route IPv4 TCP/UDP to the selected point-to-point `utun` peer,
-  and block non-`utun` TCP/UDP egress for the current user while the agent
-  runs.
+- installs a temporary PF anchor under `com.apple/lianyaohu-$uid` to match the
+  `_lianyaohu` group, block LAN destinations, route IPv4 TCP/UDP to the
+  selected point-to-point `utun` peer, and block non-`utun` TCP/UDP egress for
+  only that sandboxed agent tree.
 
 ## Root helper
 
-PF enforcement requires root. LianYaoHu first tries a root LaunchDaemon
-helper at `/var/run/lianyaohu-helper.sock`; if it is not installed, it falls
-back to `sudo pfctl`.
+PF enforcement and dedicated-group isolation require root. LianYaoHu uses a
+root LaunchDaemon helper at `/var/run/lianyaohu-helper.sock` to create/validate
+the hidden `_lianyaohu` group, install group-scoped PF rules, drop the child to
+`uid=caller_uid,gid=_lianyaohu` while keeping the caller's normal supplementary
+groups, and launch `sandbox-exec` with the caller's stdio.
 
 Install the helper once:
 
@@ -43,9 +47,14 @@ Remove it:
 scripts/uninstall-helper.sh
 ```
 
-The helper authenticates requests with `getpeereid`, generates PF rules for
-the peer UID, validates that the requested interface is an active `utun`, and
-only supports `install`, `uninstall`, and `status` operations.
+The helper authenticates requests with `getpeereid`, validates that the
+requested interface is an active `utun`, and supports the default session run
+path plus `install`, `uninstall`, and `status` for the current-UID fallback.
+
+Because the child keeps the caller's UID, normal owner-based access to `$HOME`,
+the working tree, keychain, and TCC state behaves like the desktop user. The
+sandbox profile still does not grant write access to `$HOME` except for the
+selected working directory when it lives under `$HOME`.
 
 ## Options
 
@@ -58,6 +67,7 @@ options:
   --cwd PATH                  Working directory exposed to the agent.
   --env NAME=VALUE            Add an environment variable unless it is privacy-blocked.
   --no-pf                     Do not install the PF guard. Intended for tests and debugging.
+  --shared-user-pf            Use current-UID PF rules instead of helper-managed group isolation.
   --allow-non-default-route   Do not require the system default route to use the selected utun.
   --helper-status             Query the root PF helper status for this user.
   --print-profile             Print the generated sandbox-exec profile and exit.
@@ -73,6 +83,7 @@ For inspection without applying PF:
 cargo run -p lianyaohu -- --vpn utun5 --print-profile
 cargo run -p lianyaohu -- --vpn utun5 --print-pf
 cargo run -p lianyaohu -- --vpn utun5 --no-pf -- claude
+cargo run -p lianyaohu -- --vpn utun5 --shared-user-pf -- claude
 ```
 
 ## Validation

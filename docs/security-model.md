@@ -8,17 +8,25 @@ LianYaoHu is intentionally CLI/TUI-only. It uses two macOS mechanisms:
 
 ## Filesystem
 
-The agent can read and write:
+The agent can read the caller's home directory. Write access is limited to:
 
-- the user's home directory;
 - the selected working directory;
 - a per-launch temporary directory.
+
+If the selected working directory is inside `$HOME`, that directory is the only
+intentional writable exception under the otherwise read-only home tree.
 
 Platform, developer tool, and Homebrew paths are read-only so shells,
 interpreters, git, node, and installed code-agent CLIs can start.
 
 Timezone preference files are explicitly denied and the launched environment
 sets `TZ=UTC`.
+
+By default the helper runs the sandboxed process with the caller's UID and the
+dedicated `_lianyaohu` effective GID. The sandbox profile describes where the
+process is allowed to go, but normal POSIX ownership still applies: owner-based
+access remains the caller's access, and supplementary groups keep ordinary
+group-based project access intact.
 
 ## Environment
 
@@ -32,11 +40,13 @@ timezone, Wi-Fi, BSSID, serial, or local-IP markers.
 The launcher asks the user to choose a `utun` interface and rejects startup
 unless that interface is up, has an address, and is the default IPv4 route.
 
-When PF enforcement is enabled, the launcher asks the root helper to install
-rules. If the helper is unavailable, it falls back to `sudo pfctl`. The root
-helper listens on `/var/run/lianyaohu-helper.sock`, authenticates the caller with
-`getpeereid`, generates rules for the peer UID, and validates that the requested
-interface is an active `utun`.
+When PF enforcement is enabled, the launcher asks the root helper to run the
+session. The root helper listens on `/var/run/lianyaohu-helper.sock`,
+authenticates the caller with `getpeereid`, creates or validates the hidden
+`_lianyaohu` group, installs PF rules matching that group, drops the child to
+`uid=caller_uid,gid=_lianyaohu`, and validates that the requested interface is
+an active `utun`. The helper replaces the inherited LaunchDaemon supplementary
+group list with the caller's normal groups before the drop.
 
 The installed PF rules:
 
@@ -45,14 +55,16 @@ The installed PF rules:
   unique-local/link-local/multicast ranges;
 - route IPv4 TCP/UDP opened on non-`utun` interfaces to the selected `utun`
   when the interface exposes a point-to-point IPv4 peer;
-- block TCP/UDP owned by the current UID on every interface except the selected
-  `utun`;
-- allow TCP/UDP owned by the current UID on the selected `utun`.
+- block TCP/UDP owned by the `_lianyaohu` effective GID on every interface
+  except the selected `utun`;
+- allow TCP/UDP owned by the `_lianyaohu` effective GID on the selected `utun`.
 
-The PF rules are UID-scoped because macOS PF cannot match a child process tree
-directly. If the agent runs as the same user as the desktop session, the network
-guard also affects other TCP/UDP sockets opened by that user while the agent is
-running.
+The default PF rules are group-scoped because macOS PF cannot match a child
+process tree directly. The helper-run path avoids affecting desktop-user
+traffic by moving only the sandboxed child tree to the `_lianyaohu` effective
+GID before it opens sockets. With `--shared-user-pf`, LianYaoHu uses the older
+current-UID PF path; in that mode, the network guard also affects other TCP/UDP
+sockets opened by the desktop user while the agent is running.
 
 Raw, route, and system sockets are not allowed by the process sandbox profile.
 
@@ -60,9 +72,9 @@ Raw, route, and system sockets are not allowed by the process sandbox profile.
 
 The sandbox profile lets the agent reach the system resolver over the
 mDNSResponder unix socket, so name lookups are performed by **mDNSResponder**,
-not by the agent process. Because the PF rules match the agent's UID, they do
-not apply to mDNSResponder: its DNS queries follow the system's routing table
-rather than being steered by the agent's `route-to` rule.
+not by the agent process. Because the PF rules match the agent's group, they
+do not apply to mDNSResponder: its DNS queries follow the system's routing
+table rather than being steered by the agent's `route-to` rule.
 
 In the default configuration this is not a leak — the launcher refuses to start
 unless the selected `utun` is already the default IPv4 route, so mDNSResponder's

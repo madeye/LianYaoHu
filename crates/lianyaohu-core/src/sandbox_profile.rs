@@ -54,7 +54,8 @@ impl SandboxProfile {
 
 (allow sysctl-read
     (sysctl-name "security.mac.lockdown_mode_state")
-    (sysctl-name "kern.bootargs"))
+    (sysctl-name "kern.bootargs")
+    (sysctl-name "kern.ngroups"))
 
 (allow file-read* file-map-executable
     (subpath "/Applications")
@@ -67,8 +68,10 @@ impl SandboxProfile {
     (subpath "/sbin")
     (subpath "/usr"))
 
+(allow file-read* file-map-executable
+    (subpath "{home}"))
+
 (allow file-read* file-write* file-map-executable
-    (subpath "{home}")
     (subpath "{cwd}")
     (subpath "{tmpdir}"))
 
@@ -103,17 +106,29 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn profile_allows_home_and_cwd_but_denies_host_identity_surfaces() {
+    fn profile_allows_home_read_only_and_cwd_writable_but_denies_identity_surfaces() {
         let profile =
             SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
 
-        assert!(profile.contains(r#"(subpath "/Users/example")"#));
-        assert!(profile.contains(r#"(subpath "/Users/example/project")"#));
+        assert!(profile.contains(
+            r#"(allow file-read* file-map-executable
+    (subpath "/Users/example"))"#
+        ));
+        assert!(!profile.contains(
+            r#"(allow file-read* file-write* file-map-executable
+    (subpath "/Users/example"))"#
+        ));
+        assert!(profile.contains(
+            r#"(allow file-read* file-write* file-map-executable
+    (subpath "/Users/example/project")
+    (subpath "/tmp/lyh"))"#
+        ));
         assert!(profile.contains("(deny system-socket)"));
         assert!(profile.contains("(deny socket-ioctl)"));
         assert!(profile.contains("(deny network-inbound)"));
         assert!(profile.contains("(deny network-bind)"));
         assert!(profile.contains(r#"(sysctl-name "security.mac.lockdown_mode_state")"#));
+        assert!(profile.contains(r#"(sysctl-name "kern.ngroups")"#));
         assert!(profile.contains("/private/etc/localtime"));
         assert!(profile.contains("/private/var/db/timezone"));
         assert!(profile.contains(r#"(remote tcp "*:*")"#));

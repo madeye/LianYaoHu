@@ -1,7 +1,8 @@
 use lianyaohu_core::env_policy;
 use lianyaohu_core::helper::PFHelperClient;
 use lianyaohu_core::interfaces::{NetworkInterface, utun_interfaces, validate_utun};
-use lianyaohu_core::pf::{PFGuard, PFRuleSet};
+use lianyaohu_core::launch::LaunchSpec;
+use lianyaohu_core::pf::{LIANYAOHU_GROUP_GID, PFGuard, PFRuleSet};
 use lianyaohu_core::route;
 use lianyaohu_core::sandbox_profile::SandboxProfile;
 use lianyaohu_core::{Result, err};
@@ -19,6 +20,7 @@ struct Options {
     vpn_interface: Option<String>,
     command: Vec<String>,
     enforce_pf: bool,
+    helper_group_launch: bool,
     require_default_route: bool,
     print_profile: bool,
     print_pf: bool,
@@ -33,6 +35,7 @@ impl Default for Options {
             vpn_interface: None,
             command: Vec::new(),
             enforce_pf: true,
+            helper_group_launch: true,
             require_default_route: true,
             print_profile: false,
             print_pf: false,
@@ -84,11 +87,17 @@ fn run() -> Result<i32> {
     }
 
     let uid = unsafe { libc::getuid() };
-    let rule_set = PFRuleSet::new(
-        selected_interface.name.clone(),
-        uid,
-        selected_interface.ipv4_peer_addresses.first().cloned(),
-    );
+    let route_gateway = selected_interface.ipv4_peer_addresses.first().cloned();
+    let rule_set = if options.helper_group_launch {
+        PFRuleSet::new_group(
+            selected_interface.name.clone(),
+            uid,
+            LIANYAOHU_GROUP_GID,
+            route_gateway.clone(),
+        )
+    } else {
+        PFRuleSet::new_user(selected_interface.name.clone(), uid, route_gateway.clone())
+    };
     if options.print_pf {
         print!("{}", rule_set.render());
         return Ok(0);
@@ -114,6 +123,23 @@ fn run() -> Result<i32> {
         &options.extra_environment,
     );
 
+    let command = if options.command.is_empty() {
+        vec!["claude".to_string()]
+    } else {
+        options.command
+    };
+
+    if options.enforce_pf && options.helper_group_launch {
+        return launch_agent_with_session_group(
+            &selected_interface.name,
+            &command,
+            &cwd_string,
+            &tmpdir,
+            &profile,
+            &clean_env,
+        );
+    }
+
     let mut pf_guard = None;
     if options.enforce_pf {
         let mut guard = PFGuard::new(rule_set);
@@ -125,11 +151,6 @@ fn run() -> Result<i32> {
         );
     }
 
-    let command = if options.command.is_empty() {
-        vec!["claude".to_string()]
-    } else {
-        options.command
-    };
     let status = launch_agent(&command, &cwd, &tmpdir, &profile, &clean_env)?;
 
     if let Some(mut guard) = pf_guard {
@@ -179,6 +200,7 @@ fn parse(args: Vec<String>) -> Result<Options> {
                     .insert(name.to_string(), env_value.to_string());
             }
             "--no-pf" => options.enforce_pf = false,
+            "--shared-user-pf" => options.helper_group_launch = false,
             "--allow-non-default-route" => options.require_default_route = false,
             "--print-profile" => options.print_profile = true,
             "--print-pf" => options.print_pf = true,
@@ -273,6 +295,30 @@ fn launch_agent(
     Ok(status.code().unwrap_or(1))
 }
 
+fn launch_agent_with_session_group(
+    interface_name: &str,
+    command: &[String],
+    cwd: &str,
+    tmpdir: &PathBuf,
+    profile: &SandboxProfile,
+    clean_env: &BTreeMap<String, String>,
+) -> Result<i32> {
+    fs::create_dir_all(tmpdir)?;
+    let spec_path = tmpdir.join("launch.json");
+    let spec = LaunchSpec::new(command.to_vec(), cwd, clean_env.clone(), profile.render());
+    spec.write_json(&spec_path)?;
+
+    let result = PFHelperClient::default()
+        .run_session(interface_name, &spec_path)
+        .map_err(|error| {
+            err(format!(
+                "dedicated group isolation requires an updated lianyaohu-helper: {error}. Run scripts/install-helper.sh, or pass --shared-user-pf to use current-UID PF rules."
+            ))
+        });
+    let _ = fs::remove_file(&spec_path);
+    result
+}
+
 const USAGE: &str = r#"usage:
   lianyaohu [options] [-- agent [args...]]
 
@@ -281,6 +327,7 @@ options:
   --cwd PATH                  Working directory exposed to the agent. Defaults to current directory.
   --env NAME=VALUE            Add an environment variable unless it is privacy-blocked.
   --no-pf                     Do not install the PF guard. Intended for tests and debugging.
+  --shared-user-pf            Use current-UID PF rules instead of helper-managed group isolation.
   --allow-non-default-route   Do not require the system default route to use the selected utun.
   --helper-status             Query the root PF helper status for this user.
   --print-profile             Print the generated sandbox-exec profile and exit.

@@ -6,8 +6,8 @@ macOS guest — the acceptance check is `curl ipinfo.io` succeeding *inside*
 the sandbox while LAN egress is blocked.
 
 Verified on 2026-07-07 against a macOS 26.4 guest: helper transitioned
-not installed → installed → not installed, the PF anchor
-`com.apple/lianyaohu-$uid` held the expected rules only while the agent ran,
+not installed → active session anchor → not installed, the PF anchor
+`com.apple/lianyaohu-$uid` held group-scoped rules only while the agent ran,
 sandboxed `curl ipinfo.io` returned the tunnel exit's identity, and a
 sandboxed LAN `curl` never connected.
 
@@ -103,16 +103,20 @@ While the agent runs, from a second (detached) context:
 
 ```sh
 lianyaohu --helper-status                      # expect: installed
-sudo pfctl -a com.apple/lianyaohu-501 -sr      # expect the generated rules
+ANCHOR=$(sudo pfctl -a com.apple -s Anchors | awk '/com.apple\/lianyaohu-/ {print $1; exit}')
+test -n "$ANCHOR"
+sudo pfctl -a "$ANCHOR" -sr                    # expect the generated rules
 ```
 
-After the agent exits, both must revert (`not installed`, empty anchor).
+After the agent exits, `--helper-status` must report `not installed` and
+the temporary `com.apple/lianyaohu-*` anchor must be empty or absent.
 
 Pass criteria:
 
 1. Sandboxed `curl ipinfo.io` exits 0 and prints the ipinfo JSON.
-2. Helper status is `installed` only during the run; the PF anchor holds the
-   generated rules only during the run.
+2. Helper status is `installed` only during the run; a temporary
+   `com.apple/lianyaohu-*` PF anchor holds rules matching `group 2000000`, not
+   the caller's UID.
 3. The sandboxed LAN `curl` never connects.
 4. Server-side proof the flow used the tunnel: the `iptables` counters on the
    Ubuntu VM (`-t nat -L -v`) advance for the tunnel subnet.
@@ -155,13 +159,15 @@ your time if you don't know them:
   under the old default route; they can pin a specific destination to `en0`
   even after the `/1` routes exist (`route -n get <ip>` shows `IFSCOPE`
   `WASCLONED` on `en0`; delete with `route -n delete -host <ip>`). The PF
-  `block ... on ! utunN` rule still stops that traffic for the agent UID —
+  `block ... on ! utunN` rule still stops that traffic for the agent group —
   defense in depth working as designed.
 
-- **The PF guard can cut your own SSH session.** While installed it blocks
-  LAN TCP for the agent's UID, and the test user's SSH connection to the VM
-  is exactly that. Run the whole test as a `nohup`-detached script inside the
-  guest writing to a result file, and poll the file afterwards.
+- **`--shared-user-pf` can cut your own SSH session.** The current default
+  dedicated-group path does not match the desktop user's SSH sockets. If you
+  explicitly test the current-UID fallback, it blocks LAN TCP for the user's
+  UID, and the test user's SSH connection to the VM is exactly that. Run that
+  fallback test as a `nohup`-detached script inside the guest writing to a
+  result file, and poll the file afterwards.
 
 - **`block return` LAN denials surface as timeouts**, not instant RSTs, in
   this topology; the block is still effective (the connection never
