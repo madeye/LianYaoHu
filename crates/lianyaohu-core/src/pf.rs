@@ -4,31 +4,73 @@ use std::fs;
 use std::io;
 use std::process::Command;
 
+pub const LIANYAOHU_GROUP_NAME: &str = "_lianyaohu";
+pub const LIANYAOHU_GROUP_GID: u32 = 2_000_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PFRuleSet {
     pub interface_name: String,
-    pub uid: u32,
+    pub anchor_key: u32,
+    pub socket_owner: SocketOwner,
     pub route_ipv4_gateway: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketOwner {
+    User(u32),
+    Group(u32),
+}
+
+impl SocketOwner {
+    pub fn clause(self) -> String {
+        match self {
+            Self::User(uid) => format!("user {uid}"),
+            Self::Group(gid) => format!("group {gid}"),
+        }
+    }
+
+    pub fn description(self) -> String {
+        match self {
+            Self::User(uid) => format!("uid {uid}"),
+            Self::Group(gid) => format!("gid {gid}"),
+        }
+    }
+}
+
 impl PFRuleSet {
-    pub fn new(
+    pub fn new_user(
         interface_name: impl Into<String>,
         uid: u32,
         route_ipv4_gateway: Option<String>,
     ) -> Self {
         Self {
             interface_name: interface_name.into(),
-            uid,
+            anchor_key: uid,
+            socket_owner: SocketOwner::User(uid),
+            route_ipv4_gateway,
+        }
+    }
+
+    pub fn new_group(
+        interface_name: impl Into<String>,
+        anchor_uid: u32,
+        gid: u32,
+        route_ipv4_gateway: Option<String>,
+    ) -> Self {
+        Self {
+            interface_name: interface_name.into(),
+            anchor_key: anchor_uid,
+            socket_owner: SocketOwner::Group(gid),
             route_ipv4_gateway,
         }
     }
 
     pub fn anchor_name(&self) -> String {
-        format!("com.apple/lianyaohu-{}", self.uid)
+        format!("com.apple/lianyaohu-{}", self.anchor_key)
     }
 
     pub fn render(&self) -> String {
+        let owner = self.socket_owner.clause();
         let route_rule = self.route_ipv4_gateway.as_ref().map_or_else(
             || {
                 "# No IPv4 route-to rule: selected utun has no point-to-point IPv4 peer."
@@ -36,30 +78,31 @@ impl PFRuleSet {
             },
             |gateway| {
                 format!(
-                    "pass out quick on ! {} route-to ({} {}) inet proto {{ tcp udp }} from any to any user {} keep state",
-                    self.interface_name, self.interface_name, gateway, self.uid
+                    "pass out quick on ! {} route-to ({} {}) inet proto {{ tcp udp }} from any to any {} keep state",
+                    self.interface_name, self.interface_name, gateway, owner
                 )
             },
         );
 
         format!(
             r#"# LianYaoHu agent network guard.
-# Scope: TCP/UDP sockets owned by uid {uid}.
+# Scope: TCP/UDP sockets owned by {owner_description}.
 # Raw/route/system sockets are denied by the process sandbox profile.
 
 lianyaohu_lan4 = "{{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }}"
 lianyaohu_lan6 = "{{ ::/128, fe80::/10, fc00::/7, ff00::/8 }}"
 
-pass out quick on lo0 proto {{ tcp udp }} from any to any user {uid} keep state
+pass out quick on lo0 proto {{ tcp udp }} from any to any {owner} keep state
 
-block return out quick proto {{ tcp udp }} from any to $lianyaohu_lan4 user {uid}
-block return out quick inet6 proto {{ tcp udp }} from any to $lianyaohu_lan6 user {uid}
+block return out quick proto {{ tcp udp }} from any to $lianyaohu_lan4 {owner}
+block return out quick inet6 proto {{ tcp udp }} from any to $lianyaohu_lan6 {owner}
 
 {route_rule}
-block return out quick on ! {interface_name} proto {{ tcp udp }} from any to any user {uid}
-pass out quick on {interface_name} proto {{ tcp udp }} from any to any user {uid} keep state
+block return out quick on ! {interface_name} proto {{ tcp udp }} from any to any {owner}
+pass out quick on {interface_name} proto {{ tcp udp }} from any to any {owner} keep state
 "#,
-            uid = self.uid,
+            owner_description = self.socket_owner.description(),
+            owner = owner,
             interface_name = self.interface_name
         )
     }
@@ -105,7 +148,7 @@ impl PFGuard {
         fs::create_dir_all(&dir)?;
         let rules_path = dir.join(format!(
             "rules-{}-{}.pf",
-            self.rule_set.uid, self.rule_set.interface_name
+            self.rule_set.anchor_key, self.rule_set.interface_name
         ));
         fs::write(&rules_path, self.rule_set.render())?;
         self.rules_path = Some(rules_path.clone());
@@ -210,29 +253,41 @@ mod tests {
 
     #[test]
     fn generated_rules_block_lan_and_non_selected_interfaces() {
-        let rules = PFRuleSet::new("utun4", 501, Some("10.9.0.1".to_string())).render();
+        let rules =
+            PFRuleSet::new_group("utun4", 501, 2_000_000, Some("10.9.0.1".to_string())).render();
 
         assert!(rules.contains(
-            "pass out quick on lo0 proto { tcp udp } from any to any user 501 keep state"
+            "pass out quick on lo0 proto { tcp udp } from any to any group 2000000 keep state"
         ));
         assert!(rules.contains("10.0.0.0/8"));
         assert!(rules.contains("172.16.0.0/12"));
         assert!(rules.contains("192.168.0.0/16"));
         assert!(rules.contains("fc00::/7"));
-        assert!(rules.contains("to $lianyaohu_lan4 user 501"));
-        assert!(rules.contains("to $lianyaohu_lan6 user 501"));
-        assert!(rules.contains("pass out quick on ! utun4 route-to (utun4 10.9.0.1) inet proto { tcp udp } from any to any user 501 keep state"));
+        assert!(rules.contains("to $lianyaohu_lan4 group 2000000"));
+        assert!(rules.contains("to $lianyaohu_lan6 group 2000000"));
+        assert!(rules.contains("pass out quick on ! utun4 route-to (utun4 10.9.0.1) inet proto { tcp udp } from any to any group 2000000 keep state"));
         assert!(rules.contains(
-            "block return out quick on ! utun4 proto { tcp udp } from any to any user 501"
+            "block return out quick on ! utun4 proto { tcp udp } from any to any group 2000000"
         ));
         assert!(rules.contains(
-            "pass out quick on utun4 proto { tcp udp } from any to any user 501 keep state"
+            "pass out quick on utun4 proto { tcp udp } from any to any group 2000000 keep state"
         ));
     }
 
     #[test]
+    fn generated_rules_can_scope_to_user_for_fallback() {
+        let rules = PFRuleSet::new_user("utun4", 501, Some("10.9.0.1".to_string())).render();
+
+        assert!(rules.contains("# Scope: TCP/UDP sockets owned by uid 501."));
+        assert!(rules.contains(
+            "pass out quick on lo0 proto { tcp udp } from any to any user 501 keep state"
+        ));
+        assert!(rules.contains("to $lianyaohu_lan4 user 501"));
+    }
+
+    #[test]
     fn generated_rules_can_omit_route_to_when_no_peer_exists() {
-        let rules = PFRuleSet::new("utun4", 501, None).render();
+        let rules = PFRuleSet::new_group("utun4", 501, 2_000_000, None).render();
 
         assert!(rules.contains("No IPv4 route-to rule"));
         assert!(!rules.contains("route-to (utun4"));
