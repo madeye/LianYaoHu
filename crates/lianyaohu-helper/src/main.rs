@@ -5,11 +5,22 @@ use lianyaohu_core::{Result, err};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
+use std::time::Duration;
+
+/// A request is a single short line; refuse anything larger so a client
+/// cannot exhaust memory by streaming bytes without a newline.
+const MAX_REQUEST_BYTES: u64 = 256;
+
+/// Cap how long a single peer may take to send its request / receive its
+/// reply, so one stalled client cannot pin a worker forever.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
     if let Err(error) = HelperDaemon::default().run() {
@@ -18,13 +29,13 @@ fn main() {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct HelperDaemon {
-    enable_tokens: BTreeMap<u32, String>,
+    enable_tokens: Arc<Mutex<BTreeMap<u32, String>>>,
 }
 
 impl HelperDaemon {
-    fn run(&mut self) -> Result<()> {
+    fn run(&self) -> Result<()> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(err("lianyaohu-helper must run as root"));
         }
@@ -40,14 +51,22 @@ impl HelperDaemon {
 
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => self.handle(stream),
+                // Serve each connection on its own thread so a slow or stalled
+                // peer cannot block the others. PF state is shared behind a
+                // mutex; pfctl work is infrequent so contention is negligible.
+                Ok(stream) => {
+                    let daemon = self.clone();
+                    thread::spawn(move || daemon.handle(stream));
+                }
                 Err(error) => eprintln!("accept failed: {error}"),
             }
         }
         Ok(())
     }
 
-    fn handle(&mut self, mut stream: UnixStream) {
+    fn handle(&self, mut stream: UnixStream) {
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         let result = self.handle_inner(&mut stream);
         let response = match result {
             Ok(message) => format!("ok {message}\n"),
@@ -56,10 +75,10 @@ impl HelperDaemon {
         let _ = stream.write_all(response.as_bytes());
     }
 
-    fn handle_inner(&mut self, stream: &mut UnixStream) -> Result<String> {
+    fn handle_inner(&self, stream: &mut UnixStream) -> Result<String> {
         let uid = peer_uid(stream)?;
         let mut line = String::new();
-        BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+        BufReader::new(stream.try_clone()?.take(MAX_REQUEST_BYTES)).read_line(&mut line)?;
         match parse_request(&line)? {
             HelperRequest::Install { interface_name } => {
                 self.install(uid, &interface_name)?;
@@ -72,7 +91,7 @@ impl HelperDaemon {
                 Ok(format!("uninstalled PF guard for uid {uid}"))
             }
             HelperRequest::Status => {
-                if self.enable_tokens.contains_key(&uid) {
+                if self.tokens().contains_key(&uid) {
                     Ok("installed".to_string())
                 } else {
                     Ok("not installed".to_string())
@@ -81,7 +100,13 @@ impl HelperDaemon {
         }
     }
 
-    fn install(&mut self, uid: u32, interface_name: &str) -> Result<()> {
+    fn tokens(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, String>> {
+        self.enable_tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn install(&self, uid: u32, interface_name: &str) -> Result<()> {
         let selected = validated_utun(interface_name)?;
         let rule_set = PFRuleSet::new(
             selected.name,
@@ -91,8 +116,20 @@ impl HelperDaemon {
         let rules_path = write_rules(&rule_set)?;
 
         run_pf(&["-n", "-f", &rules_path.to_string_lossy()])?;
-        let enable_output = run_pf(&["-E"])?;
-        let token = parse_enable_token(&enable_output);
+
+        // Hold the lock across the pfctl calls: it serializes pfctl (which is
+        // not safe to run concurrently) and keeps the enable-token map in sync
+        // with PF's enable-reference count.
+        let mut tokens = self.tokens();
+
+        // Enable PF at most once per uid. A repeat install (relaunched agent,
+        // concurrent launch) must NOT call `pfctl -E` again, or it leaks an
+        // enable reference that uninstall never releases.
+        let token = if tokens.contains_key(&uid) {
+            None
+        } else {
+            parse_enable_token(&run_pf(&["-E"])?)
+        };
 
         if let Err(error) = run_pf(&[
             "-a",
@@ -100,6 +137,8 @@ impl HelperDaemon {
             "-f",
             &rules_path.to_string_lossy(),
         ]) {
+            // Only roll back an enable reference we just acquired; a reused
+            // reference belongs to the prior install and must survive.
             if let Some(token) = &token {
                 let _ = run_pf(&["-X", token]);
             }
@@ -107,15 +146,16 @@ impl HelperDaemon {
         }
 
         if let Some(token) = token {
-            self.enable_tokens.insert(uid, token);
+            tokens.insert(uid, token);
         }
         Ok(())
     }
 
-    fn uninstall(&mut self, uid: u32) {
+    fn uninstall(&self, uid: u32) {
         let rule_set = PFRuleSet::new("utun0", uid, None);
+        let mut tokens = self.tokens();
         let _ = run_pf(&["-a", &rule_set.anchor_name(), "-F", "rules"]);
-        if let Some(token) = self.enable_tokens.remove(&uid) {
+        if let Some(token) = tokens.remove(&uid) {
             let _ = run_pf(&["-X", &token]);
         }
     }
