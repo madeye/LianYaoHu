@@ -77,7 +77,7 @@ jobs:
         run: cargo test
 
       - name: Build release binaries
-        run: cargo build --release --locked -p lianyaohu -p lianyaohu-helper
+        run: cargo build --release --locked -p lianyaohu
 
       - name: Package release
         id: package

@@ -33,13 +33,11 @@ archive_path="$dist_path/${package_name}.tar.gz"
 rm -rf "$stage_path"
 mkdir -p "$stage_path/bin" "$stage_path/scripts" "$dist_path"
 
-for binary in lianyaohu lianyaohu-helper; do
-  if [[ ! -x "$build_path/$binary" ]]; then
-    echo "missing executable: $build_path/$binary" >&2
-    exit 1
-  fi
-  install -m 755 "$build_path/$binary" "$stage_path/bin/$binary"
-done
+if [[ ! -x "$build_path/lianyaohu" ]]; then
+  echo "missing executable: $build_path/lianyaohu" >&2
+  exit 1
+fi
+install -m 755 "$build_path/lianyaohu" "$stage_path/bin/lianyaohu"
 
 install -m 755 "$root/scripts/install-helper.sh" "$stage_path/scripts/install-helper.sh"
 install -m 755 "$root/scripts/uninstall-helper.sh" "$stage_path/scripts/uninstall-helper.sh"
@@ -53,8 +51,7 @@ This package was built for ${target}.
 
 Contents:
 
-- bin/lianyaohu
-- bin/lianyaohu-helper
+- bin/lianyaohu (CLI and root helper daemon in one binary; the daemon runs as \`lianyaohu helper\`)
 - scripts/install-helper.sh
 - scripts/uninstall-helper.sh
 
