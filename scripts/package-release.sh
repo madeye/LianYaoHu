@@ -39,6 +39,12 @@ if [[ ! -x "$build_path/lianyaohu" ]]; then
 fi
 install -m 755 "$build_path/lianyaohu" "$stage_path/bin/lianyaohu"
 
+# Ship the short `lyh` alias alongside the canonical binary when the build
+# produced one (the Cargo [[bin]] target always should).
+if [[ -x "$build_path/lyh" ]]; then
+  install -m 755 "$build_path/lyh" "$stage_path/bin/lyh"
+fi
+
 install -m 755 "$root/scripts/install-helper.sh" "$stage_path/scripts/install-helper.sh"
 install -m 755 "$root/scripts/uninstall-helper.sh" "$stage_path/scripts/uninstall-helper.sh"
 install -m 644 "$root/README.md" "$stage_path/README.md"
@@ -52,6 +58,7 @@ This package was built for ${target}.
 Contents:
 
 - bin/lianyaohu (CLI and root helper daemon in one binary; the daemon runs as \`lianyaohu helper\`)
+- bin/lyh     (short alias for bin/lianyaohu; identical binary)
 - scripts/install-helper.sh
 - scripts/uninstall-helper.sh
 
@@ -61,7 +68,7 @@ Install the helper from this extracted package:
 scripts/install-helper.sh
 \`\`\`
 
-Run the CLI from the package or copy \`bin/lianyaohu\` into your PATH.
+Run the CLI from the package or copy \`bin/lianyaohu\` (or its short alias \`bin/lyh\`) into your PATH.
 EOF
 
 rm -f "$archive_path" "$archive_path.sha256"

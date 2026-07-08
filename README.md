@@ -16,6 +16,15 @@ cargo run -p lianyaohu-app -- --vpn utun5 -- codex
 cargo run -p lianyaohu-app -- --vpn tun0 -- codex
 ```
 
+The same binary is also built under the short alias `lyh`, so once installed
+(`cargo install --path crates/lianyaohu-app` or by copying `bin/lianyaohu`/`bin/lyh`
+into your `PATH`) you can invoke it either way:
+
+```sh
+lianyaohu --vpn utun5 -- claude
+lyh --vpn utun5 -- claude
+```
+
 By default it:
 
 - prompts for a supported VPN interface at startup;

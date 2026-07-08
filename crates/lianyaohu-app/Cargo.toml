@@ -10,6 +10,11 @@ version.workspace = true
 name = "lianyaohu"
 path = "src/main.rs"
 
+# Short alias so the same build also installs an `lyh` executable.
+[[bin]]
+name = "lyh"
+path = "src/main.rs"
+
 [dependencies]
 lianyaohu-core = { workspace = true }
 libc.workspace = true
