@@ -5,6 +5,8 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
+# Keep `cargo run -p lianyaohu-app` working now that the crate has two [[bin]] targets.
+default-run = "lianyaohu"
 
 [[bin]]
 name = "lianyaohu"
