@@ -70,6 +70,17 @@ fn main() {
         return;
     }
 
+    // Internal trampoline used by the macOS helper's launch path; on success
+    // exec replaces the process, so reaching the error branch is the only way
+    // back.
+    #[cfg(target_os = "macos")]
+    if args.first().map(String::as_str) == Some("drop-exec") {
+        if let Err(error) = helper_daemon::drop_exec(&args[1..]) {
+            eprintln!("lianyaohu drop-exec: {error}");
+        }
+        std::process::exit(1);
+    }
+
     let code = match run(args) {
         Ok(code) => code,
         Err(error) => {

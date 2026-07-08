@@ -319,8 +319,33 @@ fn run_launch_spec(
     let stdout = File::from(stdio_fds.remove(0));
     let stderr = File::from(stdio_fds.remove(0));
 
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    // Spawn through `launchctl asuser` so the agent joins the caller's Mach
+    // bootstrap and audit session. Keychain search lists and unlock state are
+    // per-session; launched straight from this LaunchDaemon the agent lands in
+    // the system session where the caller's login keychain is invisible, and
+    // tools that keep secrets there (claude, gh, git credential helpers)
+    // prompt to log in again. `launchctl asuser` keeps uid 0, so the helper
+    // re-enters itself via `drop-exec`, which drops credentials inside the
+    // caller's session and execs sandbox-exec.
+    let helper_exe = std::env::current_exe()?;
+    let supplementary_groups = supplementary_groups_for_uid(uid, primary_gid)?;
+    let groups_csv = supplementary_groups
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut command = Command::new("/bin/launchctl");
     command
+        .arg("asuser")
+        .arg(uid.to_string())
+        .arg(&helper_exe)
+        .arg("drop-exec")
+        .arg(uid.to_string())
+        .arg(session_gid.to_string())
+        .arg(&groups_csv)
+        .arg("--")
+        .arg("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(profile_arg)
         .args(&spec.command)
@@ -330,9 +355,6 @@ fn run_launch_spec(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-
-    let supplementary_groups = supplementary_groups_for_uid(uid, primary_gid)?;
-    drop_child_credentials(&mut command, uid, session_gid, supplementary_groups);
 
     let status = command.status();
     let _ = fs::remove_file(&profile_path);
@@ -381,6 +403,67 @@ fn run_launch_spec(
         .unwrap_or(1))
 }
 
+/// Entry point for `lianyaohu drop-exec <uid> <gid> <groups-csv> -- <command...>`.
+///
+/// Internal trampoline for the macOS launch path: `launchctl asuser` joins the
+/// caller's session but keeps uid 0, so the helper re-enters itself with this
+/// subcommand to drop credentials and exec the sandboxed agent. It grants
+/// nothing to unprivileged callers — setgroups/setgid/setuid fail with EPERM
+/// unless the process is already root. On success exec replaces the process
+/// and this function never returns.
+#[cfg(target_os = "macos")]
+pub fn drop_exec(args: &[String]) -> Result<()> {
+    let (uid, gid, groups, command) = parse_drop_exec_args(args)?;
+    let groups = groups
+        .iter()
+        .map(|group| *group as libc::gid_t)
+        .collect::<Vec<_>>();
+    unsafe {
+        if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 {
+            return Err(err(format!("setgroups: {}", io::Error::last_os_error())));
+        }
+        if libc::setgid(gid as libc::gid_t) != 0 {
+            return Err(err(format!("setgid {gid}: {}", io::Error::last_os_error())));
+        }
+        if libc::setuid(uid as libc::uid_t) != 0 {
+            return Err(err(format!("setuid {uid}: {}", io::Error::last_os_error())));
+        }
+    }
+    let error = Command::new(&command[0]).args(&command[1..]).exec();
+    Err(err(format!("exec {}: {error}", command[0])))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_drop_exec_args(args: &[String]) -> Result<(u32, u32, Vec<u32>, Vec<String>)> {
+    const USAGE: &str = "usage: lianyaohu drop-exec <uid> <gid> <groups-csv> -- <command...>";
+    let [uid, gid, groups_csv, separator, command @ ..] = args else {
+        return Err(err(USAGE));
+    };
+    if separator != "--" || command.is_empty() {
+        return Err(err(USAGE));
+    }
+    let uid = uid
+        .parse()
+        .map_err(|_| err(format!("drop-exec: invalid uid {uid:?}")))?;
+    let gid = gid
+        .parse()
+        .map_err(|_| err(format!("drop-exec: invalid gid {gid:?}")))?;
+    let groups = if groups_csv.is_empty() {
+        Vec::new()
+    } else {
+        groups_csv
+            .split(',')
+            .map(|group| {
+                group
+                    .parse::<u32>()
+                    .map_err(|_| err(format!("drop-exec: invalid group {group:?}")))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    Ok((uid, gid, groups, command.to_vec()))
+}
+
+#[cfg(target_os = "linux")]
 fn drop_child_credentials(
     command: &mut Command,
     uid: u32,
@@ -754,4 +837,47 @@ extern "C" fn handle_signal(signal: libc::c_int) {
         }
     }
     std::process::exit(128 + signal);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_drop_exec_args_accepts_full_form() {
+        let (uid, gid, groups, command) =
+            parse_drop_exec_args(&args(&["501", "601", "20,12,61", "--", "/bin/echo", "ok"]))
+                .unwrap();
+
+        assert_eq!(uid, 501);
+        assert_eq!(gid, 601);
+        assert_eq!(groups, vec![20, 12, 61]);
+        assert_eq!(command, args(&["/bin/echo", "ok"]));
+    }
+
+    #[test]
+    fn parse_drop_exec_args_accepts_empty_groups() {
+        let (_, _, groups, _) =
+            parse_drop_exec_args(&args(&["501", "601", "", "--", "/bin/echo"])).unwrap();
+
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn parse_drop_exec_args_rejects_bad_input() {
+        for case in [
+            &args(&["501", "601", "20"])[..],
+            &args(&["501", "601", "20", "--"]),
+            &args(&["501", "601", "20", "/bin/echo"]),
+            &args(&["nope", "601", "20", "--", "/bin/echo"]),
+            &args(&["501", "nope", "20", "--", "/bin/echo"]),
+            &args(&["501", "601", "20,nope", "--", "/bin/echo"]),
+        ] {
+            assert!(parse_drop_exec_args(case).is_err(), "{case:?}");
+        }
+    }
 }

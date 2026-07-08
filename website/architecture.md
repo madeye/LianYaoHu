@@ -56,6 +56,8 @@ launcher and the helper, so both sides always render identical rules:
 7. By default, write a launch spec and ask the helper to install group-scoped
    firewall rules, drop to `uid=caller_uid,gid=_lianyaohu` with the caller's
    normal supplementary groups, and launch the agent. macOS execs
+   `launchctl asuser` (joining the caller's security session so the login
+   keychain stays reachable) → `lianyaohu drop-exec` (credential drop) →
    `/usr/bin/sandbox-exec`; Linux applies `PR_SET_NO_NEW_PRIVS`, Landlock, and
    seccomp in the child before execing the requested command.
 8. With `--shared-user-firewall`, install the current-UID firewall guard and

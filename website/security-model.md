@@ -65,7 +65,12 @@ authenticates the caller with kernel peer credentials, creates or validates the
 hidden `_lianyaohu` group, installs firewall rules matching that group, drops
 the child to `uid=caller_uid,gid=_lianyaohu`, and validates that the requested
 interface is active. The helper replaces inherited supplementary groups with
-the caller's normal groups before the drop.
+the caller's normal groups before the drop. On macOS the child is spawned
+through `launchctl asuser`, joining the caller's Mach bootstrap and audit
+session before credentials are dropped: keychain search lists and unlock state
+are per-session, and without this the agent lands in the system session where
+the caller's login keychain is invisible, so keychain-backed logins (Claude
+Code, `gh`, git credential helpers) would prompt again.
 
 On macOS, the installed PF rules:
 

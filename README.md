@@ -38,7 +38,10 @@ Firewall enforcement and dedicated-group isolation require root. LianYaoHu uses
 a root helper at `/var/run/lianyaohu-helper.sock` to create/validate the hidden
 `_lianyaohu` group, install group-scoped firewall rules, drop the child to
 `uid=caller_uid,gid=_lianyaohu` while keeping the caller's normal supplementary
-groups, and launch the agent with the caller's stdio. The helper is installed as
+groups, and launch the agent with the caller's stdio. On macOS the agent is
+spawned through `launchctl asuser` so it joins the caller's security session
+and keychain-backed credentials (Claude Code, `gh`, git credential helpers)
+keep working. The helper is installed as
 a LaunchDaemon on macOS and a systemd service on Linux.
 
 Install the helper once:
