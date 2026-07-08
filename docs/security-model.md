@@ -16,8 +16,14 @@ Write access covers:
 - the selected working directory;
 - a per-launch temporary directory.
 
-Platform, developer tool, and Homebrew paths are read-only so shells,
-interpreters, git, node, and installed code-agent CLIs can start.
+Platform and developer tool paths are read-only so shells, interpreters, git,
+node, and installed code-agent CLIs can start. `/opt/homebrew` is writable so
+agents can `brew install` the tools they need.
+
+`uname(3)` (and therefore `kern.hostname`) is allowed because Homebrew, Ruby,
+and many build tools fail hard without it, so the machine name is visible to
+the agent; stronger identifiers such as `kern.uuid` remain blocked and
+`HOSTNAME` is still stripped from the environment.
 
 Timezone preference files are explicitly denied and the launched environment
 sets `TZ=UTC`.
