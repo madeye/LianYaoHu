@@ -8,13 +8,13 @@ LianYaoHu is intentionally CLI/TUI-only. It uses two macOS mechanisms:
 
 ## Filesystem
 
-The agent can read the caller's home directory. Write access is limited to:
+The agent can read and write the caller's home directory, so agent CLIs can
+maintain their own state (`~/.claude`, `~/.codex`, credential and cache files).
+Write access covers:
 
+- the caller's home directory;
 - the selected working directory;
 - a per-launch temporary directory.
-
-If the selected working directory is inside `$HOME`, that directory is the only
-intentional writable exception under the otherwise read-only home tree.
 
 Platform, developer tool, and Homebrew paths are read-only so shells,
 interpreters, git, node, and installed code-agent CLIs can start.
