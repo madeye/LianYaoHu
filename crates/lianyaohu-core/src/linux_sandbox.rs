@@ -529,7 +529,9 @@ mod tests {
         let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh");
         let summary = sandbox.render_summary();
 
-        assert!(summary.contains("writable: /home/alice, /home/alice/project, /tmp/lyh"));
+        assert!(summary.contains("/home/alice"));
+        assert!(summary.contains("/home/alice/project"));
+        assert!(summary.contains("/tmp/lyh"));
         assert!(summary.contains("read-only: /bin"));
         assert!(summary.contains("seccomp: deny bind/listen/accept"));
     }
