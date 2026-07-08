@@ -60,11 +60,12 @@ impl Default for Options {
 }
 
 fn main() {
+    let program = program_name();
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.first().map(String::as_str) == Some("helper") {
         if let Err(error) = helper_daemon::run() {
-            eprintln!("lianyaohu helper: {error}");
+            eprintln!("{program} helper: {error}");
             std::process::exit(1);
         }
         return;
@@ -76,7 +77,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     if args.first().map(String::as_str) == Some("drop-exec") {
         if let Err(error) = helper_daemon::drop_exec(&args[1..]) {
-            eprintln!("lianyaohu drop-exec: {error}");
+            eprintln!("{program} drop-exec: {error}");
         }
         std::process::exit(1);
     }
@@ -84,12 +85,24 @@ fn main() {
     let code = match run(args) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("lianyaohu: {error}");
-            eprintln!("{USAGE}");
+            eprintln!("{program}: {error}");
+            eprintln!("{}", usage(&program));
             2
         }
     };
     std::process::exit(code);
+}
+
+// The binary also ships as the `lyh` alias; report whichever name was invoked.
+fn program_name() -> String {
+    env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "lianyaohu".to_string())
 }
 
 fn run(args: Vec<String>) -> Result<i32> {
@@ -325,7 +338,7 @@ fn parse(args: Vec<String>) -> Result<Options> {
             "--print-pf" | "--print-firewall" => options.print_pf = true,
             "--helper-status" => options.helper_status = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", usage(&program_name()));
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(err(format!("unknown option {other}"))),
@@ -507,9 +520,11 @@ fn launch_agent_with_session_group(
     result
 }
 
-const USAGE: &str = r#"usage:
-  lianyaohu [options] [-- agent [args...]]
-  lianyaohu helper
+fn usage(program: &str) -> String {
+    format!(
+        r#"usage:
+  {program} [options] [-- agent [args...]]
+  {program} helper
 
 subcommands:
   helper                      Run the root firewall helper daemon.
@@ -533,4 +548,6 @@ options:
 
 default command:
   claude
-"#;
+"#
+    )
+}

@@ -5,9 +5,16 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
+# Keep `cargo run -p lianyaohu-app` working now that the crate has two [[bin]] targets.
+default-run = "lianyaohu"
 
 [[bin]]
 name = "lianyaohu"
+path = "src/main.rs"
+
+# Short alias so the same build also installs an `lyh` executable.
+[[bin]]
+name = "lyh"
 path = "src/main.rs"
 
 [dependencies]
