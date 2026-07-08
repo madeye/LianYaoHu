@@ -5,8 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="io.github.madeye.lianyaohu.helper"
 BIN="/usr/local/libexec/lianyaohu"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
+SERVICE="/etc/systemd/system/${LABEL}.service"
 GROUP_NAME="_lianyaohu"
 GROUP_GID="2000000"
+OS="$(uname -s)"
 
 if [[ -n "${LIANYAOHU_HELPER_BINARY:-}" ]]; then
   HELPER_BINARY="$LIANYAOHU_HELPER_BINARY"
@@ -15,6 +17,70 @@ elif [[ -x "$ROOT/bin/lianyaohu" && ! -f "$ROOT/Cargo.toml" ]]; then
 else
   cargo build --release -p lianyaohu
   HELPER_BINARY="$ROOT/target/release/lianyaohu"
+fi
+
+if [[ "$OS" == "Linux" ]]; then
+  sudo install -d -m 755 /usr/local/libexec
+  sudo install -m 755 "$HELPER_BINARY" "$BIN"
+
+  if getent group "$GROUP_NAME" >/tmp/lianyaohu-group.$$ 2>/dev/null; then
+    existing_gid="$(awk -F: '{print $3; exit}' /tmp/lianyaohu-group.$$)"
+    rm -f /tmp/lianyaohu-group.$$
+    if [[ "$existing_gid" != "$GROUP_GID" ]]; then
+      echo "${GROUP_NAME} exists with gid ${existing_gid}, expected ${GROUP_GID}" >&2
+      exit 1
+    fi
+  else
+    rm -f /tmp/lianyaohu-group.$$
+    conflicting_group="$(getent group "$GROUP_GID" 2>/dev/null | awk -F: '{print $1; exit}' || true)"
+    if [[ -n "$conflicting_group" ]]; then
+      echo "gid ${GROUP_GID} is already assigned to group ${conflicting_group}" >&2
+      exit 1
+    fi
+    sudo groupadd -g "$GROUP_GID" "$GROUP_NAME"
+  fi
+
+  tmp_service="$(mktemp)"
+  cat >"$tmp_service" <<SERVICE
+[Unit]
+Description=LianYaoHu root firewall helper
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BIN} helper
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  sudo install -m 644 "$tmp_service" "$SERVICE"
+  rm -f "$tmp_service"
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${LABEL}.service"
+  sudo systemctl restart "${LABEL}.service"
+  for _ in {1..50}; do
+    if [[ -S /var/run/lianyaohu-helper.sock ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ ! -S /var/run/lianyaohu-helper.sock ]]; then
+    sudo systemctl status --no-pager "${LABEL}.service" || true
+    echo "helper socket did not appear: /var/run/lianyaohu-helper.sock" >&2
+    exit 1
+  fi
+
+  echo "installed ${LABEL}"
+  exit 0
+fi
+
+if [[ "$OS" != "Darwin" ]]; then
+  echo "unsupported OS: ${OS}" >&2
+  exit 1
 fi
 
 sudo install -d -m 755 /usr/local/libexec

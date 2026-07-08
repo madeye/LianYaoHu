@@ -1,6 +1,18 @@
 use lianyaohu_core::helper::{HelperRequest, SOCKET_PATH, parse_request, receive_message_with_fds};
+#[cfg(target_os = "macos")]
 use lianyaohu_core::interfaces::{utun_interfaces, validate_utun};
+#[cfg(target_os = "linux")]
+use lianyaohu_core::interfaces::{
+    validate_vpn_interface as validate_platform_vpn_interface, vpn_interfaces,
+};
 use lianyaohu_core::launch::LaunchSpec;
+#[cfg(target_os = "linux")]
+use lianyaohu_core::linux_firewall::{
+    LIANYAOHU_GROUP_GID, LIANYAOHU_GROUP_NAME, LinuxFirewallGuard, LinuxFirewallRuleSet,
+};
+#[cfg(target_os = "linux")]
+use lianyaohu_core::linux_sandbox::LinuxSandbox;
+#[cfg(target_os = "macos")]
 use lianyaohu_core::pf::{
     LIANYAOHU_GROUP_GID, LIANYAOHU_GROUP_NAME, PFRuleSet, parse_enable_token,
 };
@@ -92,7 +104,7 @@ impl HelperDaemon {
             HelperRequest::Install { interface_name } => {
                 self.install(peer.uid, &interface_name)?;
                 Ok(format!(
-                    "installed PF guard for uid {} on {interface_name}",
+                    "installed firewall guard for uid {} on {interface_name}",
                     peer.uid
                 ))
             }
@@ -102,7 +114,7 @@ impl HelperDaemon {
             } => self.run_session(peer, &interface_name, Path::new(&spec_path), received.fds),
             HelperRequest::Uninstall => {
                 self.uninstall(peer.uid);
-                Ok(format!("uninstalled PF guard for uid {}", peer.uid))
+                Ok(format!("uninstalled firewall guard for uid {}", peer.uid))
             }
             HelperRequest::Status => {
                 if self.tokens().contains_key(&peer.uid) {
@@ -121,16 +133,27 @@ impl HelperDaemon {
     }
 
     fn install(&self, uid: u32, interface_name: &str) -> Result<()> {
-        let selected = validated_utun(interface_name)?;
-        let rule_set = PFRuleSet::new_user(
-            selected.name,
-            uid,
-            selected.ipv4_peer_addresses.first().cloned(),
-        );
-        let rules_path = write_rules(&rule_set)?;
-        self.install_rule_set(&rule_set, &rules_path)
+        #[cfg(target_os = "macos")]
+        {
+            let selected = validated_vpn_interface(interface_name)?;
+            let rule_set = PFRuleSet::new_user(
+                selected.name,
+                uid,
+                selected.ipv4_peer_addresses.first().cloned(),
+            );
+            let rules_path = write_rules(&rule_set)?;
+            self.install_rule_set(&rule_set, &rules_path)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let selected = validated_vpn_interface(interface_name)?;
+            let rule_set = LinuxFirewallRuleSet::new_user(selected.name, uid);
+            self.install_rule_set(&rule_set)
+        }
     }
 
+    #[cfg(target_os = "macos")]
     fn install_rule_set(&self, rule_set: &PFRuleSet, rules_path: &Path) -> Result<()> {
         run_pf(&["-n", "-f", &rules_path.to_string_lossy()])?;
 
@@ -168,6 +191,23 @@ impl HelperDaemon {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn install_rule_set(&self, rule_set: &LinuxFirewallRuleSet) -> Result<()> {
+        let mut tokens = self.tokens();
+        if tokens.contains_key(&rule_set.anchor_key) {
+            return Err(err(format!(
+                "firewall guard is already installed for uid {}",
+                rule_set.anchor_key
+            )));
+        }
+
+        let mut guard = LinuxFirewallGuard::new_root(rule_set.clone());
+        guard.install()?;
+        guard.disarm();
+        tokens.insert(rule_set.anchor_key, "linux-firewall".to_string());
+        Ok(())
+    }
+
     fn run_session(
         &self,
         peer: PeerCredentials,
@@ -183,32 +223,67 @@ impl HelperDaemon {
 
         let spec = LaunchSpec::read_json(spec_path)?;
         ensure_session_group()?;
-        let selected = validated_utun(interface_name)?;
-        let rule_set = PFRuleSet::new_group(
-            selected.name,
-            peer.uid,
-            LIANYAOHU_GROUP_GID,
-            selected.ipv4_peer_addresses.first().cloned(),
-        );
-        let rules_path = write_rules(&rule_set)?;
+        let selected = validated_vpn_interface(interface_name)?;
 
-        if let Err(error) = self.install_rule_set(&rule_set, &rules_path) {
+        #[cfg(target_os = "macos")]
+        {
+            let rule_set = PFRuleSet::new_group(
+                selected.name,
+                peer.uid,
+                LIANYAOHU_GROUP_GID,
+                selected.ipv4_peer_addresses.first().cloned(),
+            );
+            let rules_path = write_rules(&rule_set)?;
+
+            if let Err(error) = self.install_rule_set(&rule_set, &rules_path) {
+                let _ = fs::remove_file(rules_path);
+                return Err(error);
+            }
+            let run_result =
+                run_launch_spec(&spec, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
+            self.uninstall(peer.uid);
             let _ = fs::remove_file(rules_path);
-            return Err(error);
-        }
-        let run_result = run_launch_spec(&spec, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
-        self.uninstall(peer.uid);
-        let _ = fs::remove_file(rules_path);
 
-        run_result.map(|code| format!("exit {code}"))
+            run_result.map(|code| format!("exit {code}"))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let rule_set =
+                LinuxFirewallRuleSet::new_group(selected.name, peer.uid, LIANYAOHU_GROUP_GID);
+            self.install_rule_set(&rule_set)?;
+            let run_result =
+                run_launch_spec(&spec, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
+            self.uninstall(peer.uid);
+
+            run_result.map(|code| format!("exit {code}"))
+        }
     }
 
     fn uninstall(&self, uid: u32) {
-        let rule_set = PFRuleSet::new_user("utun0", uid, None);
-        let mut tokens = self.tokens();
-        let _ = run_pf(&["-a", &rule_set.anchor_name(), "-F", "rules"]);
-        if let Some(token) = tokens.remove(&uid) {
-            let _ = run_pf(&["-X", &token]);
+        #[cfg(target_os = "macos")]
+        {
+            let rule_set = PFRuleSet::new_user("utun0", uid, None);
+            let mut tokens = self.tokens();
+            let _ = run_pf(&["-a", &rule_set.anchor_name(), "-F", "rules"]);
+            if let Some(token) = tokens.remove(&uid) {
+                let _ = run_pf(&["-X", &token]);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut user_guard =
+                LinuxFirewallGuard::new_root(LinuxFirewallRuleSet::new_user("tun0", uid));
+            user_guard.uninstall();
+            let mut group_guard = LinuxFirewallGuard::new_root(LinuxFirewallRuleSet::new_group(
+                "tun0",
+                uid,
+                LIANYAOHU_GROUP_GID,
+            ));
+            group_guard.uninstall();
+            let mut tokens = self.tokens();
+            tokens.remove(&uid);
         }
     }
 }
@@ -219,6 +294,7 @@ struct PeerCredentials {
     gid: u32,
 }
 
+#[cfg(target_os = "macos")]
 fn run_launch_spec(
     spec: &LaunchSpec,
     uid: u32,
@@ -267,6 +343,44 @@ fn run_launch_spec(
         .unwrap_or(1))
 }
 
+#[cfg(target_os = "linux")]
+fn run_launch_spec(
+    spec: &LaunchSpec,
+    uid: u32,
+    primary_gid: u32,
+    session_gid: u32,
+    mut stdio_fds: Vec<OwnedFd>,
+) -> Result<i32> {
+    let stdin = File::from(stdio_fds.remove(0));
+    let stdout = File::from(stdio_fds.remove(0));
+    let stderr = File::from(stdio_fds.remove(0));
+    let executable = spec
+        .command
+        .first()
+        .ok_or_else(|| err("launch spec command is empty"))?;
+    let sandbox = LinuxSandbox::from_environment(spec.cwd.as_str(), &spec.environment)?;
+
+    let mut command = Command::new(executable);
+    command
+        .args(&spec.command[1..])
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(&spec.environment)
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    let supplementary_groups = supplementary_groups_for_uid(uid, primary_gid)?;
+    drop_child_credentials(&mut command, uid, session_gid, supplementary_groups);
+    apply_child_sandbox(&mut command, sandbox);
+
+    let status = command.status()?;
+    Ok(status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1))
+}
+
 fn drop_child_credentials(
     command: &mut Command,
     uid: u32,
@@ -292,6 +406,17 @@ fn drop_child_credentials(
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_child_sandbox(command: &mut Command, sandbox: LinuxSandbox) {
+    unsafe {
+        command.pre_exec(move || {
+            sandbox
+                .apply()
+                .map_err(|error| io::Error::other(error.to_string()))
         });
     }
 }
@@ -324,7 +449,10 @@ fn supplementary_groups_for_uid(uid: u32, primary_gid: u32) -> Result<Vec<u32>> 
     Ok(groups)
 }
 
-fn validated_utun(interface_name: &str) -> Result<lianyaohu_core::interfaces::NetworkInterface> {
+#[cfg(target_os = "macos")]
+fn validated_vpn_interface(
+    interface_name: &str,
+) -> Result<lianyaohu_core::interfaces::NetworkInterface> {
     let suffix = interface_name
         .strip_prefix("utun")
         .ok_or_else(|| err(format!("refusing non-utun interface: {interface_name}")))?;
@@ -341,6 +469,19 @@ fn validated_utun(interface_name: &str) -> Result<lianyaohu_core::interfaces::Ne
     Ok(selected)
 }
 
+#[cfg(target_os = "linux")]
+fn validated_vpn_interface(
+    interface_name: &str,
+) -> Result<lianyaohu_core::interfaces::NetworkInterface> {
+    let selected = vpn_interfaces()?
+        .into_iter()
+        .find(|interface| interface.name == interface_name)
+        .ok_or_else(|| err(format!("{interface_name} is not present")))?;
+    validate_platform_vpn_interface(&selected)?;
+    Ok(selected)
+}
+
+#[cfg(target_os = "macos")]
 fn write_rules(rule_set: &PFRuleSet) -> Result<std::path::PathBuf> {
     let dir = Path::new("/var/run/lianyaohu");
     fs::create_dir_all(dir)?;
@@ -353,6 +494,7 @@ fn write_rules(rule_set: &PFRuleSet) -> Result<std::path::PathBuf> {
     Ok(rules_path)
 }
 
+#[cfg(target_os = "macos")]
 fn ensure_session_group() -> Result<()> {
     let groups = list_groups()?;
     let mut found_session_group = None;
@@ -383,6 +525,71 @@ fn ensure_session_group() -> Result<()> {
     create_session_group()
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_session_group() -> Result<()> {
+    if let Some(gid) = group_gid_by_name(LIANYAOHU_GROUP_NAME)? {
+        if gid == LIANYAOHU_GROUP_GID {
+            return Ok(());
+        }
+        return Err(err(format!(
+            "{LIANYAOHU_GROUP_NAME} has gid {gid}, expected {LIANYAOHU_GROUP_GID}"
+        )));
+    }
+
+    if let Some(name) = group_name_by_gid(LIANYAOHU_GROUP_GID)? {
+        return Err(err(format!(
+            "gid {LIANYAOHU_GROUP_GID} is already assigned to group {name}"
+        )));
+    }
+
+    let gid = LIANYAOHU_GROUP_GID.to_string();
+    let output = Command::new("/usr/sbin/groupadd")
+        .args(["-g", &gid, LIANYAOHU_GROUP_NAME])
+        .output()?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(err(format!("groupadd failed: {}", combined.trim())))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn group_gid_by_name(name: &str) -> Result<Option<u32>> {
+    let output = Command::new("/usr/bin/getent")
+        .args(["group", name])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_group_entry(&String::from_utf8_lossy(&output.stdout)).map(|(_, gid)| gid))
+}
+
+#[cfg(target_os = "linux")]
+fn group_name_by_gid(gid: u32) -> Result<Option<String>> {
+    let output = Command::new("/usr/bin/getent")
+        .args(["group", &gid.to_string()])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_group_entry(&String::from_utf8_lossy(&output.stdout)).map(|(name, _)| name))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_group_entry(entry: &str) -> Option<(String, u32)> {
+    let mut fields = entry.trim().split(':');
+    let name = fields.next()?.to_string();
+    let _password = fields.next()?;
+    let gid = fields.next()?.parse::<u32>().ok()?;
+    Some((name, gid))
+}
+
+#[cfg(target_os = "macos")]
 fn list_groups() -> Result<Vec<(String, u32)>> {
     let output = run_dscl(&[".", "-list", "/Groups", "PrimaryGroupID"])?;
     let mut groups = Vec::new();
@@ -401,6 +608,7 @@ fn list_groups() -> Result<Vec<(String, u32)>> {
     Ok(groups)
 }
 
+#[cfg(target_os = "macos")]
 fn create_session_group() -> Result<()> {
     let record = format!("/Groups/{LIANYAOHU_GROUP_NAME}");
     let gid = LIANYAOHU_GROUP_GID.to_string();
@@ -428,6 +636,7 @@ fn create_session_group() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn run_dscl(args: &[&str]) -> Result<String> {
     let output = Command::new("/usr/bin/dscl").args(args).output()?;
     let combined = format!(
@@ -446,6 +655,7 @@ fn run_dscl(args: &[&str]) -> Result<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn run_pf(args: &[&str]) -> Result<String> {
     let output = Command::new("/sbin/pfctl").args(args).output()?;
     let combined = format!(
@@ -465,11 +675,39 @@ fn run_pf(args: &[&str]) -> Result<String> {
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials> {
+    peer_credentials_inner(stream)
+}
+
+#[cfg(target_vendor = "apple")]
+fn peer_credentials_inner(stream: &UnixStream) -> Result<PeerCredentials> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
     let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
     if rc == 0 {
         Ok(PeerCredentials { uid, gid })
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_credentials_inner(stream: &UnixStream) -> Result<PeerCredentials> {
+    let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok(PeerCredentials {
+            uid: credentials.uid,
+            gid: credentials.gid,
+        })
     } else {
         Err(std::io::Error::last_os_error().into())
     }
@@ -485,6 +723,7 @@ fn chmod(path: &Path, mode: libc::mode_t) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<()> {
     let path = CString::new(path.as_os_str().as_encoded_bytes())?;
     let rc = unsafe { libc::chown(path.as_ptr(), uid, gid) };

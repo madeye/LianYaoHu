@@ -23,8 +23,11 @@ env:
 
 jobs:
   build-and-upload:
-    # LianYaoHu currently depends on macOS-only sandbox/PF APIs.
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Resolve release tag
         id: release
@@ -92,7 +95,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-package
+          name: release-package-${{ matrix.os }}
           path: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
@@ -106,6 +109,6 @@ jobs:
         shell: bash
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes || gh release view "$TAG" >/dev/null
           fi
           gh release upload "$TAG" "$ASSET" "$CHECKSUM" --clobber

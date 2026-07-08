@@ -2,16 +2,28 @@ mod helper_daemon;
 
 use lianyaohu_core::env_policy;
 use lianyaohu_core::helper::PFHelperClient;
-use lianyaohu_core::interfaces::{NetworkInterface, utun_interfaces, validate_utun};
+use lianyaohu_core::interfaces::{
+    NetworkInterface, validate_vpn_interface, vpn_interface_description, vpn_interfaces,
+};
 use lianyaohu_core::launch::LaunchSpec;
+#[cfg(target_os = "linux")]
+use lianyaohu_core::linux_firewall::{
+    LIANYAOHU_GROUP_GID, LinuxFirewallGuard, LinuxFirewallRuleSet,
+};
+#[cfg(target_os = "linux")]
+use lianyaohu_core::linux_sandbox::LinuxSandbox;
+#[cfg(target_os = "macos")]
 use lianyaohu_core::pf::{LIANYAOHU_GROUP_GID, PFGuard, PFRuleSet};
 use lianyaohu_core::route;
+#[cfg(target_os = "macos")]
 use lianyaohu_core::sandbox_profile::SandboxProfile;
 use lianyaohu_core::{Result, err};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,16 +102,37 @@ fn run(args: Vec<String>) -> Result<i32> {
     let tmpdir = temporary_directory();
 
     let selected_interface = select_interface(options.vpn_interface.as_deref())?;
-    validate_utun(&selected_interface)?;
+    validate_vpn_interface(&selected_interface)?;
 
+    let env_input = env::vars().collect::<BTreeMap<_, _>>();
+    let clean_env = env_policy::sanitize(
+        &env_input,
+        &home,
+        &cwd_string,
+        &tmpdir.to_string_lossy(),
+        &options.extra_environment,
+    );
+
+    #[cfg(target_os = "macos")]
     let profile = SandboxProfile::new(&home, &cwd_string, tmpdir.to_string_lossy());
+    #[cfg(target_os = "macos")]
     if options.print_profile {
         print!("{}", profile.render());
         return Ok(0);
     }
+    #[cfg(target_os = "linux")]
+    let linux_sandbox = LinuxSandbox::from_environment(cwd.clone(), &clean_env)?;
+    #[cfg(target_os = "linux")]
+    if options.print_profile {
+        print!("{}", linux_sandbox.render_summary());
+        return Ok(0);
+    }
 
     let uid = unsafe { libc::getuid() };
+
+    #[cfg(target_os = "macos")]
     let route_gateway = selected_interface.ipv4_peer_addresses.first().cloned();
+    #[cfg(target_os = "macos")]
     let rule_set = if options.helper_group_launch {
         PFRuleSet::new_group(
             selected_interface.name.clone(),
@@ -110,6 +143,19 @@ fn run(args: Vec<String>) -> Result<i32> {
     } else {
         PFRuleSet::new_user(selected_interface.name.clone(), uid, route_gateway.clone())
     };
+    #[cfg(target_os = "macos")]
+    if options.print_pf {
+        print!("{}", rule_set.render());
+        return Ok(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    let rule_set = if options.helper_group_launch {
+        LinuxFirewallRuleSet::new_group(selected_interface.name.clone(), uid, LIANYAOHU_GROUP_GID)
+    } else {
+        LinuxFirewallRuleSet::new_user(selected_interface.name.clone(), uid)
+    };
+    #[cfg(target_os = "linux")]
     if options.print_pf {
         print!("{}", rule_set.render());
         return Ok(0);
@@ -119,6 +165,7 @@ fn run(args: Vec<String>) -> Result<i32> {
         let default_route = route::default_ipv4_interface()?;
         if default_route.as_deref() != Some(selected_interface.name.as_str()) {
             let default_route_name = default_route.as_deref().unwrap_or("<unknown>");
+            #[cfg(target_os = "macos")]
             if options.enforce_pf
                 && route_gateway.is_some()
                 && PFHelperClient::default().status().is_ok()
@@ -135,17 +182,15 @@ fn run(args: Vec<String>) -> Result<i32> {
                     selected_interface.name
                 )));
             }
+            #[cfg(target_os = "linux")]
+            return Err(err(format!(
+                "default IPv4 route uses {default_route_name}, not selected VPN interface {} \
+                 (Linux firewall support cannot route traffic by itself; configure the VPN as \
+                 the default route or pass --allow-non-default-route for diagnostics only)",
+                selected_interface.name
+            )));
         }
     }
-
-    let env_input = env::vars().collect::<BTreeMap<_, _>>();
-    let clean_env = env_policy::sanitize(
-        &env_input,
-        &home,
-        &cwd_string,
-        &tmpdir.to_string_lossy(),
-        &options.extra_environment,
-    );
 
     let command = if options.command.is_empty() {
         vec!["claude".to_string()]
@@ -153,35 +198,74 @@ fn run(args: Vec<String>) -> Result<i32> {
         options.command
     };
 
-    if options.enforce_pf && options.helper_group_launch {
-        return launch_agent_with_session_group(
-            &selected_interface.name,
-            &command,
-            &cwd_string,
-            &tmpdir,
-            &profile,
-            &clean_env,
-        );
+    #[cfg(target_os = "macos")]
+    {
+        if options.enforce_pf && options.helper_group_launch {
+            return launch_agent_with_session_group(
+                &selected_interface.name,
+                &command,
+                &cwd_string,
+                &tmpdir,
+                &profile,
+                &clean_env,
+            );
+        }
+
+        let mut pf_guard = None;
+        if options.enforce_pf {
+            let mut guard = PFGuard::new(rule_set);
+            guard.install()?;
+            pf_guard = Some(guard);
+        } else {
+            eprintln!(
+                "warning: PF network guard disabled; relying only on route preflight and process sandbox"
+            );
+        }
+
+        let status = launch_agent(&command, &cwd, &tmpdir, &profile, &clean_env)?;
+
+        if let Some(mut guard) = pf_guard {
+            guard.uninstall();
+        }
+
+        return Ok(status);
     }
 
-    let mut pf_guard = None;
-    if options.enforce_pf {
-        let mut guard = PFGuard::new(rule_set);
-        guard.install()?;
-        pf_guard = Some(guard);
-    } else {
-        eprintln!(
-            "warning: PF network guard disabled; relying only on route preflight and process sandbox"
-        );
+    #[cfg(target_os = "linux")]
+    {
+        if options.enforce_pf && options.helper_group_launch {
+            return launch_agent_with_session_group(
+                &selected_interface.name,
+                &command,
+                &cwd_string,
+                &tmpdir,
+                &linux_sandbox,
+                &clean_env,
+            );
+        }
+
+        let mut firewall_guard = None;
+        if options.enforce_pf {
+            let mut guard = LinuxFirewallGuard::new(rule_set);
+            guard.install()?;
+            firewall_guard = Some(guard);
+        } else {
+            eprintln!(
+                "warning: Linux firewall guard disabled; filesystem/process sandbox remains enabled"
+            );
+        }
+
+        let status = launch_agent(&command, &cwd, &linux_sandbox, &clean_env)?;
+
+        if let Some(mut guard) = firewall_guard {
+            guard.uninstall();
+        }
+
+        return Ok(status);
     }
 
-    let status = launch_agent(&command, &cwd, &tmpdir, &profile, &clean_env)?;
-
-    if let Some(mut guard) = pf_guard {
-        guard.uninstall();
-    }
-
-    Ok(status)
+    #[allow(unreachable_code)]
+    Err(err("unsupported platform"))
 }
 
 fn parse(args: Vec<String>) -> Result<Options> {
@@ -204,7 +288,7 @@ fn parse(args: Vec<String>) -> Result<Options> {
                 index += 1;
                 options.vpn_interface = Some(
                     args.get(index)
-                        .ok_or_else(|| err("--vpn requires a utun interface name"))?
+                        .ok_or_else(|| err("--vpn requires a VPN interface name"))?
                         .clone(),
                 );
             }
@@ -223,11 +307,11 @@ fn parse(args: Vec<String>) -> Result<Options> {
                     .extra_environment
                     .insert(name.to_string(), env_value.to_string());
             }
-            "--no-pf" => options.enforce_pf = false,
-            "--shared-user-pf" => options.helper_group_launch = false,
+            "--no-pf" | "--no-firewall" => options.enforce_pf = false,
+            "--shared-user-pf" | "--shared-user-firewall" => options.helper_group_launch = false,
             "--allow-non-default-route" => options.require_default_route = false,
             "--print-profile" => options.print_profile = true,
-            "--print-pf" => options.print_pf = true,
+            "--print-pf" | "--print-firewall" => options.print_pf = true,
             "--helper-status" => options.helper_status = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -245,19 +329,22 @@ fn parse(args: Vec<String>) -> Result<Options> {
 }
 
 fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
-    let interfaces = utun_interfaces()?;
+    let interfaces = vpn_interfaces()?;
     if interfaces.is_empty() {
-        return Err(err("no utun interfaces found; start the VPN first"));
+        return Err(err(format!(
+            "no supported VPN interfaces found ({}); start the VPN first",
+            vpn_interface_description()
+        )));
     }
 
     if let Some(name) = requested {
         return interfaces
             .into_iter()
             .find(|interface| interface.name == name)
-            .ok_or_else(|| err(format!("{name} was not found among active utun interfaces")));
+            .ok_or_else(|| err(format!("{name} was not found among active VPN interfaces")));
     }
 
-    println!("Select VPN utun interface:");
+    println!("Select VPN interface ({}):", vpn_interface_description());
     for (offset, interface) in interfaces.iter().enumerate() {
         let state = if interface.is_up() && interface.is_running() {
             "up"
@@ -279,7 +366,7 @@ fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
     io::stdin().read_line(&mut input)?;
     let selected = input.trim().parse::<usize>()?;
     if selected == 0 || selected > interfaces.len() {
-        return Err(err("invalid utun selection"));
+        return Err(err("invalid VPN interface selection"));
     }
     Ok(interfaces[selected - 1].clone())
 }
@@ -296,6 +383,7 @@ fn temporary_directory() -> PathBuf {
     ))
 }
 
+#[cfg(target_os = "macos")]
 fn launch_agent(
     command: &[String],
     cwd: &PathBuf,
@@ -319,6 +407,41 @@ fn launch_agent(
     Ok(status.code().unwrap_or(1))
 }
 
+#[cfg(target_os = "linux")]
+fn launch_agent(
+    command: &[String],
+    cwd: &PathBuf,
+    sandbox: &LinuxSandbox,
+    clean_env: &BTreeMap<String, String>,
+) -> Result<i32> {
+    let executable = command
+        .first()
+        .ok_or_else(|| err("agent command is empty"))?;
+    let mut child = Command::new(executable);
+    child
+        .args(&command[1..])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(clean_env);
+    apply_child_sandbox(&mut child, sandbox.clone());
+
+    let status = child.status()?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_child_sandbox(command: &mut Command, sandbox: LinuxSandbox) {
+    unsafe {
+        command.pre_exec(move || {
+            sandbox
+                .apply()
+                .map_err(|error| io::Error::other(error.to_string()))
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn launch_agent_with_session_group(
     interface_name: &str,
     command: &[String],
@@ -343,26 +466,59 @@ fn launch_agent_with_session_group(
     result
 }
 
+#[cfg(target_os = "linux")]
+fn launch_agent_with_session_group(
+    interface_name: &str,
+    command: &[String],
+    cwd: &str,
+    tmpdir: &PathBuf,
+    sandbox: &LinuxSandbox,
+    clean_env: &BTreeMap<String, String>,
+) -> Result<i32> {
+    fs::create_dir_all(tmpdir)?;
+    let spec_path = tmpdir.join("launch.json");
+    let spec = LaunchSpec::new(
+        command.to_vec(),
+        cwd,
+        clean_env.clone(),
+        sandbox.render_summary(),
+    );
+    spec.write_json(&spec_path)?;
+
+    let result = PFHelperClient::default()
+        .run_session(interface_name, &spec_path)
+        .map_err(|error| {
+            err(format!(
+                "dedicated group isolation requires the root helper: {error}. Run scripts/install-helper.sh, or pass --shared-user-firewall to use current-UID firewall rules."
+            ))
+        });
+    let _ = fs::remove_file(&spec_path);
+    result
+}
+
 const USAGE: &str = r#"usage:
   lianyaohu [options] [-- agent [args...]]
   lianyaohu helper
 
 subcommands:
-  helper                      Run the root PF helper daemon (installed as a LaunchDaemon).
+  helper                      Run the root firewall helper daemon.
 
 options:
-  --vpn NAME                  Select a utun interface without prompting.
+  --vpn NAME                  Select a VPN interface without prompting
+                              (macOS: utun*, Linux: tun* or wg*).
   --cwd PATH                  Working directory exposed to the agent. Defaults to current directory.
   --env NAME=VALUE            Add an environment variable unless it is privacy-blocked.
-  --no-pf                     Do not install the PF guard. Intended for tests and debugging.
-  --shared-user-pf            Use current-UID PF rules instead of helper-managed group isolation.
-  --allow-non-default-route   Do not require the system default route to use the selected utun.
-                              Skipped automatically when the PF guard is enabled, the utun has an
+  --no-firewall               Do not install the firewall guard. Intended for tests and debugging.
+                              Alias: --no-pf.
+  --shared-user-firewall      Use current-UID firewall rules instead of helper-managed group isolation.
+                              Alias: --shared-user-pf.
+  --allow-non-default-route   Do not require the system default route to use the selected VPN.
+                              On macOS, skipped automatically when the PF guard is enabled, the utun has an
                               IPv4 peer, and the root helper is reachable (PF route-to steers
                               agent traffic through the utun regardless of the default route).
-  --helper-status             Query the root PF helper status for this user.
-  --print-profile             Print the generated sandbox-exec profile and exit.
-  --print-pf                  Print the generated PF anchor rules and exit.
+  --helper-status             Query the root firewall helper status for this user.
+  --print-profile             Print the generated sandbox profile/summary and exit.
+  --print-firewall            Print generated firewall rules and exit. Alias: --print-pf.
 
 default command:
   claude
