@@ -118,11 +118,23 @@ fn run(args: Vec<String>) -> Result<i32> {
     if options.require_default_route {
         let default_route = route::default_ipv4_interface()?;
         if default_route.as_deref() != Some(selected_interface.name.as_str()) {
-            return Err(err(format!(
-                "default IPv4 route uses {}, not selected VPN interface {}",
-                default_route.as_deref().unwrap_or("<unknown>"),
-                selected_interface.name
-            )));
+            let default_route_name = default_route.as_deref().unwrap_or("<unknown>");
+            if options.enforce_pf
+                && route_gateway.is_some()
+                && PFHelperClient::default().status().is_ok()
+            {
+                eprintln!(
+                    "note: default IPv4 route uses {default_route_name}; PF route-to will steer agent traffic through {}",
+                    selected_interface.name
+                );
+            } else {
+                return Err(err(format!(
+                    "default IPv4 route uses {default_route_name}, not selected VPN interface {} \
+                     (auto-allow needs the PF guard enabled, a point-to-point IPv4 peer on the utun, \
+                     and a reachable root helper; pass --allow-non-default-route to skip this check)",
+                    selected_interface.name
+                )));
+            }
         }
     }
 
@@ -345,6 +357,9 @@ options:
   --no-pf                     Do not install the PF guard. Intended for tests and debugging.
   --shared-user-pf            Use current-UID PF rules instead of helper-managed group isolation.
   --allow-non-default-route   Do not require the system default route to use the selected utun.
+                              Skipped automatically when the PF guard is enabled, the utun has an
+                              IPv4 peer, and the root helper is reachable (PF route-to steers
+                              agent traffic through the utun regardless of the default route).
   --helper-status             Query the root PF helper status for this user.
   --print-profile             Print the generated sandbox-exec profile and exit.
   --print-pf                  Print the generated PF anchor rules and exit.
