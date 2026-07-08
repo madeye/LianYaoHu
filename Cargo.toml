@@ -1,19 +1,10 @@
-[package]
-name = "lianyaohu"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-
-[dependencies]
-lianyaohu-core = { path = "crates/lianyaohu-core" }
-libc.workspace = true
-
 [workspace]
 members = [
+    "crates/lianyaohu-app",
     "crates/lianyaohu-core",
 ]
 default-members = [
-    ".",
+    "crates/lianyaohu-app",
     "crates/lianyaohu-core",
 ]
 resolver = "3"
@@ -21,10 +12,13 @@ resolver = "3"
 [workspace.package]
 authors = ["Max Lv"]
 edition = "2024"
+homepage = "https://github.com/madeye/LianYaoHu"
 license = "MIT"
+repository = "https://github.com/madeye/LianYaoHu"
 version = "0.1.1"
 
 [workspace.dependencies]
+lianyaohu-core = { path = "crates/lianyaohu-core", version = "0.1.1" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -48,7 +48,7 @@ if [[ "${LIANYAOHU_E2E_SKIP_BUILD:-0}" != "1" ]]; then
     echo "cargo-zigbuild is required for the Linux Tart e2e build" >&2
     exit 1
   fi
-  cargo zigbuild --release --target "$TARGET" -p lianyaohu
+  cargo zigbuild --release --target "$TARGET" -p lianyaohu-app
 fi
 
 if [[ ! -x "$LINUX_BIN" ]]; then

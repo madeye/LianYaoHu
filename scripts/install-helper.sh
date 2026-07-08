@@ -15,7 +15,7 @@ if [[ -n "${LIANYAOHU_HELPER_BINARY:-}" ]]; then
 elif [[ -x "$ROOT/bin/lianyaohu" && ! -f "$ROOT/Cargo.toml" ]]; then
   HELPER_BINARY="$ROOT/bin/lianyaohu"
 else
-  cargo build --release -p lianyaohu
+  cargo build --release -p lianyaohu-app
   HELPER_BINARY="$ROOT/target/release/lianyaohu"
 fi
 

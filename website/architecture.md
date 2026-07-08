@@ -12,9 +12,11 @@ Linux uses Landlock/seccomp plus owner-scoped iptables/ip6tables chains on
 
 ```text
 crates/
-├── lianyaohu          single binary: CLI launcher (user-facing) plus the
-│                      `lianyaohu helper` root daemon subcommand that applies
-│                      firewall rules and launches dedicated-group sessions
+├── lianyaohu-app      single binary crate, producing the `lianyaohu`
+│                      executable. It contains the user-facing CLI launcher and
+│                      the `lianyaohu helper` root daemon subcommand that
+│                      applies firewall rules and launches dedicated-group
+│                      sessions
 └── lianyaohu-core     shared library: policy generation + system probes
 ```
 
@@ -35,7 +37,7 @@ launcher and the helper, so both sides always render identical rules:
 | `linux_firewall` | Linux: `LinuxFirewallRuleSet` renders and installs iptables/ip6tables OUTPUT chains for a `(tun/wg, socket owner)` pair; the default helper path matches `_lianyaohu`, while the fallback path matches the caller UID. |
 | `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, while `install <utun>`, `uninstall`, and `status` remain for the current-UID fallback. |
 
-### `lianyaohu` (launcher)
+### `lianyaohu-app` (launcher)
 
 `run()` is a straight pipeline; every step must pass before the agent starts:
 

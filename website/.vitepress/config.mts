@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'LianYaoHu',
   description:
-    'Run code agents inside a constrained macOS sandbox, forced through a VPN utun interface.',
+    'Run code agents inside a constrained sandbox, forced through a selected VPN interface.',
   base: '/LianYaoHu/',
   cleanUrls: true,
   themeConfig: {
