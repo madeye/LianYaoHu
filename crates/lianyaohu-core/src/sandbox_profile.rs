@@ -147,6 +147,23 @@ impl SandboxProfile {
     (regex #"^/dev/ttys[0-9]+$"))
 (allow pseudo-tty)
 
+; TLS: Security.framework loads root CA certificates and trust settings by
+; talking to securityd/trustd over XPC and reading the keychain databases.
+; Without this, Rust agents (rustls-native-certs) see zero root CAs
+; ("No keychain is available") and cannot validate any TLS connection.
+(allow mach-lookup
+    (global-name "com.apple.SecurityServer")
+    (global-name "com.apple.trustd")
+    (global-name "com.apple.trustd.agent"))
+(allow file-read*
+    (subpath "/Library/Keychains")
+    (subpath "/private/var/db/mds"))
+
+; /usr/bin/git is an xcrun shim that refuses to run unless it can read the
+; Xcode license-acceptance state.
+(allow file-read*
+    (literal "/Library/Preferences/com.apple.dt.Xcode.plist"))
+
 (allow network-outbound
     (remote tcp "*:*")
     (remote udp "*:*")
@@ -190,6 +207,9 @@ mod tests {
         assert!(profile.contains(r#"(sysctl-name-prefix "hw.optional.")"#));
         assert!(profile.contains(r#"(regex #"^/dev/ttys[0-9]+$")"#));
         assert!(profile.contains("(allow pseudo-tty)"));
+        assert!(profile.contains(r#"(global-name "com.apple.SecurityServer")"#));
+        assert!(profile.contains(r#"(global-name "com.apple.trustd.agent")"#));
+        assert!(profile.contains(r#"(subpath "/Library/Keychains")"#));
         assert!(!profile.contains(r#"(sysctl-name "kern.hostname")"#));
         assert!(profile.contains("/private/etc/localtime"));
         assert!(profile.contains("/private/var/db/timezone"));
@@ -234,6 +254,27 @@ mod tests {
         });
 
         assert_eq!(result.status, 0, "rust probe failed: {}", result.output);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_root_ca_access() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // TLS stacks load root CAs through Security.framework, which needs
+        // securityd/trustd XPC access; without it agents see zero root CAs
+        // ("No keychain is available") and cannot validate TLS connections.
+        let result = run_in_sandbox(&[
+            "/usr/bin/security",
+            "find-certificate",
+            "-a",
+            "/System/Library/Keychains/SystemRootCertificates.keychain",
+        ]);
+
+        assert_eq!(result.status, 0, "{}", result.output);
+        assert!(result.output.contains("labl"));
     }
 
     #[cfg(target_os = "macos")]
