@@ -138,6 +138,15 @@ impl SandboxProfile {
     (subpath "/private/tmp")
     (subpath "/tmp"))
 
+; TUI agents (codex, fish, claude) put the terminal into raw mode with
+; tcsetattr and open /dev/tty; both need ioctl access to the pty devices.
+; pseudo-tty lets agents allocate nested ptys for interactive subprocesses.
+(allow file-read* file-write* file-ioctl
+    (literal "/dev/tty")
+    (literal "/dev/ptmx")
+    (regex #"^/dev/ttys[0-9]+$"))
+(allow pseudo-tty)
+
 (allow network-outbound
     (remote tcp "*:*")
     (remote udp "*:*")
@@ -179,6 +188,8 @@ mod tests {
         assert!(profile.contains(r#"(sysctl-name "kern.ngroups")"#));
         assert!(profile.contains(r#"(sysctl-name "hw.pagesize")"#));
         assert!(profile.contains(r#"(sysctl-name-prefix "hw.optional.")"#));
+        assert!(profile.contains(r#"(regex #"^/dev/ttys[0-9]+$")"#));
+        assert!(profile.contains("(allow pseudo-tty)"));
         assert!(!profile.contains(r#"(sysctl-name "kern.hostname")"#));
         assert!(profile.contains("/private/etc/localtime"));
         assert!(profile.contains("/private/var/db/timezone"));
@@ -223,6 +234,47 @@ mod tests {
         });
 
         assert_eq!(result.status, 0, "rust probe failed: {}", result.output);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_tty_raw_mode() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // TUI agents enable raw mode via tcsetattr on the terminal; without
+        // tty device + file-ioctl access the sandbox returns EPERM and agents
+        // die with "Operation not permitted". stty -f opens the pty slave and
+        // calls tcsetattr, exercising the same path.
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let mut name = [0 as libc::c_char; 128];
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                name.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let slave_name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .to_string();
+
+        let result = run_in_sandbox(&["/bin/stty", "-f", &slave_name, "raw"]);
+
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert_eq!(
+            result.status, 0,
+            "stty raw on {slave_name}: {}",
+            result.output
+        );
     }
 
     #[cfg(target_os = "macos")]
