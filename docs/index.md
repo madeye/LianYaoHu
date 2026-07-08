@@ -22,10 +22,10 @@ features:
   - icon: 📦
     title: Process sandbox
     details: >-
-      The agent runs under sandbox-exec with a deny-default profile — read-only
-      access to $HOME, writable access to the working directory and an isolated
-      tmpdir; raw sockets, inbound connections, socket binding, and broad sysctl
-      reads are denied.
+      The agent runs under sandbox-exec with a deny-default profile — writable
+      access to $HOME, the working directory, and an isolated tmpdir; raw
+      sockets, inbound connections, socket binding, and broad sysctl reads are
+      denied.
   - icon: 🔒
     title: PF network guard
     details: >-

@@ -18,8 +18,8 @@ By default it:
 - asks the root helper to run the agent as the caller's UID with the dedicated
   `_lianyaohu` effective GID, then applies `sandbox-exec`;
 - removes host-identifying environment variables and sets `TZ=UTC`;
-- exposes the caller's `$HOME` as read-only, while `--cwd` and a per-launch
-  temporary directory are writable;
+- exposes the caller's `$HOME`, `--cwd`, and a per-launch temporary directory
+  as writable, so agents can maintain their own state under `$HOME`;
 - denies raw/system sockets, socket ioctls, inbound sockets, socket binding,
   and broad `sysctl` reads in the process sandbox;
 - installs a temporary PF anchor under `com.apple/lianyaohu-$uid` to match the
@@ -53,8 +53,8 @@ path plus `install`, `uninstall`, and `status` for the current-UID fallback.
 
 Because the child keeps the caller's UID, normal owner-based access to `$HOME`,
 the working tree, keychain, and TCC state behaves like the desktop user. The
-sandbox profile still does not grant write access to `$HOME` except for the
-selected working directory when it lives under `$HOME`.
+sandbox profile grants write access to `$HOME` so agent CLIs can maintain
+their own configuration and credential state.
 
 ## Options
 

@@ -25,7 +25,7 @@ launcher and the helper, so both sides always render identical rules:
 |---|---|
 | `interfaces` | Enumerate interfaces via `getifaddrs`, collect IPv4/IPv6 and point-to-point peer addresses; `validate_utun` requires a `utun*` name that is up, running, and addressed. |
 | `route` | Ask `/sbin/route -n get 1.1.1.1` which interface holds the default IPv4 route. |
-| `sandbox_profile` | Render the `sandbox-exec` SBPL profile (deny-default; read-only access to `$HOME`; writable access to `$PWD` and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow outbound TCP/UDP and the mDNSResponder socket). |
+| `sandbox_profile` | Render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow outbound TCP/UDP and the mDNSResponder socket). |
 | `env_policy` | Sanitize the child environment: allowlist of operational variables and agent credentials (`ANTHROPIC_*`, `OPENAI_*`, `GIT_*`, …), blocklist of host-identity surfaces (`SSH_*`, `XPC_*`, hostname/MAC/serial/timezone markers); forces `TZ=UTC` and sets `LIANYAOHU_SANDBOX=1`. |
 | `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, and rendered sandbox profile. |
 | `pf` | `PFRuleSet` renders the PF anchor rules for a `(utun, socket owner)` pair; the default helper path matches the `_lianyaohu` group, while the fallback path matches the caller UID. `PFGuard` installs fallback rules via the helper or sudo and uninstalls on `Drop`. |

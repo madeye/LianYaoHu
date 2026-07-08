@@ -122,10 +122,11 @@ impl SandboxProfile {
     (subpath "/sbin")
     (subpath "/usr"))
 
-(allow file-read* file-map-executable
-    (subpath "{home}"))
-
+; $HOME is writable so agents can maintain their own state (~/.claude,
+; ~/.codex, credential and cache files). The identity-surface denials above
+; still win over this allow.
 (allow file-read* file-write* file-map-executable
+    (subpath "{home}")
     (subpath "{cwd}")
     (subpath "{tmpdir}"))
 
@@ -160,20 +161,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn profile_allows_home_read_only_and_cwd_writable_but_denies_identity_surfaces() {
+    fn profile_allows_home_and_cwd_writable_but_denies_identity_surfaces() {
         let profile =
             SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
 
         assert!(profile.contains(
-            r#"(allow file-read* file-map-executable
-    (subpath "/Users/example"))"#
-        ));
-        assert!(!profile.contains(
             r#"(allow file-read* file-write* file-map-executable
-    (subpath "/Users/example"))"#
-        ));
-        assert!(profile.contains(
-            r#"(allow file-read* file-write* file-map-executable
+    (subpath "/Users/example")
     (subpath "/Users/example/project")
     (subpath "/tmp/lyh"))"#
         ));
@@ -229,6 +223,28 @@ mod tests {
         });
 
         assert_eq!(result.status, 0, "rust probe failed: {}", result.output);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_home_write() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(format!(".lianyaohu-write-test-{nanos}"));
+
+        let result = run_in_sandbox(&["/usr/bin/touch", &marker.to_string_lossy()]);
+
+        let written = marker.exists();
+        let _ = fs::remove_file(&marker);
+        assert_eq!(result.status, 0, "{}", result.output);
+        assert!(written);
     }
 
     #[cfg(target_os = "macos")]
