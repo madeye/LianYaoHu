@@ -28,7 +28,8 @@ By default it:
 - exposes the caller's `$HOME`, `--cwd`, and a per-launch temporary directory
   as writable, so agents can maintain their own state under `$HOME`;
 - denies raw/system sockets, socket ioctls or kernel APIs, inbound sockets, and
-  socket binding in the process sandbox;
+  socket binding in the process sandbox (on macOS, loopback-only listeners are
+  allowed so OAuth login callbacks and local dev servers work);
 - blocks LAN destinations and non-selected-interface egress for only the
   guarded agent tree.
 

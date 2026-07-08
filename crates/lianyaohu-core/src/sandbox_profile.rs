@@ -41,6 +41,12 @@ impl SandboxProfile {
 (deny sysctl-write)
 (deny network-inbound)
 (deny network-bind)
+; Loopback-only listeners: OAuth callback servers (e.g. `claude /login`) and
+; dev servers bind an ephemeral localhost port and accept same-machine
+; connections. "localhost" matches only the loopback interface, so nothing is
+; reachable from the network; the denies above still cover every other address.
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
 
 (allow process*)
 (allow signal (target self))
@@ -231,6 +237,8 @@ mod tests {
         assert!(profile.contains("(deny socket-ioctl)"));
         assert!(profile.contains("(deny network-inbound)"));
         assert!(profile.contains("(deny network-bind)"));
+        assert!(profile.contains(r#"(allow network-bind (local ip "localhost:*"))"#));
+        assert!(profile.contains(r#"(allow network-inbound (local ip "localhost:*"))"#));
         assert!(profile.contains(r#"(sysctl-name "security.mac.lockdown_mode_state")"#));
         assert!(profile.contains(r#"(sysctl-name "kern.ngroups")"#));
         assert!(profile.contains(r#"(sysctl-name "hw.pagesize")"#));
@@ -289,6 +297,39 @@ mod tests {
         });
 
         assert_eq!(result.status, 0, "rust probe failed: {}", result.output);
+    }
+
+    // Trivially passes when run directly; its real purpose is to be re-run
+    // inside sandbox-exec by generated_profile_allows_localhost_bind, where it
+    // exercises the loopback network-bind/network-inbound allows.
+    #[test]
+    fn localhost_bind_probe() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_localhost_bind() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // OAuth logins (`claude /login`) start a localhost callback server on
+        // an ephemeral port; without the loopback allows the bind fails with
+        // EPERM. Re-run this test binary inside the sandbox, filtered to the
+        // probe test above, so the bind happens under the generated profile.
+        let result = run_in_sandbox_with_tmpdir(|tmpdir| {
+            let probe = tmpdir.join("localhost-bind-probe");
+            fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+            vec![
+                probe.to_string_lossy().to_string(),
+                "tests::localhost_bind_probe".to_string(),
+                "--exact".to_string(),
+            ]
+        });
+
+        assert_eq!(result.status, 0, "localhost bind probe: {}", result.output);
     }
 
     #[cfg(target_os = "macos")]
