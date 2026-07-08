@@ -1,9 +1,0 @@
-[package]
-name = "lianyaohu"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
-
-[dependencies]
-lianyaohu-core = { path = "../lianyaohu-core" }
-libc.workspace = true

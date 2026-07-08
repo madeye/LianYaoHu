@@ -1,7 +1,20 @@
+[package]
+name = "lianyaohu"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+lianyaohu-core = { path = "crates/lianyaohu-core" }
+libc.workspace = true
+
 [workspace]
 members = [
     "crates/lianyaohu-core",
-    "crates/lianyaohu",
+]
+default-members = [
+    ".",
+    "crates/lianyaohu-core",
 ]
 resolver = "3"
 
