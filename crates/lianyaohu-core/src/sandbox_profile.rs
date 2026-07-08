@@ -56,8 +56,8 @@ impl SandboxProfile {
 ; getpagesize(3) read hw.pagesize via sysctl, and Rust binaries abort during
 ; startup when that is denied (stack guard-page setup computes a bogus page
 ; size). Allow the benign machine-description keys Apple's application.sb
-; allows; identity surfaces (kern.hostname, kern.uuid, hw.serialnumber, ...)
-; stay denied by the default-deny.
+; allows; identity surfaces (kern.uuid, hw.serialnumber, ...) stay denied by
+; the default-deny.
 (allow sysctl-read
     (sysctl-name "hw.activecpu")
     (sysctl-name "hw.busfrequency")
@@ -98,6 +98,11 @@ impl SandboxProfile {
     (sysctl-name-prefix "hw.perflevel")
     (sysctl-name "kern.argmax")
     (sysctl-name "kern.bootargs")
+    ; uname(3) reads kern.hostname for the nodename field and fails entirely
+    ; when it is denied, breaking Ruby's Etc.uname and therefore Homebrew.
+    ; The hostname leaks the machine name; stronger identifiers (kern.uuid)
+    ; stay blocked and HOSTNAME is still stripped from the environment.
+    (sysctl-name "kern.hostname")
     (sysctl-name "kern.maxfilesperproc")
     (sysctl-name "kern.ngroups")
     (sysctl-name "kern.osproductversion")
@@ -124,17 +129,22 @@ impl SandboxProfile {
 
 ; $HOME is writable so agents can maintain their own state (~/.claude,
 ; ~/.codex, credential and cache files). The identity-surface denials above
-; still win over this allow.
+; still win over this allow. /opt/homebrew is writable so agents can
+; brew install the tools they need.
 (allow file-read* file-write* file-map-executable
     (subpath "{home}")
     (subpath "{cwd}")
-    (subpath "{tmpdir}"))
+    (subpath "{tmpdir}")
+    (subpath "/opt/homebrew"))
 
+; /dev/fd is how bash implements process substitution (/dev/fd/62); Homebrew
+; uses it on every run.
 (allow file-read* file-write*
     (literal "/dev/null")
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/zero")
+    (subpath "/dev/fd")
     (subpath "/private/tmp")
     (subpath "/tmp"))
 
@@ -155,6 +165,12 @@ impl SandboxProfile {
     (global-name "com.apple.SecurityServer")
     (global-name "com.apple.trustd")
     (global-name "com.apple.trustd.agent"))
+
+; getpwuid/getpwnam and group membership resolve through opendirectoryd;
+; Homebrew (Ruby Dir.home) and many tools look up the current user.
+(allow mach-lookup
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership"))
 (allow file-read*
     (subpath "/Library/Keychains")
     (subpath "/private/var/db/mds"))
@@ -195,7 +211,8 @@ mod tests {
             r#"(allow file-read* file-write* file-map-executable
     (subpath "/Users/example")
     (subpath "/Users/example/project")
-    (subpath "/tmp/lyh"))"#
+    (subpath "/tmp/lyh")
+    (subpath "/opt/homebrew"))"#
         ));
         assert!(profile.contains("(deny system-socket)"));
         assert!(profile.contains("(deny socket-ioctl)"));
@@ -210,7 +227,11 @@ mod tests {
         assert!(profile.contains(r#"(global-name "com.apple.SecurityServer")"#));
         assert!(profile.contains(r#"(global-name "com.apple.trustd.agent")"#));
         assert!(profile.contains(r#"(subpath "/Library/Keychains")"#));
-        assert!(!profile.contains(r#"(sysctl-name "kern.hostname")"#));
+        assert!(profile.contains(r#"(sysctl-name "kern.hostname")"#));
+        assert!(!profile.contains(r#"(sysctl-name "kern.uuid")"#));
+        assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
+        assert!(profile.contains(r#"(subpath "/dev/fd")"#));
+        assert!(profile.contains(r#"(global-name "com.apple.system.opendirectoryd.libinfo")"#));
         assert!(profile.contains("/private/etc/localtime"));
         assert!(profile.contains("/private/var/db/timezone"));
         assert!(profile.contains(r#"(remote tcp "*:*")"#));
@@ -342,14 +363,30 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn generated_profile_blocks_host_sysctl() {
+    fn generated_profile_blocks_host_uuid_sysctl() {
         if skip_sandbox_runtime_tests_in_ci() {
             return;
         }
 
-        let result = run_in_sandbox(&["/usr/sbin/sysctl", "-n", "kern.hostname"]);
+        let result = run_in_sandbox(&["/usr/sbin/sysctl", "-n", "kern.uuid"]);
 
         assert_ne!(result.status, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_uname() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // uname(3) reads kern.hostname among other sysctls and fails entirely
+        // when any of them is denied; Ruby's Etc.uname (and thus Homebrew)
+        // raises on that failure.
+        let result = run_in_sandbox(&["/usr/bin/uname", "-a"]);
+
+        assert_eq!(result.status, 0, "{}", result.output);
+        assert!(result.output.contains("Darwin"));
     }
 
     #[cfg(target_os = "macos")]
