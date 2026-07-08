@@ -89,7 +89,7 @@ On the (Apple Silicon) host:
 
 ```sh
 # LianYaoHu launcher + root helper (one binary; run in this repo)
-cargo build --release -p lianyaohu
+cargo build --release -p lianyaohu-app
 
 # ShadowVPN client for the macOS guest (run in the shadowvpn repo)
 cargo build --release --bin shadowvpn-client

@@ -1,12 +1,15 @@
 [package]
-name = "lianyaohu-core"
+name = "lianyaohu-app"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "lianyaohu"
+path = "src/main.rs"
+
 [dependencies]
+lianyaohu-core = { workspace = true }
 libc.workspace = true
-serde.workspace = true
-serde_json.workspace = true

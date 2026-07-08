@@ -9,9 +9,9 @@ owner-scoped iptables/ip6tables rules on `tun*` or `wg*`.
 Run directly during development:
 
 ```sh
-cargo run -p lianyaohu -- --vpn utun5 -- claude
-cargo run -p lianyaohu -- --vpn utun5 -- codex
-cargo run -p lianyaohu -- --vpn tun0 -- codex
+cargo run -p lianyaohu-app -- --vpn utun5 -- claude
+cargo run -p lianyaohu-app -- --vpn utun5 -- codex
+cargo run -p lianyaohu-app -- --vpn tun0 -- codex
 ```
 
 By default it:
@@ -65,12 +65,12 @@ their own configuration and credential state.
 For inspection without applying PF:
 
 ```sh
-cargo run -p lianyaohu -- --vpn utun5 --print-profile
-cargo run -p lianyaohu -- --vpn tun0 --print-profile
-cargo run -p lianyaohu -- --vpn utun5 --print-firewall
-cargo run -p lianyaohu -- --vpn tun0 --print-firewall
-cargo run -p lianyaohu -- --vpn utun5 --no-pf -- claude
-cargo run -p lianyaohu -- --vpn tun0 --shared-user-firewall -- claude
+cargo run -p lianyaohu-app -- --vpn utun5 --print-profile
+cargo run -p lianyaohu-app -- --vpn tun0 --print-profile
+cargo run -p lianyaohu-app -- --vpn utun5 --print-firewall
+cargo run -p lianyaohu-app -- --vpn tun0 --print-firewall
+cargo run -p lianyaohu-app -- --vpn utun5 --no-pf -- claude
+cargo run -p lianyaohu-app -- --vpn tun0 --shared-user-firewall -- claude
 ```
 
 ## Validation

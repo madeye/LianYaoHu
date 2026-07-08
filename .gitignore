@@ -2,5 +2,5 @@ target/
 dist/
 .DS_Store
 node_modules/
-docs/.vitepress/dist/
-docs/.vitepress/cache/
+website/.vitepress/dist/
+website/.vitepress/cache/
