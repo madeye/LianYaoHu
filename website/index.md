@@ -31,6 +31,13 @@ features:
       A root helper runs each guarded process with the caller UID and a
       dedicated _lianyaohu effective GID, then installs group-scoped PF or
       iptables rules that leave other desktop traffic alone.
+  - icon: 🔑
+    title: Credentials keep working
+    details: >-
+      Agents join the caller's login session, so keychain-backed logins
+      (Claude Code, gh, git credential helpers) don't prompt again, and
+      loopback-only listeners keep OAuth callback flows working inside the
+      sandbox.
   - icon: 🕵️
     title: Identity hygiene
     details: >-

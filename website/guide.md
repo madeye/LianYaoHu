@@ -115,3 +115,35 @@ Tart e2e boots an Ubuntu VM, installs the helper, creates a temporary `tun0`,
 and verifies group-scoped firewall, filesystem, and process-syscall
 enforcement around a real launched process.
 For the full-stack tests in VMs, see [End-to-End Testing](/e2e-testing).
+
+## Troubleshooting
+
+**The agent asks to log in even though the host is already authenticated.**
+On macOS the helper launches agents through `launchctl asuser` so they join
+your login session and can read keychain-backed credentials (Claude Code,
+`gh`, git credential helpers). If an agent still prompts, the installed helper
+is probably older than v0.1.2 — helper changes only take effect after
+reinstalling the LaunchDaemon:
+
+```sh
+scripts/install-helper.sh
+shasum /usr/local/libexec/lianyaohu target/release/lianyaohu  # should match
+```
+
+**OAuth login fails with "Failed to start server. Is port 0 in use?"**
+The login flow binds an ephemeral localhost port for its OAuth callback.
+Profiles generated before v0.1.2 denied all socket binding, which surfaces as
+this misleading port error; current profiles allow loopback-only listeners.
+Rebuild and reinstall the CLI, or use the manual paste-the-code fallback.
+
+**The agent aborts, or a tool fails with "Operation not permitted".**
+Under the deny-default sandbox this usually means a missing profile
+allowance, not firewall or helper logic. Inspect the active policy with
+`--print-profile`, and bisect by re-running the failing command with
+`--no-pf` (skips the helper) or under plain `sandbox-exec -f <profile>` to
+separate sandbox denials from network-guard effects.
+
+**Upgrading.** The CLI and the helper are the same binary but installed in two
+places: `cargo install --path crates/lianyaohu-app` updates the CLI;
+`scripts/install-helper.sh` updates the LaunchDaemon / systemd service. After
+an upgrade, run both.
