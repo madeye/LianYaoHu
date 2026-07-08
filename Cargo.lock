@@ -26,14 +26,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lianyaohu-helper"
-version = "0.1.0"
-dependencies = [
- "lianyaohu-core",
- "libc",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

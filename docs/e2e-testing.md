@@ -40,8 +40,8 @@ credentials (`admin`/`admin`, passwordless sudo).
 On the (Apple Silicon) host:
 
 ```sh
-# LianYaoHu launcher + root helper (run in this repo)
-cargo build --release -p lianyaohu -p lianyaohu-helper
+# LianYaoHu launcher + root helper (one binary; run in this repo)
+cargo build --release -p lianyaohu
 
 # ShadowVPN client for the macOS guest (run in the shadowvpn repo)
 cargo build --release --bin shadowvpn-client
@@ -72,9 +72,9 @@ Install the launcher and helper (prebuilt binaries; this mirrors
 
 ```sh
 sudo install -m755 lianyaohu shadowvpn-client /usr/local/bin/
-sudo install -m755 lianyaohu-helper /usr/local/libexec/lianyaohu-helper
+sudo install -m755 lianyaohu /usr/local/libexec/lianyaohu
 # install /Library/LaunchDaemons/io.github.madeye.lianyaohu.helper.plist
-# (same plist as scripts/install-helper.sh), then:
+# (same plist as scripts/install-helper.sh; it runs "lianyaohu helper"), then:
 sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.madeye.lianyaohu.helper.plist
 lianyaohu --helper-status   # expect: "not installed" (daemon answered)
 ```

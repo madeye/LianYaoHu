@@ -10,10 +10,10 @@ end-to-end validation setup in [e2e-testing.md](e2e-testing.md).
 
 ```text
 crates/
-├── lianyaohu          CLI launcher (user-facing binary)
-├── lianyaohu-core     shared library: policy generation + system probes
-└── lianyaohu-helper   root LaunchDaemon that applies PF rules and launches
-                       dedicated-group sandboxes
+├── lianyaohu          single binary: CLI launcher (user-facing) plus the
+│                      `lianyaohu helper` root LaunchDaemon subcommand that
+│                      applies PF rules and launches dedicated-group sandboxes
+└── lianyaohu-core     shared library: policy generation + system probes
 ```
 
 ### `lianyaohu-core`
@@ -55,10 +55,11 @@ launcher and the helper, so both sides always render identical rules:
    `sandbox-exec` directly from the CLI.
 9. On agent exit, uninstall the PF guard.
 
-### `lianyaohu-helper` (root daemon)
+### `lianyaohu helper` (root daemon)
 
-A minimal root LaunchDaemon (`io.github.madeye.lianyaohu.helper`, installed
-by `scripts/install-helper.sh`) that owns the privileged half of PF
+The same binary run with the `helper` subcommand as a minimal root
+LaunchDaemon (`io.github.madeye.lianyaohu.helper`, installed by
+`scripts/install-helper.sh`) that owns the privileged half of PF
 enforcement:
 
 - Listens on `/var/run/lianyaohu-helper.sock` (mode `0666`; authentication is

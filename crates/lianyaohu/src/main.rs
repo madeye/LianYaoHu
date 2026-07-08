@@ -1,3 +1,5 @@
+mod helper_daemon;
+
 use lianyaohu_core::env_policy;
 use lianyaohu_core::helper::PFHelperClient;
 use lianyaohu_core::interfaces::{NetworkInterface, utun_interfaces, validate_utun};
@@ -46,7 +48,17 @@ impl Default for Options {
 }
 
 fn main() {
-    let code = match run() {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.first().map(String::as_str) == Some("helper") {
+        if let Err(error) = helper_daemon::run() {
+            eprintln!("lianyaohu helper: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let code = match run(args) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("lianyaohu: {error}");
@@ -57,8 +69,8 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run() -> Result<i32> {
-    let options = parse(env::args().skip(1).collect())?;
+fn run(args: Vec<String>) -> Result<i32> {
+    let options = parse(args)?;
 
     if options.helper_status {
         let response = PFHelperClient::default().status()?;
@@ -312,7 +324,7 @@ fn launch_agent_with_session_group(
         .run_session(interface_name, &spec_path)
         .map_err(|error| {
             err(format!(
-                "dedicated group isolation requires an updated lianyaohu-helper: {error}. Run scripts/install-helper.sh, or pass --shared-user-pf to use current-UID PF rules."
+                "dedicated group isolation requires an updated root helper: {error}. Run scripts/install-helper.sh, or pass --shared-user-pf to use current-UID PF rules."
             ))
         });
     let _ = fs::remove_file(&spec_path);
@@ -321,6 +333,10 @@ fn launch_agent_with_session_group(
 
 const USAGE: &str = r#"usage:
   lianyaohu [options] [-- agent [args...]]
+  lianyaohu helper
+
+subcommands:
+  helper                      Run the root PF helper daemon (installed as a LaunchDaemon).
 
 options:
   --vpn NAME                  Select a utun interface without prompting.

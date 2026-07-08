@@ -26,11 +26,8 @@ const MAX_REQUEST_BYTES: usize = 4096;
 /// reply, so one stalled client cannot pin a worker forever.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn main() {
-    if let Err(error) = HelperDaemon::default().run() {
-        eprintln!("lianyaohu-helper: {error}");
-        std::process::exit(1);
-    }
+pub fn run() -> Result<()> {
+    HelperDaemon::default().run()
 }
 
 #[derive(Clone)]
@@ -49,7 +46,7 @@ impl Default for HelperDaemon {
 impl HelperDaemon {
     fn run(&self) -> Result<()> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err(err("lianyaohu-helper must run as root"));
+            return Err(err("lianyaohu helper must run as root"));
         }
         ensure_session_group()?;
 

@@ -2,7 +2,6 @@
 members = [
     "crates/lianyaohu-core",
     "crates/lianyaohu",
-    "crates/lianyaohu-helper",
 ]
 resolver = "3"
 

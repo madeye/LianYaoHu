@@ -3,22 +3,24 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="io.github.madeye.lianyaohu.helper"
-BIN="/usr/local/libexec/lianyaohu-helper"
+BIN="/usr/local/libexec/lianyaohu"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 GROUP_NAME="_lianyaohu"
 GROUP_GID="2000000"
 
 if [[ -n "${LIANYAOHU_HELPER_BINARY:-}" ]]; then
   HELPER_BINARY="$LIANYAOHU_HELPER_BINARY"
-elif [[ -x "$ROOT/bin/lianyaohu-helper" && ! -f "$ROOT/Cargo.toml" ]]; then
-  HELPER_BINARY="$ROOT/bin/lianyaohu-helper"
+elif [[ -x "$ROOT/bin/lianyaohu" && ! -f "$ROOT/Cargo.toml" ]]; then
+  HELPER_BINARY="$ROOT/bin/lianyaohu"
 else
-  cargo build --release -p lianyaohu-helper
-  HELPER_BINARY="$ROOT/target/release/lianyaohu-helper"
+  cargo build --release -p lianyaohu
+  HELPER_BINARY="$ROOT/target/release/lianyaohu"
 fi
 
 sudo install -d -m 755 /usr/local/libexec
 sudo install -m 755 "$HELPER_BINARY" "$BIN"
+# Remove the split-binary helper from installs that predate the merged binary.
+sudo rm -f /usr/local/libexec/lianyaohu-helper
 
 if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >/tmp/lianyaohu-group.$$ 2>/dev/null; then
   existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' /tmp/lianyaohu-group.$$)"
@@ -52,6 +54,7 @@ cat >"$tmp_plist" <<PLIST
   <key>ProgramArguments</key>
   <array>
     <string>${BIN}</string>
+    <string>helper</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

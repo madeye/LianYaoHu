@@ -80,7 +80,7 @@ PF rules or launch a real agent.
 ## Releases
 
 Pushing a tag like `v0.1.0` runs the release workflow. It verifies formatting,
-clippy, and tests, builds `lianyaohu` plus `lianyaohu-helper`, creates a
+clippy, and tests, builds `lianyaohu`, creates a
 `lianyaohu-<version>-<target>.tar.gz` package, and attaches that package plus a
 SHA-256 checksum to the GitHub Release for the tag.
 
