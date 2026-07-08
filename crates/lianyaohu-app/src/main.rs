@@ -368,20 +368,36 @@ fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
             .ok_or_else(|| err(format!("{name} was not found among active VPN interfaces")));
     }
 
+    let interactive =
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
+    let selected = if interactive {
+        select_interface_interactive(&interfaces)?
+    } else {
+        select_interface_numbered(&interfaces)?
+    };
+    Ok(interfaces[selected].clone())
+}
+
+fn interface_entry(offset: usize, interface: &NetworkInterface) -> String {
+    let state = if interface.is_up() && interface.is_running() {
+        "up"
+    } else {
+        "down"
+    };
+    format!(
+        "{}. {} [{}] {}",
+        offset + 1,
+        interface.name,
+        state,
+        interface.address_summary()
+    )
+}
+
+// Non-TTY fallback (piped stdin, scripts): keep the classic numbered prompt.
+fn select_interface_numbered(interfaces: &[NetworkInterface]) -> Result<usize> {
     println!("Select VPN interface ({}):", vpn_interface_description());
     for (offset, interface) in interfaces.iter().enumerate() {
-        let state = if interface.is_up() && interface.is_running() {
-            "up"
-        } else {
-            "down"
-        };
-        println!(
-            "  {}. {} [{}] {}",
-            offset + 1,
-            interface.name,
-            state,
-            interface.address_summary()
-        );
+        println!("  {}", interface_entry(offset, interface));
     }
     print!("choice> ");
     io::stdout().flush()?;
@@ -392,7 +408,157 @@ fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
     if selected == 0 || selected > interfaces.len() {
         return Err(err("invalid VPN interface selection"));
     }
-    Ok(interfaces[selected - 1].clone())
+    Ok(selected - 1)
+}
+
+fn select_interface_interactive(interfaces: &[NetworkInterface]) -> Result<usize> {
+    println!(
+        "Select VPN interface ({}); ↑/↓ to highlight, Enter to confirm, q to cancel:",
+        vpn_interface_description()
+    );
+    let terminal = RawTerminal::enable()?;
+    print!("\x1b[?25l");
+    let mut selected = 0usize;
+    render_interface_menu(interfaces, selected, false)?;
+    loop {
+        match terminal.read_key()? {
+            Key::Up => {
+                selected = selected.checked_sub(1).unwrap_or(interfaces.len() - 1);
+            }
+            Key::Down => selected = (selected + 1) % interfaces.len(),
+            Key::Enter => return Ok(selected),
+            Key::Digit(digit) if (1..=interfaces.len()).contains(&digit) => {
+                render_interface_menu(interfaces, digit - 1, true)?;
+                return Ok(digit - 1);
+            }
+            Key::Cancel => return Err(err("VPN interface selection cancelled")),
+            _ => continue,
+        }
+        render_interface_menu(interfaces, selected, true)?;
+    }
+}
+
+fn render_interface_menu(
+    interfaces: &[NetworkInterface],
+    selected: usize,
+    redraw: bool,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+    if redraw {
+        write!(stdout, "\x1b[{}A", interfaces.len())?;
+    }
+    for (offset, interface) in interfaces.iter().enumerate() {
+        let entry = interface_entry(offset, interface);
+        if offset == selected {
+            writeln!(stdout, "\r\x1b[2K\x1b[7m> {entry}\x1b[0m")?;
+        } else {
+            writeln!(stdout, "\r\x1b[2K  {entry}")?;
+        }
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+enum Key {
+    Up,
+    Down,
+    Enter,
+    Digit(usize),
+    Cancel,
+    Other,
+}
+
+// Puts stdin into raw mode for the picker; Drop restores the terminal and the
+// cursor even when selection errors or is cancelled. ISIG is disabled so
+// Ctrl-C cancels cleanly through the same path instead of killing the process
+// with the terminal still in raw mode.
+struct RawTerminal {
+    original: libc::termios,
+    raw: libc::termios,
+}
+
+impl RawTerminal {
+    fn enable() -> Result<Self> {
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return Err(err("failed to read terminal attributes"));
+        }
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+            return Err(err("failed to enable terminal raw mode"));
+        }
+        Ok(Self { original, raw })
+    }
+
+    fn read_key(&self) -> Result<Key> {
+        let Some(byte) = self.read_byte(true)? else {
+            return Err(err("stdin closed during VPN interface selection"));
+        };
+        Ok(match byte {
+            b'\r' | b'\n' => Key::Enter,
+            0x03 | b'q' => Key::Cancel,
+            byte @ b'1'..=b'9' => Key::Digit(usize::from(byte - b'0')),
+            0x1b => {
+                let first = self.read_byte(false)?;
+                if first.is_none() {
+                    // Bare Escape: no continuation bytes arrived.
+                    return Ok(Key::Cancel);
+                }
+                let second = if first == Some(b'[') {
+                    self.read_byte(false)?
+                } else {
+                    None
+                };
+                match second {
+                    Some(b'A') => Key::Up,
+                    Some(b'B') => Key::Down,
+                    _ => Key::Other,
+                }
+            }
+            _ => Key::Other,
+        })
+    }
+
+    fn read_byte(&self, blocking: bool) -> Result<Option<u8>> {
+        let mut settings = self.raw;
+        settings.c_cc[libc::VMIN] = if blocking { 1 } else { 0 };
+        settings.c_cc[libc::VTIME] = if blocking { 0 } else { 1 };
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &settings) } != 0 {
+            return Err(err("failed to adjust terminal read mode"));
+        }
+        let mut byte = 0u8;
+        loop {
+            let count = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
+                    1,
+                )
+            };
+            if count == 1 {
+                return Ok(Some(byte));
+            }
+            if count == 0 {
+                return Ok(None);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
+        let mut stdout = io::stdout();
+        let _ = write!(stdout, "\x1b[?25h");
+        let _ = stdout.flush();
+    }
 }
 
 fn temporary_directory() -> PathBuf {
