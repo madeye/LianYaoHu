@@ -32,10 +32,6 @@ impl SandboxProfile {
 (deny file-read*
     (literal "/etc/localtime")
     (literal "/private/etc/localtime")
-    (literal "/var/db/timezone")
-    (subpath "/var/db/timezone")
-    (literal "/private/var/db/timezone")
-    (subpath "/private/var/db/timezone")
     (literal "/Library/Preferences/.GlobalPreferences.plist")
     (literal "{home_global_preferences}")
     (subpath "{home_by_host_preferences}"))
@@ -148,6 +144,18 @@ impl SandboxProfile {
     (subpath "/private/tmp")
     (subpath "/tmp"))
 
+; Bun/JavaScriptCore initializes ICU timezone data during startup. With TZ=UTC,
+; it still reads the versioned UTC zoneinfo and ICU timezone bundle; allow only
+; those UTC data files while keeping localtime and preference-based timezone
+; identity blocked above.
+(allow file-read*
+    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
+    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
+    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
+    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
+    (regex #"^/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$")
+    (regex #"^/private/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$"))
+
 ; TUI agents (codex, fish, claude) put the terminal into raw mode with
 ; tcsetattr and open /dev/tty; both need ioctl access to the pty devices.
 ; pseudo-tty lets agents allocate nested ptys for interactive subprocesses.
@@ -233,7 +241,8 @@ mod tests {
         assert!(profile.contains(r#"(subpath "/dev/fd")"#));
         assert!(profile.contains(r#"(global-name "com.apple.system.opendirectoryd.libinfo")"#));
         assert!(profile.contains("/private/etc/localtime"));
-        assert!(profile.contains("/private/var/db/timezone"));
+        assert!(profile.contains("zoneinfo/UTC"));
+        assert!(!profile.contains(r#"(subpath "/private/var/db/timezone")"#));
         assert!(profile.contains(r#"(remote tcp "*:*")"#));
         assert!(profile.contains(r#"(remote udp "*:*")"#));
     }
@@ -296,6 +305,23 @@ mod tests {
 
         assert_eq!(result.status, 0, "{}", result.output);
         assert!(result.output.contains("labl"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_allows_utc_timezone_data() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        let Some(utc_path) = find_utc_timezone_file() else {
+            eprintln!("skipping UTC timezone sandbox test; no macOS timezone DB found");
+            return;
+        };
+        let utc_path = utc_path.to_string_lossy().to_string();
+        let result = run_in_sandbox(&["/bin/cat", &utc_path]);
+
+        assert_eq!(result.status, 0, "cat {utc_path}: {}", result.output);
     }
 
     #[cfg(target_os = "macos")]
@@ -421,6 +447,19 @@ mod tests {
     fn run_in_sandbox(command: &[&str]) -> SandboxRun {
         let command: Vec<String> = command.iter().map(|arg| arg.to_string()).collect();
         run_in_sandbox_with_tmpdir(|_| command)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn find_utc_timezone_file() -> Option<std::path::PathBuf> {
+        let timezone_root = std::path::Path::new("/private/var/db/timezone/tz");
+        let entries = fs::read_dir(timezone_root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path().join("zoneinfo/UTC");
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        None
     }
 
     #[cfg(target_os = "macos")]
