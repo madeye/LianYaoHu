@@ -22,7 +22,7 @@ resolver = "3"
 authors = ["Max Lv"]
 edition = "2024"
 license = "MIT"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 libc = "0.2"
