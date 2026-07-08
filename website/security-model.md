@@ -86,6 +86,10 @@ current-UID PF path; in that mode, the network guard also affects other TCP/UDP
 sockets opened by the desktop user while the agent is running.
 
 Raw, route, and system sockets are not allowed by the process sandbox profile.
+On macOS, `network-bind` and `network-inbound` are denied except on the
+loopback interface, so agents can run localhost-only servers (OAuth login
+callbacks such as `claude /login`, local dev servers) that are unreachable
+from the network.
 On Linux, seccomp also denies bind/listen/accept, mount and namespace escapes,
 ptrace/process-memory inspection, BPF/perf/userfault/io_uring setup, keyring
 APIs, module loading, reboot/accounting/syslog, and other kernel-control

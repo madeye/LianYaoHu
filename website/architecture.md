@@ -29,7 +29,7 @@ launcher and the helper, so both sides always render identical rules:
 |---|---|
 | `interfaces` | Enumerate interfaces via `getifaddrs`, collect IPv4/IPv6 and point-to-point peer addresses; supported VPN interfaces are `utun*` on macOS and `tun*`/`wg*` on Linux. |
 | `route` | Ask the platform route tool which interface would carry `1.1.1.1` (`/sbin/route -n get` on macOS, `ip route get` on Linux). |
-| `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow outbound TCP/UDP and the mDNSResponder socket). |
+| `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow loopback-only bind/inbound, outbound TCP/UDP, and the mDNSResponder socket). |
 | `linux_sandbox` | Linux: build and apply the child sandbox (`PR_SET_NO_NEW_PRIVS`, Landlock filesystem rules, and seccomp-BPF syscall filtering). Launch fails if Landlock is unavailable. |
 | `env_policy` | Sanitize the child environment: allowlist of operational variables and agent credentials (`ANTHROPIC_*`, `OPENAI_*`, `GIT_*`, …), blocklist of host-identity surfaces (`SSH_*`, `XPC_*`, hostname/MAC/serial/timezone markers); forces `TZ=UTC` and sets `LIANYAOHU_SANDBOX=1`. |
 | `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, and the rendered sandbox profile/summary field. |
@@ -145,7 +145,7 @@ The same escape has to defeat several independent mechanisms:
 
 | Layer | Mechanism | Stops |
 |---|---|---|
-| Process sandbox | macOS: `sandbox-exec` SBPL profile; Linux: Landlock + seccomp-BPF | raw/system sockets, socket ioctls or kernel APIs, bind/inbound, filesystem and sysctl probing |
+| Process sandbox | macOS: `sandbox-exec` SBPL profile; Linux: Landlock + seccomp-BPF | raw/system sockets, socket ioctls or kernel APIs, bind/inbound (loopback listeners allowed on macOS), filesystem and sysctl probing |
 | Packet filter | macOS: group-scoped PF anchor; Linux: group-scoped iptables/ip6tables chains | LAN egress, egress on any non-selected interface |
 | Route preflight | default-route check at launch | starting the agent while traffic would bypass the VPN |
 | Environment | `env_policy::sanitize` | host/session identity leaking into the agent process |
