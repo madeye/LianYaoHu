@@ -39,11 +39,11 @@ if [[ ! -x "$build_path/lianyaohu" ]]; then
 fi
 install -m 755 "$build_path/lianyaohu" "$stage_path/bin/lianyaohu"
 
-# Ship the short `lyh` alias alongside the canonical binary when the build
-# produced one (the Cargo [[bin]] target always should).
-if [[ -x "$build_path/lyh" ]]; then
-  install -m 755 "$build_path/lyh" "$stage_path/bin/lyh"
+if [[ ! -x "$build_path/lyh" ]]; then
+  echo "missing executable: $build_path/lyh" >&2
+  exit 1
 fi
+install -m 755 "$build_path/lyh" "$stage_path/bin/lyh"
 
 install -m 755 "$root/scripts/install-helper.sh" "$stage_path/scripts/install-helper.sh"
 install -m 755 "$root/scripts/uninstall-helper.sh" "$stage_path/scripts/uninstall-helper.sh"
@@ -58,7 +58,7 @@ This package was built for ${target}.
 Contents:
 
 - bin/lianyaohu (CLI and root helper daemon in one binary; the daemon runs as \`lianyaohu helper\`)
-- bin/lyh     (short alias for bin/lianyaohu; identical binary)
+- bin/lyh (short alias for bin/lianyaohu; the same program under a short name)
 - scripts/install-helper.sh
 - scripts/uninstall-helper.sh
 
