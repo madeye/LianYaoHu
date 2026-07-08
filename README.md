@@ -1,5 +1,7 @@
 # LianYaoHu
 
+Documentation: <https://madeye.github.io/LianYaoHu/>
+
 LianYaoHu is a Rust CLI/TUI launcher for running Claude Code, Codex, or another
 code agent with a sanitized environment and a helper-managed network guard while
 forcing agent traffic through a selected VPN interface. macOS uses
