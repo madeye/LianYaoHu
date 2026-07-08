@@ -14,9 +14,11 @@ env:
 
 jobs:
   test:
-    # macOS-specific crate: sandbox-exec, PF, getifaddrs, and the runtime
-    # sandbox tests only build/run under target_os = "macos".
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

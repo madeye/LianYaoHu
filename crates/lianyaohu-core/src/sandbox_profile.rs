@@ -204,10 +204,15 @@ pub fn scheme_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::env_policy;
+    #[cfg(target_os = "macos")]
     use std::collections::BTreeMap;
+    #[cfg(target_os = "macos")]
     use std::fs;
+    #[cfg(target_os = "macos")]
     use std::process::Command;
+    #[cfg(target_os = "macos")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

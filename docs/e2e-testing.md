@@ -1,5 +1,53 @@
 # End-to-End Testing in Tart VMs
 
+## Linux helper/firewall/sandbox e2e
+
+Run the automated Linux e2e from the repo root:
+
+```sh
+scripts/e2e-linux-tart.sh
+```
+
+The script builds an aarch64 Linux binary with `cargo zigbuild`, clones or
+reuses an Ubuntu Tart VM (`LIANYAOHU_TART_VM` can override the generated VM
+name), mounts this repo into the guest, installs the helper as a systemd
+service, creates a temporary point-to-point `tun0`, and adds `/1` routes so
+`ip route get 1.1.1.1` selects `tun0`. It also creates a world-readable and
+world-writable directory under `/var` so ordinary Unix permissions would allow
+access if Landlock were not active.
+
+It then starts a host HTTP server on the Tart bridge and launches:
+
+```sh
+lianyaohu --vpn tun0 -- /tmp/lyh-agent-check.sh
+```
+
+Pass criteria:
+
+1. The helper reports `installed` only while the guarded process is running and
+   `not installed` afterwards.
+2. The child runs with effective gid `2000000`.
+3. The child environment contains `TZ=UTC` and `LIANYAOHU_SANDBOX=1`.
+4. The temporary `LYH-$uid` iptables chain contains a `--gid-owner 2000000`
+   OUTPUT jump and returns traffic on `tun0`.
+5. The child cannot `curl` the host LAN HTTP endpoint, while the unguarded guest
+   can reach it before the guarded launch.
+6. The child can write to `/tmp` but cannot read or write the prepared
+   world-accessible `/var/lyh-outside-sandbox` directory.
+7. The child cannot bind/listen on a local TCP socket.
+8. The OUTPUT jump is gone after process exit.
+
+Useful overrides:
+
+```sh
+LIANYAOHU_TART_SOURCE=ghcr.io/cirruslabs/ubuntu:latest
+LIANYAOHU_TART_VM=lyh-linux-e2e
+LIANYAOHU_KEEP_TART_VM=1
+LIANYAOHU_E2E_SKIP_BUILD=1
+```
+
+## macOS helper/PF e2e
+
 This documents the e2e setup used to verify that the root PF helper daemon,
 the `utun` enforcement, and the process sandbox work together on a real
 macOS guest — the acceptance check is `curl ipinfo.io` succeeding *inside*

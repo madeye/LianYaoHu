@@ -5,8 +5,8 @@ hero:
   name: LianYaoHu
   text: 炼妖壶
   tagline: >-
-    Run Claude Code, Codex, or any code agent inside a constrained macOS
-    sandbox — with all of its traffic forced through a VPN utun interface.
+    Run Claude Code, Codex, or any code agent behind a helper-managed VPN
+    network guard on macOS or Linux.
   actions:
     - theme: brand
       text: Getting Started
@@ -20,19 +20,17 @@ hero:
 
 features:
   - icon: 📦
-    title: Process sandbox
+    title: Platform confinement
     details: >-
-      The agent runs under sandbox-exec with a deny-default profile — writable
-      access to $HOME, the working directory, and an isolated tmpdir; raw
-      sockets, inbound connections, socket binding, and broad sysctl reads are
-      denied.
+      macOS runs the agent under sandbox-exec with a deny-default profile.
+      Linux applies Landlock filesystem rules, seccomp syscall filtering, and
+      owner-scoped firewall rules.
   - icon: 🔒
-    title: PF network guard
+    title: Network guard
     details: >-
-      A root helper daemon runs each sandbox with the caller UID and a dedicated
-      _lianyaohu effective GID, installs group-scoped PF rules, blocks LAN
-      destinations, steers IPv4 TCP/UDP into the selected utun, and leaves
-      other desktop traffic alone.
+      A root helper runs each guarded process with the caller UID and a
+      dedicated _lianyaohu effective GID, then installs group-scoped PF or
+      iptables rules that leave other desktop traffic alone.
   - icon: 🕵️
     title: Identity hygiene
     details: >-
@@ -42,6 +40,6 @@ features:
   - icon: 🧪
     title: Verified end to end
     details: >-
-      The full stack — sandbox, root helper, PF anchor, utun routing — is
-      exercised in a Tart macOS VM against a real ShadowVPN tunnel.
+      macOS and Linux helper paths are exercised in Tart VMs; Linux verifies
+      firewall, filesystem, and process-syscall confinement in Ubuntu.
 ---

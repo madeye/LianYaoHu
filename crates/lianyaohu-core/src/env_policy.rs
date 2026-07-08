@@ -76,6 +76,8 @@ const BLOCKED_SUBSTRINGS: &[&str] = &[
     "WIFI",
 ];
 
+const FIXED_SANDBOX_ENV: &[&str] = &["HOME", "PWD", "TMPDIR", "TZ", "LIANYAOHU_SANDBOX"];
+
 pub fn sanitize(
     input: &BTreeMap<String, String>,
     home: &str,
@@ -113,7 +115,7 @@ pub fn sanitize(
     output.insert("LIANYAOHU_SANDBOX".to_string(), "1".to_string());
 
     for (key, value) in extra {
-        if !is_blocked(key) {
+        if !is_blocked(key) && !is_fixed_sandbox_env(key) {
             output.insert(key.clone(), value.clone());
         }
     }
@@ -139,6 +141,10 @@ pub fn is_blocked(key: &str) -> bool {
         || BLOCKED_SUBSTRINGS
             .iter()
             .any(|needle| upper.contains(needle))
+}
+
+fn is_fixed_sandbox_env(key: &str) -> bool {
+    FIXED_SANDBOX_ENV.contains(&key)
 }
 
 #[cfg(test)]
@@ -210,6 +216,43 @@ mod tests {
         assert_eq!(
             output.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some("/Users/example/.claude")
+        );
+    }
+
+    #[test]
+    fn extra_environment_cannot_override_sandbox_roots() {
+        let extra = BTreeMap::from([
+            ("HOME".to_string(), "/".to_string()),
+            ("PWD".to_string(), "/".to_string()),
+            ("TMPDIR".to_string(), "/".to_string()),
+            ("TZ".to_string(), "Asia/Singapore".to_string()),
+            ("LIANYAOHU_SANDBOX".to_string(), "0".to_string()),
+        ]);
+
+        let output = sanitize(
+            &BTreeMap::new(),
+            "/Users/example",
+            "/Users/example/project",
+            "/tmp/lianyaohu",
+            &extra,
+        );
+
+        assert_eq!(
+            output.get("HOME").map(String::as_str),
+            Some("/Users/example")
+        );
+        assert_eq!(
+            output.get("PWD").map(String::as_str),
+            Some("/Users/example/project")
+        );
+        assert_eq!(
+            output.get("TMPDIR").map(String::as_str),
+            Some("/tmp/lianyaohu")
+        );
+        assert_eq!(output.get("TZ").map(String::as_str), Some("UTC"));
+        assert_eq!(
+            output.get("LIANYAOHU_SANDBOX").map(String::as_str),
+            Some("1")
         );
     }
 }

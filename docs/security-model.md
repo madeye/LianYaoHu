@@ -1,10 +1,12 @@
 # Security Model
 
-LianYaoHu is intentionally CLI/TUI-only. It uses two macOS mechanisms:
+LianYaoHu is intentionally CLI/TUI-only. It combines environment cleanup with a
+platform firewall guard:
 
-1. A voluntary process sandbox via `sandbox-exec`.
-2. A PF firewall anchor evaluated through macOS' default `com.apple/*` PF
-   anchor point.
+1. macOS: a voluntary process sandbox via `sandbox-exec` plus a PF firewall
+   anchor evaluated through macOS' default `com.apple/*` PF anchor point.
+2. Linux: a voluntary process sandbox via Landlock and seccomp-BPF plus
+   owner-scoped iptables/ip6tables OUTPUT chains.
 
 ## Filesystem
 
@@ -16,9 +18,16 @@ Write access covers:
 - the selected working directory;
 - a per-launch temporary directory.
 
-Platform and developer tool paths are read-only so shells, interpreters, git,
-node, and installed code-agent CLIs can start. `/opt/homebrew` is writable so
-agents can `brew install` the tools they need.
+On macOS, platform and developer tool paths are read-only so shells,
+interpreters, git, node, and installed code-agent CLIs can start.
+`/opt/homebrew` is writable so agents can `brew install` the tools they need.
+
+On Linux, Landlock applies a deny-default filesystem ruleset. `$HOME`, the
+selected working directory, the per-launch tmpdir, `/tmp`, `/var/tmp`, and
+`/dev` are writable; `/bin`, `/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/opt`,
+and the process' own `/proc` entries are read-only. If the kernel does not
+support Landlock, launch fails instead of silently degrading to firewall-only
+mode.
 
 `uname(3)` (and therefore `kern.hostname`) is allowed because Homebrew, Ruby,
 and many build tools fail hard without it, so the machine name is visible to
@@ -28,11 +37,14 @@ the agent; stronger identifiers such as `kern.uuid` remain blocked and
 Timezone preference files are explicitly denied and the launched environment
 sets `TZ=UTC`.
 
-By default the helper runs the sandboxed process with the caller's UID and the
-dedicated `_lianyaohu` effective GID. The sandbox profile describes where the
-process is allowed to go, but normal POSIX ownership still applies: owner-based
-access remains the caller's access, and supplementary groups keep ordinary
-group-based project access intact.
+By default the helper runs the guarded process with the caller's UID and the
+dedicated `_lianyaohu` effective GID. On macOS, the sandbox profile describes
+where the process is allowed to go, but normal POSIX ownership still applies:
+owner-based access remains the caller's access, and supplementary groups keep
+ordinary group-based project access intact.
+
+On Linux, the helper drops to the caller UID and `_lianyaohu` effective GID
+before applying `PR_SET_NO_NEW_PRIVS`, Landlock, and seccomp in the child.
 
 ## Environment
 
@@ -43,18 +55,19 @@ timezone, Wi-Fi, BSSID, serial, or local-IP markers.
 
 ## Network
 
-The launcher asks the user to choose a `utun` interface and rejects startup
-unless that interface is up, has an address, and is the default IPv4 route.
+The launcher asks the user to choose a supported VPN interface (`utun*` on
+macOS, `tun*` or `wg*` on Linux) and rejects startup unless that interface is
+up, has an address, and is the default IPv4 route.
 
-When PF enforcement is enabled, the launcher asks the root helper to run the
-session. The root helper listens on `/var/run/lianyaohu-helper.sock`,
-authenticates the caller with `getpeereid`, creates or validates the hidden
-`_lianyaohu` group, installs PF rules matching that group, drops the child to
-`uid=caller_uid,gid=_lianyaohu`, and validates that the requested interface is
-an active `utun`. The helper replaces the inherited LaunchDaemon supplementary
-group list with the caller's normal groups before the drop.
+When firewall enforcement is enabled, the launcher asks the root helper to run
+the session. The root helper listens on `/var/run/lianyaohu-helper.sock`,
+authenticates the caller with kernel peer credentials, creates or validates the
+hidden `_lianyaohu` group, installs firewall rules matching that group, drops
+the child to `uid=caller_uid,gid=_lianyaohu`, and validates that the requested
+interface is active. The helper replaces inherited supplementary groups with
+the caller's normal groups before the drop.
 
-The installed PF rules:
+On macOS, the installed PF rules:
 
 - allow loopback TCP/UDP;
 - block TCP/UDP to private, carrier-grade NAT, link-local, multicast, and IPv6
@@ -67,30 +80,48 @@ The installed PF rules:
 
 The default PF rules are group-scoped because macOS PF cannot match a child
 process tree directly. The helper-run path avoids affecting desktop-user
-traffic by moving only the sandboxed child tree to the `_lianyaohu` effective
-GID before it opens sockets. With `--shared-user-pf`, LianYaoHu uses the older
+traffic by moving only the guarded child tree to the `_lianyaohu` effective GID
+before it opens sockets. With `--shared-user-firewall`, LianYaoHu uses the
 current-UID PF path; in that mode, the network guard also affects other TCP/UDP
 sockets opened by the desktop user while the agent is running.
 
 Raw, route, and system sockets are not allowed by the process sandbox profile.
+On Linux, seccomp also denies bind/listen/accept, mount and namespace escapes,
+ptrace/process-memory inspection, BPF/perf/userfault/io_uring setup, keyring
+APIs, module loading, reboot/accounting/syslog, and other kernel-control
+syscalls. `socket(2)` is limited to Unix sockets and IPv4/IPv6 stream or
+datagram sockets; the firewall rules then constrain where those network sockets
+can send traffic.
+
+On Linux, the installed iptables/ip6tables chains:
+
+- allow loopback traffic to continue through the host firewall;
+- reject traffic to private, carrier-grade NAT, link-local, multicast, and IPv6
+  unique-local/link-local/multicast ranges;
+- allow traffic already leaving the selected VPN interface to continue through
+  the host firewall;
+- reject other traffic opened by the `_lianyaohu` effective GID.
 
 ### DNS resolution
 
-The sandbox profile lets the agent reach the system resolver over the
+On macOS, the sandbox profile lets the agent reach the system resolver over the
 mDNSResponder unix socket, so name lookups are performed by **mDNSResponder**,
-not by the agent process. Because the PF rules match the agent's group, they
-do not apply to mDNSResponder: its DNS queries follow the system's routing
-table rather than being steered by the agent's `route-to` rule.
+not by the agent process. Because the PF rules match the agent's group, they do
+not apply to mDNSResponder: its DNS queries follow the system's routing table
+rather than being steered by the agent's `route-to` rule.
 
 In the default configuration this is not a leak — the launcher refuses to start
-unless the selected `utun` is already the default IPv4 route, so mDNSResponder's
-queries traverse the same `utun`. The confinement of DNS therefore depends on
-that default-route invariant:
+unless the selected VPN is already the default IPv4 route, so resolver queries
+traverse the same tunnel. The confinement of DNS therefore depends on that
+default-route invariant:
 
-- With `--allow-non-default-route`, the agent's own connections are still pinned
-  to the `utun` by `route-to`, but its DNS lookups can leave over the real
-  default interface. Do not use that flag when DNS metadata must stay inside the
-  tunnel.
+- On macOS with `--allow-non-default-route`, the agent's own connections are
+  still pinned to the `utun` by `route-to`, but its DNS lookups can leave over
+  the real default interface. Do not use that flag when DNS metadata must stay
+  inside the tunnel.
+- On Linux with `--allow-non-default-route`, neither DNS nor other traffic is
+  route-steered by LianYaoHu; the firewall can block non-selected egress, but it
+  cannot make another interface carry the default route.
 - If the system default route changes while the agent runs, DNS can leave the
   tunnel even though the agent's sockets remain pinned.
 
@@ -101,13 +132,6 @@ with the child sandbox and prevent the requested default `$HOME` access for
 arbitrary code-agent tools. The sandbox boundary for the agent is the generated
 `sandbox-exec` profile.
 
-## Linux Port
-
-The Rust workspace keeps the policy model, helper protocol, CLI parsing, and
-tests portable. macOS-specific enforcement is currently `sandbox-exec` plus PF.
-A Linux backend can add nftables or policy routing in the helper, then combine
-that with Linux sandbox primitives such as namespaces, seccomp, and Landlock.
-
-PF enforcement requires administrator authorization. Without PF, the launcher
-still validates that the selected `utun` is the default route, but it cannot
-force routing by itself.
+On Linux, the process sandbox depends on kernel Landlock and seccomp support.
+LianYaoHu does not build a private mount namespace or overlay filesystem; it
+uses Landlock path rules for filesystem access and seccomp for syscall classes.
