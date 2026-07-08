@@ -77,6 +77,13 @@ The tests validate policy generation, environment filtering, PF token parsing,
 route-output parsing, and selected runtime sandbox denials. They do not install
 PF rules or launch a real agent.
 
+## Releases
+
+Pushing a tag like `v0.1.0` runs the release workflow. It verifies formatting,
+clippy, and tests, builds `lianyaohu` plus `lianyaohu-helper`, creates a
+`lianyaohu-<version>-<target>.tar.gz` package, and attaches that package plus a
+SHA-256 checksum to the GitHub Release for the tag.
+
 ## License
 
 LianYaoHu is licensed under the MIT License.

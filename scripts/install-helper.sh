@@ -8,10 +8,17 @@ PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 GROUP_NAME="_lianyaohu"
 GROUP_GID="2000000"
 
-cargo build --release -p lianyaohu-helper
+if [[ -n "${LIANYAOHU_HELPER_BINARY:-}" ]]; then
+  HELPER_BINARY="$LIANYAOHU_HELPER_BINARY"
+elif [[ -x "$ROOT/bin/lianyaohu-helper" && ! -f "$ROOT/Cargo.toml" ]]; then
+  HELPER_BINARY="$ROOT/bin/lianyaohu-helper"
+else
+  cargo build --release -p lianyaohu-helper
+  HELPER_BINARY="$ROOT/target/release/lianyaohu-helper"
+fi
 
 sudo install -d -m 755 /usr/local/libexec
-sudo install -m 755 "$ROOT/target/release/lianyaohu-helper" "$BIN"
+sudo install -m 755 "$HELPER_BINARY" "$BIN"
 
 if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >/tmp/lianyaohu-group.$$ 2>/dev/null; then
   existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' /tmp/lianyaohu-group.$$)"

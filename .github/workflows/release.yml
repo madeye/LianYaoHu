@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-upload:
+    # LianYaoHu currently depends on macOS-only sandbox/PF APIs.
+    runs-on: macos-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag must look like v0.1.0, got '${tag}'"
+            exit 1
+          fi
+
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          manifest_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "lianyaohu"))'
+          )"
+          if [[ "$manifest_version" != "${{ steps.release.outputs.version }}" ]]; then
+            echo "::error::Tag ${{ steps.release.outputs.tag }} does not match Cargo version ${manifest_version}"
+            exit 1
+          fi
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p lianyaohu -p lianyaohu-helper
+
+      - name: Package release
+        id: package
+        shell: bash
+        run: |
+          target="$(rustc -vV | awk '/host:/ {print $2}')"
+          scripts/package-release.sh "${{ steps.release.outputs.version }}" "$target" target/release dist
+          asset="dist/lianyaohu-${{ steps.release.outputs.version }}-${target}.tar.gz"
+          checksum="${asset}.sha256"
+          echo "asset=${asset}" >>"$GITHUB_OUTPUT"
+          echo "checksum=${checksum}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+
+      - name: Attach package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ASSET: ${{ steps.package.outputs.asset }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        shell: bash
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" "$ASSET" "$CHECKSUM" --clobber
