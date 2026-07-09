@@ -250,6 +250,66 @@ impl Drop for LinuxFirewallGuard {
     }
 }
 
+/// Remove `LYH-*` chains and their OUTPUT jumps left behind by a helper that
+/// exited uncleanly (SIGKILL, crash, systemd restart): the session map lives
+/// in memory, so a restarted helper would otherwise never reap rules whose
+/// sessions no longer exist. Must run as root, before the daemon starts
+/// serving, while no live session owns any chain.
+pub fn reap_stale_chains() {
+    for family in [IpFamily::V4, IpFamily::V6] {
+        let listing = match run_firewall_command(
+            Privilege::Root,
+            family,
+            &["-w".to_string(), "-S".to_string()],
+        ) {
+            Ok(listing) => listing,
+            // ip6tables may be missing entirely; nothing to reap there.
+            Err(_) => continue,
+        };
+        let (jumps, chains) = parse_stale_chain_listing(&listing);
+        for jump in jumps {
+            let mut command = vec!["-w".to_string(), "-D".to_string()];
+            command.extend(jump);
+            let _ = run_firewall_command(Privilege::Root, family, &command);
+        }
+        for chain in chains {
+            let _ = run_firewall_command(
+                Privilege::Root,
+                family,
+                &["-w".to_string(), "-F".to_string(), chain.clone()],
+            );
+            let _ = run_firewall_command(
+                Privilege::Root,
+                family,
+                &["-w".to_string(), "-X".to_string(), chain],
+            );
+        }
+    }
+}
+
+/// Parse `iptables -S` output into the jump rules targeting `LYH-*` chains
+/// (as replayable argument lists, minus the `-A`) and the `LYH-*` chain names.
+fn parse_stale_chain_listing(listing: &str) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut jumps = Vec::new();
+    let mut chains = Vec::new();
+    for line in listing.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["-N", chain] if chain.starts_with("LYH-") => chains.push((*chain).to_string()),
+            ["-A", rest @ ..] => {
+                let targets_lyh_chain = rest.len() >= 2
+                    && rest[rest.len() - 2] == "-j"
+                    && rest[rest.len() - 1].starts_with("LYH-");
+                if targets_lyh_chain {
+                    jumps.push(tokens[1..].iter().map(ToString::to_string).collect());
+                }
+            }
+            _ => {}
+        }
+    }
+    (jumps, chains)
+}
+
 fn run_firewall_command(privilege: Privilege, family: IpFamily, args: &[String]) -> Result<String> {
     let program = firewall_program(family);
     let output = match privilege {
@@ -319,6 +379,50 @@ mod tests {
             "iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 --gid-owner 2000000 -j LYH-1000"
         ));
         assert!(rules.contains("ip6tables -w -A LYH-1000 -d fc00::/7 -j REJECT"));
+    }
+
+    #[test]
+    fn stale_chain_listing_parses_jumps_and_chains() {
+        let listing = "\
+-P OUTPUT ACCEPT
+-N DOCKER-USER
+-N LYH-1000
+-N LYH-1001
+-A OUTPUT -m owner --uid-owner 1000 --gid-owner 2000000 -j LYH-1000
+-A OUTPUT -m owner --uid-owner 1001 -j LYH-1001
+-A OUTPUT -j DOCKER-USER
+-A LYH-1000 -o lo -j RETURN
+-A LYH-1000 -d 10.0.0.0/8 -j REJECT
+";
+
+        let (jumps, chains) = parse_stale_chain_listing(listing);
+
+        assert_eq!(chains, vec!["LYH-1000".to_string(), "LYH-1001".to_string()]);
+        assert_eq!(
+            jumps,
+            vec![
+                vec![
+                    "OUTPUT".to_string(),
+                    "-m".to_string(),
+                    "owner".to_string(),
+                    "--uid-owner".to_string(),
+                    "1000".to_string(),
+                    "--gid-owner".to_string(),
+                    "2000000".to_string(),
+                    "-j".to_string(),
+                    "LYH-1000".to_string(),
+                ],
+                vec![
+                    "OUTPUT".to_string(),
+                    "-m".to_string(),
+                    "owner".to_string(),
+                    "--uid-owner".to_string(),
+                    "1001".to_string(),
+                    "-j".to_string(),
+                    "LYH-1001".to_string(),
+                ],
+            ]
+        );
     }
 
     #[test]

@@ -178,6 +178,7 @@ impl Default for PFHelperClient {
     }
 }
 
+#[derive(Debug)]
 pub struct ReceivedMessage {
     pub message: String,
     pub fds: Vec<OwnedFd>,
@@ -253,35 +254,55 @@ pub fn receive_message_with_fds(
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
+    bytes.truncate(received as usize);
+
+    // recvmsg has already installed any passed descriptors into this process'
+    // fd table, so every one of them must be wrapped in OwnedFd BEFORE any
+    // validation can bail out; an early return that skips the harvest leaks
+    // the fds for the lifetime of the daemon.
+    //
+    // On a truncated control message the kernel can report the sender's
+    // cmsg_len while delivering fewer bytes, so the fd count is clamped to the
+    // control data actually received (msg_controllen); trusting cmsg_len alone
+    // reads past the buffer and harvests garbage descriptor numbers.
+    let mut fds = Vec::new();
+    let mut malformed_control = false;
+    unsafe {
+        let control_start = control.as_ptr() as usize;
+        let control_end = control_start + (msg.msg_controllen as usize).min(control.len());
+        let mut header = libc::CMSG_FIRSTHDR(&msg);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                if (*header).cmsg_len < libc::CMSG_LEN(0) as _ {
+                    malformed_control = true;
+                } else {
+                    let data_start = libc::CMSG_DATA(header) as usize;
+                    let claimed_end = (header as usize).saturating_add((*header).cmsg_len as usize);
+                    let data_end = claimed_end.min(control_end);
+                    let count = data_end.saturating_sub(data_start) / mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(header).cast::<RawFd>();
+                    for index in 0..count {
+                        fds.push(OwnedFd::from_raw_fd(*data.add(index)));
+                    }
+                }
+            }
+            header = libc::CMSG_NXTHDR(&msg, header);
+        }
+    }
+
+    // Dropping `fds` on these error paths closes everything just harvested.
     if msg.msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::other(
             "truncated file descriptors in helper request",
         ));
     }
-    bytes.truncate(received as usize);
-
-    let mut fds = Vec::new();
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&msg);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                if (*header).cmsg_len < libc::CMSG_LEN(0) as _ {
-                    return Err(io::Error::other("malformed helper control message"));
-                }
-                let data_len = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                let count = data_len / mem::size_of::<RawFd>();
-                if fds.len() + count > max_fds {
-                    return Err(io::Error::other(
-                        "too many file descriptors in helper request",
-                    ));
-                }
-                let data = libc::CMSG_DATA(header).cast::<RawFd>();
-                for index in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(*data.add(index)));
-                }
-            }
-            header = libc::CMSG_NXTHDR(&msg, header);
-        }
+    if malformed_control {
+        return Err(io::Error::other("malformed helper control message"));
+    }
+    if fds.len() > max_fds {
+        return Err(io::Error::other(
+            "too many file descriptors in helper request",
+        ));
     }
 
     let message = String::from_utf8(bytes)
@@ -354,6 +375,38 @@ mod tests {
         let mut contents = String::new();
         received_file.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, "fd-ok");
+    }
+
+    // Regression test for a root-helper fd leak: recvmsg installs passed fds
+    // into the process fd table before any validation runs, so rejecting an
+    // over-count SCM_RIGHTS message must still close every received fd. Loop
+    // past the fd soft limit: if the reject path leaks, the table fills and
+    // the error changes (EMFILE from socketpair/recvmsg), failing the assert.
+    #[test]
+    fn rejected_fd_message_does_not_leak_descriptors() {
+        let file = tempfile_file();
+        let iterations = (nofile_soft_limit() / 3 + 16).min(100_000);
+        for _ in 0..iterations {
+            let (left, right) = UnixStream::pair().unwrap();
+            send_message_with_fds(&left, b"run test\n", &[file.as_raw_fd(); 4]).unwrap();
+
+            let error = receive_message_with_fds(&right, 1024, 3).unwrap_err();
+
+            assert!(
+                error.to_string().contains("file descriptors"),
+                "expected fd-count rejection, got: {error}"
+            );
+        }
+    }
+
+    fn nofile_soft_limit() -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        assert_eq!(rc, 0);
+        limit.rlim_cur
     }
 
     fn tempfile_file() -> File {

@@ -48,6 +48,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// threads and memory.
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
+/// Per-UID share of the worker pool. The global cap alone lets one local user
+/// pin every slot with long-lived run sessions and starve other users'
+/// requests; capping each UID below the global limit keeps slots available
+/// for everyone else.
+const MAX_CONNECTIONS_PER_UID: usize = 8;
+
 pub fn run() -> Result<()> {
     HelperDaemon::default().run()
 }
@@ -71,6 +77,7 @@ struct SessionState {
 struct HelperDaemon {
     sessions: Arc<Mutex<BTreeMap<u32, SessionState>>>,
     active_connections: Arc<AtomicUsize>,
+    uid_connections: Arc<Mutex<BTreeMap<u32, usize>>>,
 }
 
 impl Default for HelperDaemon {
@@ -78,6 +85,7 @@ impl Default for HelperDaemon {
         Self {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            uid_connections: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -92,12 +100,59 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// One UID's claim on a worker slot; released on drop, including on panic.
+struct UidSlot {
+    uid_connections: Arc<Mutex<BTreeMap<u32, usize>>>,
+    uid: u32,
+}
+
+impl UidSlot {
+    fn acquire(
+        uid_connections: &Arc<Mutex<BTreeMap<u32, usize>>>,
+        uid: u32,
+        cap: usize,
+    ) -> Option<Self> {
+        let mut connections = uid_connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = connections.entry(uid).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            uid_connections: uid_connections.clone(),
+            uid,
+        })
+    }
+}
+
+impl Drop for UidSlot {
+    fn drop(&mut self) {
+        let mut connections = self
+            .uid_connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = connections.get_mut(&self.uid) {
+            *count -= 1;
+            if *count == 0 {
+                connections.remove(&self.uid);
+            }
+        }
+    }
+}
+
 impl HelperDaemon {
     fn run(&self) -> Result<()> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(err("lianyaohu helper must run as root"));
         }
         ensure_session_group()?;
+        // The session map is in-memory, so firewall state installed by a
+        // previous helper instance that exited uncleanly (SIGKILL, crash,
+        // supervisor restart) would never be reaped. No session is live yet,
+        // so anything found now is stale by definition.
+        reap_stale_sessions();
 
         let socket_path = Path::new(SOCKET_PATH);
         if let Some(parent) = socket_path.parent() {
@@ -140,7 +195,17 @@ impl HelperDaemon {
     fn handle(&self, mut stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let result = self.handle_inner(&mut stream);
+        let result = peer_credentials(&stream).and_then(|peer| {
+            let Some(_uid_slot) =
+                UidSlot::acquire(&self.uid_connections, peer.uid, MAX_CONNECTIONS_PER_UID)
+            else {
+                return Err(err(format!(
+                    "uid {} is at its helper connection limit; retry shortly",
+                    peer.uid
+                )));
+            };
+            self.handle_inner(&mut stream, peer)
+        });
         let response = match result {
             Ok(message) => format!("ok {message}\n"),
             Err(error) => format!("error {error}\n"),
@@ -148,8 +213,7 @@ impl HelperDaemon {
         let _ = stream.write_all(response.as_bytes());
     }
 
-    fn handle_inner(&self, stream: &mut UnixStream) -> Result<String> {
-        let peer = peer_credentials(stream)?;
+    fn handle_inner(&self, stream: &mut UnixStream, peer: PeerCredentials) -> Result<String> {
         let received = receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3)?;
         match parse_request(&received.message)? {
             HelperRequest::Install { interface_name } => {
@@ -798,6 +862,47 @@ fn validated_vpn_interface(
     Ok(selected)
 }
 
+/// Flush firewall state orphaned by a previous helper instance. The PF
+/// enable-reference tokens from `pfctl -E` died with the old process and
+/// cannot be released, so PF may stay enabled; that is benign (an enabled PF
+/// with empty anchors filters nothing extra), unlike stale rules, which keep
+/// blocking a user whose session is long gone.
+#[cfg(target_os = "macos")]
+fn reap_stale_sessions() {
+    match run_pf(&["-a", "com.apple", "-s", "Anchors"]) {
+        Ok(listing) => {
+            for anchor in parse_stale_anchor_listing(&listing) {
+                if let Err(error) = run_pf(&["-a", &anchor, "-F", "rules"]) {
+                    eprintln!("failed to flush stale PF anchor {anchor}: {error}");
+                }
+            }
+        }
+        Err(error) => eprintln!("could not list PF anchors to reap stale sessions: {error}"),
+    }
+    // Rules and profile files from the previous instance; new launches write
+    // fresh ones.
+    if let Ok(entries) = fs::read_dir("/var/run/lianyaohu") {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_stale_anchor_listing(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("com.apple/lianyaohu-"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn reap_stale_sessions() {
+    lianyaohu_core::linux_firewall::reap_stale_chains();
+}
+
 #[cfg(target_os = "macos")]
 fn write_rules(rule_set: &PFRuleSet) -> Result<std::path::PathBuf> {
     let dir = Path::new("/var/run/lianyaohu");
@@ -1145,6 +1250,49 @@ mod tests {
         ] {
             assert!(parse_drop_exec_args(case).is_err(), "{case:?}");
         }
+    }
+
+    #[test]
+    fn uid_slots_cap_per_uid_and_release_on_drop() {
+        let connections = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let held = (0..3)
+            .map(|_| UidSlot::acquire(&connections, 501, 3).expect("slot under cap"))
+            .collect::<Vec<_>>();
+
+        // The capped UID is refused; another UID still gets a slot.
+        assert!(UidSlot::acquire(&connections, 501, 3).is_none());
+        assert!(UidSlot::acquire(&connections, 502, 3).is_some());
+
+        // Releasing one slot frees capacity for the capped UID again.
+        drop(held);
+        assert!(UidSlot::acquire(&connections, 501, 3).is_some());
+        // Fully released UIDs are removed from the map rather than kept at 0.
+        assert!(
+            !connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&502)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_anchor_listing_parses_only_lianyaohu_anchors() {
+        let listing = "\
+  com.apple/250.ApplicationFirewall
+  com.apple/lianyaohu-501
+  com.apple/lianyaohu-502
+  org.example/other
+";
+
+        assert_eq!(
+            parse_stale_anchor_listing(listing),
+            vec![
+                "com.apple/lianyaohu-501".to_string(),
+                "com.apple/lianyaohu-502".to_string(),
+            ]
+        );
     }
 
     #[test]

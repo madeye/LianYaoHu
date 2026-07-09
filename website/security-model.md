@@ -92,9 +92,15 @@ same user share one set of rules, which are removed only when the last session
 ends, so an early-exiting session cannot strip the guard from a running one.
 Concurrent sessions for one UID must use the same VPN interface and scope;
 a mismatching launch is refused rather than silently weakening either session.
-The helper also caps concurrent connections and, on SIGINT/SIGTERM, hands
-shutdown to a dedicated thread (the signal handler only writes to a pipe) that
-removes the socket and uninstalls any remaining firewall state before exit. On macOS the child is spawned
+The helper also caps concurrent connections — globally and per UID, so one
+user's long-lived sessions cannot occupy every worker slot — and, on
+SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only
+writes to a pipe) that removes the socket and uninstalls any remaining
+firewall state before exit. On startup, before serving, the helper reaps
+firewall state orphaned by a previous instance that exited without cleanup
+(SIGKILL, crash, supervisor restart); orphaned rules fail closed — they
+over-block rather than open anything — but would otherwise keep blocking a
+user whose session is long gone. On macOS the child is spawned
 through `launchctl asuser`, joining the caller's Mach bootstrap and audit
 session before credentials are dropped: keychain search lists and unlock state
 are per-session, and without this the agent lands in the system session where
@@ -187,3 +193,29 @@ setuid/setgid binaries from inside the generated sandbox profile, so the agent
 cannot escalate through setuid-root helpers such as `sudo`; a regression test
 pins this behavior. On Linux the helper sets `PR_SET_NO_NEW_PRIVS` in the
 child before Landlock and seccomp.
+
+### Persistence is not contained
+
+The sandbox confines the agent **while it runs**; it does not stop the agent
+from persisting code that runs later, outside the sandbox. `$HOME` is writable
+by design (agents maintain `~/.claude`, `~/.codex`, credentials, caches), and
+on macOS `/opt/homebrew` is writable and executable so agents can
+`brew install` tools. A malicious or compromised agent can therefore drop an
+executable into a `PATH` directory such as `/opt/homebrew/bin`, or edit shell
+startup files (`~/.zshrc`, `~/.config/...`), and that code executes with the
+user's full, unsandboxed privileges the next time a shell or command runs.
+
+This is an accepted trade-off of giving agents a usable home directory and
+tool installation. If your threat model treats the agent itself as the
+adversary, review what it wrote to `$HOME` and the Homebrew prefix before
+trusting the machine, or run it against a dedicated user account.
+
+### Supply chain
+
+The `curl | bash` installer verifies the release tarball against a SHA-256
+checksum downloaded from the same GitHub release. This protects integrity (a
+corrupted download fails), not authenticity: releases are not yet signed, so
+trust rests on GitHub's account and release infrastructure. The uninstaller
+fetches the helper-teardown script from the repository pinned to a release
+tag. Review the scripts before piping them to `bash` if this trust model is
+not acceptable for your environment.
