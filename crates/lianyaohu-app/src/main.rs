@@ -699,7 +699,8 @@ options:
   --vpn NAME                  Select a VPN interface without prompting
                               (macOS: utun*, Linux: tun* or wg*).
   --cwd PATH                  Working directory exposed to the agent. Defaults to current directory.
-  --env NAME=VALUE            Add an environment variable unless it is privacy-blocked.
+  --env NAME=VALUE            Add an environment variable unless it is privacy-blocked or a
+                              code-injection vector (LD_*, DYLD_*, PYTHON*, NODE_OPTIONS, ...).
   --no-firewall               Do not install the firewall guard. Intended for tests and debugging.
                               Alias: --no-pf.
   --shared-user-firewall      Use current-UID firewall rules instead of helper-managed group isolation.
