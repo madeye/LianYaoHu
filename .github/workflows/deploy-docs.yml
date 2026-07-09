@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'scripts/install.sh'
+      - 'scripts/uninstall.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/deploy-docs.yml'

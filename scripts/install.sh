@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LianYaoHu one-line installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/install.sh | bash
+#   curl -fsSL https://lyh.maxlv.net/install.sh | bash
 #
 # Downloads the latest release for this platform, verifies its SHA-256, installs
 # the `lianyaohu` and `lyh` binaries into a PATH directory, and installs the

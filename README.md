@@ -1,6 +1,6 @@
 # LianYaoHu
 
-Documentation: <https://madeye.github.io/LianYaoHu/>
+Documentation: <https://lyh.maxlv.net/>
 
 LianYaoHu is a Rust CLI/TUI launcher for running Claude Code, Codex, or another
 code agent with a sanitized environment and a helper-managed network guard while
@@ -15,7 +15,7 @@ SHA-256, installs the `lianyaohu` and `lyh` binaries into `/usr/local/bin`,
 and installs the root firewall helper:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/install.sh | bash
+curl -fsSL https://lyh.maxlv.net/install.sh | bash
 ```
 
 Prebuilt releases cover Apple Silicon macOS (`aarch64-apple-darwin`) and
@@ -24,15 +24,15 @@ tells you to build from source. Pass options after `bash -s --`, for example
 to skip the root helper or pin a version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/install.sh | bash -s -- --no-helper
-curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/install.sh | bash -s -- --version v0.1.3
+curl -fsSL https://lyh.maxlv.net/install.sh | bash -s -- --no-helper
+curl -fsSL https://lyh.maxlv.net/install.sh | bash -s -- --version v0.1.3
 ```
 
 Uninstall (removes the root helper, the hidden `_lianyaohu` group, and the
 binaries):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/uninstall.sh | bash
+curl -fsSL https://lyh.maxlv.net/uninstall.sh | bash
 ```
 
 Run directly during development:
