@@ -1166,12 +1166,32 @@ mod tests {
         assert!(validated_directory("test", Path::new("/usr"), None).is_ok());
     }
 
+    // A temporary directory owned by the calling uid, as the launcher's
+    // per-launch tmpdir is; the helper rejects a tmpdir the caller does not
+    // own, so tests that expect success must supply an owned one rather than
+    // the shared, root-owned system temp root.
+    fn owned_tmpdir() -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lianyaohu-helper-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn validate_launch_rebuilds_environment_and_ignores_client_profile() {
         let uid = unsafe { libc::getuid() };
-        let home = home_directory_for_uid(uid).unwrap();
+        let home = validated_directory(
+            "home",
+            Path::new(&home_directory_for_uid(uid).unwrap()),
+            Some(uid),
+        )
+        .unwrap();
         let cwd = std::env::current_dir().unwrap();
-        let tmpdir = std::env::temp_dir();
+        let tmpdir = owned_tmpdir();
         let spec = LaunchSpec::new(
             vec!["/bin/echo".to_string(), "ok".to_string()],
             cwd.to_string_lossy().to_string(),
@@ -1189,6 +1209,7 @@ mod tests {
         );
 
         let launch = validate_launch(&spec, uid).unwrap();
+        let _ = fs::remove_dir_all(&tmpdir);
 
         // Home comes from the passwd database, not the client environment.
         assert_eq!(launch.home, home);
