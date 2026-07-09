@@ -56,6 +56,12 @@ API credentials. It drops host and session identity variables such as `HOSTNAME`
 `SSH_AUTH_SOCK`, `SSH_CONNECTION`, `TZ`, `XPC_*`, and names containing MAC,
 timezone, Wi-Fi, BSSID, serial, or local-IP markers.
 
+Loader and language-runtime injection variables are blocked even when passed
+explicitly with `--env`: `LD_*`, `DYLD_*`, `PYTHON*`, `PERL5*`, `BASH_FUNC*`,
+`GLIBC_*`, `NODE_OPTIONS`, `NODE_PATH`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV`,
+`ENV`, `SHELLOPTS`, `ZDOTDIR`, and `IFS`. These change what code every child
+process loads at startup, so they are not accepted from the caller.
+
 ## Network
 
 The launcher asks the user to choose a supported VPN interface (`utun*` on

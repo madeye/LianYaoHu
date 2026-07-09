@@ -45,13 +45,21 @@ const ALLOWED_PREFIXES: &[&str] = &[
 const BLOCKED_EXACT: &[&str] = &[
     "__CF_USER_TEXT_ENCODING",
     "APPLE_PUBSUB_SOCKET_RENDER",
+    "BASH_ENV",
     "DISPLAY",
+    "ENV",
     "HOST",
     "HOSTNAME",
+    "IFS",
     "ITERM_SESSION_ID",
     "LAUNCHINSTANCEID",
+    "NODE_OPTIONS",
+    "NODE_PATH",
     "REMOTEHOST",
+    "RUBYLIB",
+    "RUBYOPT",
     "SECURITYSESSIONID",
+    "SHELLOPTS",
     "SSH_AUTH_SOCK",
     "SSH_CLIENT",
     "SSH_CONNECTION",
@@ -59,6 +67,22 @@ const BLOCKED_EXACT: &[&str] = &[
     "TZ",
     "XPC_FLAGS",
     "XPC_SERVICE_NAME",
+    "ZDOTDIR",
+];
+
+// Families that change what code a process loads or executes at startup
+// (dynamic-loader preloads, interpreter startup files, exported shell
+// functions). Allowing them through --env would let a caller plant code in
+// every process the agent starts, so they are blocked even as extras.
+const BLOCKED_PREFIXES: &[&str] = &[
+    "BASH_FUNC",
+    "DYLD_",
+    "GLIBC_",
+    "LD_",
+    "PERL5",
+    "PYTHON",
+    "SSH_",
+    "XPC_",
 ];
 
 const BLOCKED_SUBSTRINGS: &[&str] = &[
@@ -136,8 +160,9 @@ pub fn is_allowed(key: &str) -> bool {
 pub fn is_blocked(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     BLOCKED_EXACT.contains(&upper.as_str())
-        || upper.starts_with("XPC_")
-        || upper.starts_with("SSH_")
+        || BLOCKED_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
         || BLOCKED_SUBSTRINGS
             .iter()
             .any(|needle| upper.contains(needle))
@@ -216,6 +241,79 @@ mod tests {
         assert_eq!(
             output.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some("/Users/example/.claude")
+        );
+    }
+
+    #[test]
+    fn extra_environment_cannot_inject_loader_or_runtime_knobs() {
+        let injection_keys = [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PYTHONHOME",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "ZDOTDIR",
+            "IFS",
+            "GLIBC_TUNABLES",
+            "BASH_FUNC_ls%%",
+            "ld_preload",
+        ];
+        let extra = injection_keys
+            .iter()
+            .map(|key| (key.to_string(), "injected".to_string()))
+            .collect::<BTreeMap<_, _>>();
+
+        let output = sanitize(
+            &extra.clone(),
+            "/Users/example",
+            "/Users/example/project",
+            "/tmp/lianyaohu",
+            &extra,
+        );
+
+        for key in injection_keys {
+            assert!(!output.contains_key(key), "{key} should be blocked");
+        }
+    }
+
+    #[test]
+    fn extra_environment_still_admits_agent_configuration() {
+        let extra = BTreeMap::from([
+            ("NODE_ENV".to_string(), "production".to_string()),
+            ("MY_AGENT_FLAG".to_string(), "1".to_string()),
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "test-anthropic".to_string(),
+            ),
+        ]);
+
+        let output = sanitize(
+            &BTreeMap::new(),
+            "/Users/example",
+            "/Users/example/project",
+            "/tmp/lianyaohu",
+            &extra,
+        );
+
+        assert_eq!(
+            output.get("NODE_ENV").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(output.get("MY_AGENT_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            output.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("test-anthropic")
         );
     }
 
