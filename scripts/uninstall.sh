@@ -13,11 +13,11 @@
 #
 # Environment overrides: LIANYAOHU_BIN_DIR, LIANYAOHU_REPO (default
 # madeye/LianYaoHu), LIANYAOHU_REF (branch/tag for the helper teardown script,
-# default main).
+# default: the latest release tag, falling back to main).
 set -euo pipefail
 
 REPO="${LIANYAOHU_REPO:-madeye/LianYaoHu}"
-REF="${LIANYAOHU_REF:-main}"
+REF="${LIANYAOHU_REF:-}"
 BIN_DIR="${LIANYAOHU_BIN_DIR:-/usr/local/bin}"
 REMOVE_HELPER=1
 
@@ -46,6 +46,14 @@ as_root() {
 
 if [[ "$REMOVE_HELPER" == "1" ]]; then
   echo "uninstall: removing the root helper (may prompt for sudo)"
+  # Pin the teardown script to a release tag rather than executing whatever is
+  # on the branch tip at run time; fall back to main only if no tag resolves.
+  if [[ -z "$REF" ]]; then
+    location="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+    REF="${location##*/}"
+    [[ "$REF" == v* ]] || REF="main"
+  fi
   # Reuse the canonical helper-teardown script so this stays in one place.
   helper_script="$(mktemp)"
   trap 'rm -f "$helper_script"' EXIT
