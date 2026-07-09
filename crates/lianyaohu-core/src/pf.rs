@@ -18,21 +18,25 @@ pub struct PFRuleSet {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketOwner {
     User(u32),
-    Group(u32),
+    /// Match both the socket's UID and its GID. The session GID alone is
+    /// shared by every helper-run session on the machine, so matching the
+    /// caller's UID too keeps one user's rules from capturing another user's
+    /// agent traffic.
+    UserAndGroup(u32, u32),
 }
 
 impl SocketOwner {
     pub fn clause(self) -> String {
         match self {
             Self::User(uid) => format!("user {uid}"),
-            Self::Group(gid) => format!("group {gid}"),
+            Self::UserAndGroup(uid, gid) => format!("user {uid} group {gid}"),
         }
     }
 
     pub fn description(self) -> String {
         match self {
             Self::User(uid) => format!("uid {uid}"),
-            Self::Group(gid) => format!("gid {gid}"),
+            Self::UserAndGroup(uid, gid) => format!("uid {uid} gid {gid}"),
         }
     }
 }
@@ -60,7 +64,7 @@ impl PFRuleSet {
         Self {
             interface_name: interface_name.into(),
             anchor_key: anchor_uid,
-            socket_owner: SocketOwner::Group(gid),
+            socket_owner: SocketOwner::UserAndGroup(anchor_uid, gid),
             route_ipv4_gateway,
         }
     }
@@ -256,22 +260,26 @@ mod tests {
         let rules =
             PFRuleSet::new_group("utun4", 501, 2_000_000, Some("10.9.0.1".to_string())).render();
 
+        // Session rules must match the caller's UID as well as the shared
+        // session GID; a group-only match would let one user's rules capture
+        // another user's agent traffic.
         assert!(rules.contains(
-            "pass out quick on lo0 proto { tcp udp } from any to any group 2000000 keep state"
+            "pass out quick on lo0 proto { tcp udp } from any to any user 501 group 2000000 keep state"
         ));
         assert!(rules.contains("10.0.0.0/8"));
         assert!(rules.contains("172.16.0.0/12"));
         assert!(rules.contains("192.168.0.0/16"));
         assert!(rules.contains("fc00::/7"));
-        assert!(rules.contains("to $lianyaohu_lan4 group 2000000"));
-        assert!(rules.contains("to $lianyaohu_lan6 group 2000000"));
-        assert!(rules.contains("pass out quick on ! utun4 route-to (utun4 10.9.0.1) inet proto { tcp udp } from any to any group 2000000 keep state"));
+        assert!(rules.contains("to $lianyaohu_lan4 user 501 group 2000000"));
+        assert!(rules.contains("to $lianyaohu_lan6 user 501 group 2000000"));
+        assert!(rules.contains("pass out quick on ! utun4 route-to (utun4 10.9.0.1) inet proto { tcp udp } from any to any user 501 group 2000000 keep state"));
         assert!(rules.contains(
-            "block return out quick on ! utun4 proto { tcp udp } from any to any group 2000000"
+            "block return out quick on ! utun4 proto { tcp udp } from any to any user 501 group 2000000"
         ));
         assert!(rules.contains(
-            "pass out quick on utun4 proto { tcp udp } from any to any group 2000000 keep state"
+            "pass out quick on utun4 proto { tcp udp } from any to any user 501 group 2000000 keep state"
         ));
+        assert!(rules.contains("# Scope: TCP/UDP sockets owned by uid 501 gid 2000000."));
     }
 
     #[test]
