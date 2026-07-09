@@ -51,8 +51,13 @@ impl LinuxSandbox {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        let devices = writable_device_files()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "Linux sandbox:\n  writable: {writable}\n  read-only: /bin, /sbin, /usr, /lib, /lib64, /etc, /opt, /proc/self\n  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
+            "Linux sandbox:\n  writable: {writable}\n  writable devices: {devices}\n  read-only: /bin, /sbin, /usr, /lib, /lib64, /etc, /opt, /proc/self\n  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
         )
     }
 }
@@ -130,6 +135,12 @@ fn apply_landlock(sandbox: &LinuxSandbox) -> Result<()> {
     }
     for path in writable_paths(sandbox) {
         add_path_rule(ruleset_fd.0, &path, read_access | write_access)?;
+    }
+    // Landlock rejects directory-only access rights on non-directory rule
+    // targets, so device files get the file-scoped subset.
+    let file_access = (read_access | write_access) & file_landlock_access();
+    for path in writable_device_files() {
+        add_path_rule(ruleset_fd.0, &path, file_access)?;
     }
 
     let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd.0, 0) };
@@ -229,7 +240,10 @@ fn writable_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
         sandbox.tmpdir.clone(),
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
-        PathBuf::from("/dev"),
+        // Pty slaves and POSIX shared memory need directory-level access;
+        // the rest of /dev is covered by the device-file list below.
+        PathBuf::from("/dev/pts"),
+        PathBuf::from("/dev/shm"),
     ]
     .into_iter()
     .filter_map(safe_writable_path)
@@ -237,6 +251,30 @@ fn writable_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn writable_device_files() -> Vec<PathBuf> {
+    [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/ptmx",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+// The access rights Landlock accepts for rules whose target is a file rather
+// than a directory.
+fn file_landlock_access() -> u64 {
+    LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_TRUNCATE
 }
 
 fn safe_writable_path(path: PathBuf) -> Option<PathBuf> {
@@ -534,6 +572,36 @@ mod tests {
         assert!(summary.contains("/tmp/lyh"));
         assert!(summary.contains("read-only: /bin"));
         assert!(summary.contains("seccomp: deny bind/listen/accept"));
+        assert!(summary.contains("writable devices: /dev/null"));
+    }
+
+    #[test]
+    fn writable_policy_grants_devices_not_all_of_dev() {
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh");
+        let writable = writable_paths(&sandbox);
+
+        assert!(!writable.iter().any(|path| path == Path::new("/dev")));
+        assert!(writable.contains(&PathBuf::from("/dev/pts")));
+        assert!(writable.contains(&PathBuf::from("/dev/shm")));
+
+        let devices = writable_device_files();
+        assert!(devices.contains(&PathBuf::from("/dev/null")));
+        assert!(devices.contains(&PathBuf::from("/dev/urandom")));
+        assert!(devices.contains(&PathBuf::from("/dev/tty")));
+        assert!(devices.contains(&PathBuf::from("/dev/ptmx")));
+    }
+
+    #[test]
+    fn file_rules_carry_only_file_compatible_access() {
+        let handled = handled_landlock_access(3);
+        let file_access = (read_landlock_access(handled) | write_landlock_access(handled))
+            & file_landlock_access();
+
+        assert_eq!(file_access & LANDLOCK_ACCESS_FS_READ_DIR, 0);
+        assert_eq!(file_access & LANDLOCK_ACCESS_FS_MAKE_DIR, 0);
+        assert_eq!(file_access & LANDLOCK_ACCESS_FS_REMOVE_FILE, 0);
+        assert_ne!(file_access & LANDLOCK_ACCESS_FS_READ_FILE, 0);
+        assert_ne!(file_access & LANDLOCK_ACCESS_FS_WRITE_FILE, 0);
     }
 
     #[test]

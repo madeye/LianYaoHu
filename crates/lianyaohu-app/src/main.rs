@@ -561,6 +561,17 @@ impl Drop for RawTerminal {
     }
 }
 
+// The launch tree holds the sandbox profile and the launch spec (command,
+// environment, credentials); keep it owner-only.
+fn create_private_dir(path: &PathBuf) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    Ok(())
+}
+
 fn temporary_directory() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -581,7 +592,7 @@ fn launch_agent(
     profile: &SandboxProfile,
     clean_env: &BTreeMap<String, String>,
 ) -> Result<i32> {
-    fs::create_dir_all(tmpdir)?;
+    create_private_dir(tmpdir)?;
     let profile_path = tmpdir.join("agent.sb");
     fs::write(&profile_path, profile.render())?;
 
@@ -640,7 +651,7 @@ fn launch_agent_with_session_group(
     profile: &SandboxProfile,
     clean_env: &BTreeMap<String, String>,
 ) -> Result<i32> {
-    fs::create_dir_all(tmpdir)?;
+    create_private_dir(tmpdir)?;
     let spec_path = tmpdir.join("launch.json");
     let spec = LaunchSpec::new(command.to_vec(), cwd, clean_env.clone(), profile.render());
     spec.write_json(&spec_path)?;
@@ -665,7 +676,7 @@ fn launch_agent_with_session_group(
     sandbox: &LinuxSandbox,
     clean_env: &BTreeMap<String, String>,
 ) -> Result<i32> {
-    fs::create_dir_all(tmpdir)?;
+    create_private_dir(tmpdir)?;
     let spec_path = tmpdir.join("launch.json");
     let spec = LaunchSpec::new(
         command.to_vec(),
