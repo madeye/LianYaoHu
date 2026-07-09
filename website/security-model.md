@@ -71,10 +71,30 @@ up, has an address, and is the default IPv4 route.
 When firewall enforcement is enabled, the launcher asks the root helper to run
 the session. The root helper listens on `/var/run/lianyaohu-helper.sock`,
 authenticates the caller with kernel peer credentials, creates or validates the
-hidden `_lianyaohu` group, installs firewall rules matching that group, drops
-the child to `uid=caller_uid,gid=_lianyaohu`, and validates that the requested
-interface is active. The helper replaces inherited supplementary groups with
-the caller's normal groups before the drop. On macOS the child is spawned
+hidden `_lianyaohu` group, installs firewall rules matching the caller's UID
+together with that group, drops the child to `uid=caller_uid,gid=_lianyaohu`,
+and validates that the requested interface is active. The helper replaces
+inherited supplementary groups with the caller's normal groups before the
+drop.
+
+The helper treats the client-supplied launch spec as untrusted, since any
+local user can connect to its socket. It rebuilds the sandbox profile
+server-side from inputs it validates itself — the home directory from the
+passwd database for the authenticated peer UID, and a working directory and
+temporary directory that must be real directories (the temporary directory
+owned by the caller) — and re-sanitizes the launch environment with the same
+privacy and injection blocklists the launcher applies. The client's profile
+text is never consumed. Before exec on macOS, the `drop-exec` trampoline
+verifies the credential drop took effect and cannot be reversed.
+
+Firewall sessions are reference-counted per UID: concurrent launches by the
+same user share one set of rules, which are removed only when the last session
+ends, so an early-exiting session cannot strip the guard from a running one.
+Concurrent sessions for one UID must use the same VPN interface and scope;
+a mismatching launch is refused rather than silently weakening either session.
+The helper also caps concurrent connections and, on SIGINT/SIGTERM, hands
+shutdown to a dedicated thread (the signal handler only writes to a pipe) that
+removes the socket and uninstalls any remaining firewall state before exit. On macOS the child is spawned
 through `launchctl asuser`, joining the caller's Mach bootstrap and audit
 session before credentials are dropped: keychain search lists and unlock state
 are per-session, and without this the agent lands in the system session where
@@ -88,14 +108,16 @@ On macOS, the installed PF rules:
   unique-local/link-local/multicast ranges;
 - route IPv4 TCP/UDP opened on non-`utun` interfaces to the selected `utun`
   when the interface exposes a point-to-point IPv4 peer;
-- block TCP/UDP owned by the `_lianyaohu` effective GID on every interface
-  except the selected `utun`;
-- allow TCP/UDP owned by the `_lianyaohu` effective GID on the selected `utun`.
+- block TCP/UDP owned by the caller's UID with the `_lianyaohu` effective GID
+  on every interface except the selected `utun`;
+- allow TCP/UDP owned by the caller's UID with the `_lianyaohu` effective GID
+  on the selected `utun`.
 
-The default PF rules are group-scoped because macOS PF cannot match a child
-process tree directly. The helper-run path avoids affecting desktop-user
-traffic by moving only the guarded child tree to the `_lianyaohu` effective GID
-before it opens sockets. With `--shared-user-firewall`, LianYaoHu uses the
+The default PF rules match UID and GID together because macOS PF cannot match
+a child process tree directly. The `_lianyaohu` effective GID separates the
+guarded child tree from the desktop user's other traffic, and the UID match
+keeps one user's session rules from capturing another user's agent traffic
+when several sessions run at once. With `--shared-user-firewall`, LianYaoHu uses the
 current-UID PF path; in that mode, the network guard also affects other TCP/UDP
 sockets opened by the desktop user while the agent is running.
 
@@ -123,7 +145,8 @@ On Linux, the installed iptables/ip6tables chains:
   unique-local/link-local/multicast ranges;
 - allow traffic already leaving the selected VPN interface to continue through
   the host firewall;
-- reject other traffic opened by the `_lianyaohu` effective GID.
+- reject other traffic opened by the caller's UID with the `_lianyaohu`
+  effective GID.
 
 ### DNS resolution
 

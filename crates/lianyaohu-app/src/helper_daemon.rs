@@ -1,3 +1,4 @@
+use lianyaohu_core::env_policy;
 use lianyaohu_core::helper::{HelperRequest, SOCKET_PATH, parse_request, receive_message_with_fds};
 #[cfg(target_os = "macos")]
 use lianyaohu_core::interfaces::{utun_interfaces, validate_utun};
@@ -16,9 +17,11 @@ use lianyaohu_core::linux_sandbox::LinuxSandbox;
 use lianyaohu_core::pf::{
     LIANYAOHU_GROUP_GID, LIANYAOHU_GROUP_NAME, PFRuleSet, parse_enable_token,
 };
+#[cfg(target_os = "macos")]
+use lianyaohu_core::sandbox_profile::SandboxProfile;
 use lianyaohu_core::{Result, err};
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -26,9 +29,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
 use std::time::Duration;
+use std::{mem, ptr, thread};
 
 /// A request is a single short line; refuse anything larger so a client
 /// cannot exhaust memory by streaming bytes without a newline.
@@ -38,20 +42,53 @@ const MAX_REQUEST_BYTES: usize = 4096;
 /// reply, so one stalled client cannot pin a worker forever.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on concurrent worker threads. Run sessions hold a worker for
+/// the lifetime of the agent, so the cap must comfortably cover legitimate
+/// concurrent sessions while keeping a local flood from pinning unbounded
+/// threads and memory.
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+
 pub fn run() -> Result<()> {
     HelperDaemon::default().run()
 }
 
+/// Firewall state for one caller UID. Sessions are reference-counted: a
+/// second concurrent launch by the same user on the same interface reuses the
+/// installed rules, and the rules come down only when the last session ends.
+struct SessionState {
+    #[cfg(target_os = "macos")]
+    rule_set: PFRuleSet,
+    #[cfg(target_os = "linux")]
+    rule_set: LinuxFirewallRuleSet,
+    refcount: usize,
+    #[cfg(target_os = "macos")]
+    enable_token: Option<String>,
+    #[cfg(target_os = "macos")]
+    rules_path: std::path::PathBuf,
+}
+
 #[derive(Clone)]
 struct HelperDaemon {
-    enable_tokens: Arc<Mutex<BTreeMap<u32, String>>>,
+    sessions: Arc<Mutex<BTreeMap<u32, SessionState>>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl Default for HelperDaemon {
     fn default() -> Self {
         Self {
-            enable_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+}
+
+/// Decrements the active-connection count when a worker finishes, including
+/// on panic, so a crashed worker cannot leak a connection slot.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -69,16 +106,30 @@ impl HelperDaemon {
         let _ = fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
         chmod(socket_path, 0o666)?;
-        install_signal_handlers();
+        install_signal_handlers(self.clone())?;
 
         for stream in listener.incoming() {
             match stream {
                 // Serve each connection on its own thread so a slow or stalled
-                // peer cannot block the others. PF state is shared behind a
-                // mutex; pfctl work is infrequent so contention is negligible.
-                Ok(stream) => {
+                // peer cannot block the others. Firewall state is shared behind
+                // a mutex; pfctl/iptables work is infrequent so contention is
+                // negligible.
+                Ok(mut stream) => {
+                    if self.active_connections.fetch_add(1, Ordering::AcqRel)
+                        >= MAX_CONCURRENT_CONNECTIONS
+                    {
+                        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+                        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                        let _ = stream
+                            .write_all(b"error helper is at its connection limit; retry shortly\n");
+                        continue;
+                    }
+                    let slot = ConnectionSlot(self.active_connections.clone());
                     let daemon = self.clone();
-                    thread::spawn(move || daemon.handle(stream));
+                    thread::spawn(move || {
+                        let _slot = slot;
+                        daemon.handle(stream);
+                    });
                 }
                 Err(error) => eprintln!("accept failed: {error}"),
             }
@@ -113,11 +164,11 @@ impl HelperDaemon {
                 spec_path,
             } => self.run_session(peer, &interface_name, Path::new(&spec_path), received.fds),
             HelperRequest::Uninstall => {
-                self.uninstall(peer.uid);
+                self.release_session(peer.uid);
                 Ok(format!("uninstalled firewall guard for uid {}", peer.uid))
             }
             HelperRequest::Status => {
-                if self.tokens().contains_key(&peer.uid) {
+                if self.lock_sessions().contains_key(&peer.uid) {
                     Ok("installed".to_string())
                 } else {
                     Ok("not installed".to_string())
@@ -126,49 +177,61 @@ impl HelperDaemon {
         }
     }
 
-    fn tokens(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, String>> {
-        self.enable_tokens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, SessionState>> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn install(&self, uid: u32, interface_name: &str) -> Result<()> {
+        let selected = validated_vpn_interface(interface_name)?;
+
         #[cfg(target_os = "macos")]
         {
-            let selected = validated_vpn_interface(interface_name)?;
-            let rule_set = PFRuleSet::new_user(
+            self.acquire_session(PFRuleSet::new_user(
                 selected.name,
                 uid,
                 selected.ipv4_peer_addresses.first().cloned(),
-            );
-            let rules_path = write_rules(&rule_set)?;
-            self.install_rule_set(&rule_set, &rules_path)
+            ))
         }
 
         #[cfg(target_os = "linux")]
         {
-            let selected = validated_vpn_interface(interface_name)?;
-            let rule_set = LinuxFirewallRuleSet::new_user(selected.name, uid);
-            self.install_rule_set(&rule_set)
+            self.acquire_session(LinuxFirewallRuleSet::new_user(selected.name, uid))
         }
     }
 
+    /// Install firewall rules for this rule set, or join the session that
+    /// already holds them. A concurrent session for the same UID must use the
+    /// same interface and owner scope: the rules live under one anchor/chain
+    /// per UID, so two different scopes cannot both be enforced at once, and
+    /// failing closed here beats silently weakening either session.
     #[cfg(target_os = "macos")]
-    fn install_rule_set(&self, rule_set: &PFRuleSet, rules_path: &Path) -> Result<()> {
-        run_pf(&["-n", "-f", &rules_path.to_string_lossy()])?;
-
+    fn acquire_session(&self, rule_set: PFRuleSet) -> Result<()> {
         // Hold the lock across the pfctl calls: it serializes pfctl (which is
-        // not safe to run concurrently) and keeps the enable-token map in sync
-        // with PF's enable-reference count.
-        let mut tokens = self.tokens();
+        // not safe to run concurrently) and keeps the session map in sync with
+        // PF's enable-reference count.
+        let mut sessions = self.lock_sessions();
+        if let Some(state) = sessions.get_mut(&rule_set.anchor_key) {
+            if state.rule_set.interface_name != rule_set.interface_name
+                || state.rule_set.socket_owner != rule_set.socket_owner
+            {
+                return Err(session_conflict_error(&state.rule_set));
+            }
+            state.refcount += 1;
+            return Ok(());
+        }
 
-        // Enable PF at most once per anchor. A repeat install (relaunched agent,
-        // concurrent launch) must NOT call `pfctl -E` again, or it leaks an
-        // enable reference that uninstall never releases.
-        let token = if tokens.contains_key(&rule_set.anchor_key) {
-            None
-        } else {
-            parse_enable_token(&run_pf(&["-E"])?)
+        let rules_path = write_rules(&rule_set)?;
+        if let Err(error) = run_pf(&["-n", "-f", &rules_path.to_string_lossy()]) {
+            let _ = fs::remove_file(&rules_path);
+            return Err(error);
+        }
+
+        let enable_token = match run_pf(&["-E"]) {
+            Ok(output) => parse_enable_token(&output),
+            Err(error) => {
+                let _ = fs::remove_file(&rules_path);
+                return Err(error);
+            }
         };
 
         if let Err(error) = run_pf(&[
@@ -177,35 +240,75 @@ impl HelperDaemon {
             "-f",
             &rules_path.to_string_lossy(),
         ]) {
-            // Only roll back an enable reference we just acquired; a reused
-            // reference belongs to the prior install and must survive.
-            if let Some(token) = &token {
+            if let Some(token) = &enable_token {
                 let _ = run_pf(&["-X", token]);
             }
+            let _ = fs::remove_file(&rules_path);
             return Err(error);
         }
 
-        if let Some(token) = token {
-            tokens.insert(rule_set.anchor_key, token);
-        }
+        sessions.insert(
+            rule_set.anchor_key,
+            SessionState {
+                rule_set,
+                refcount: 1,
+                enable_token,
+                rules_path,
+            },
+        );
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
-    fn install_rule_set(&self, rule_set: &LinuxFirewallRuleSet) -> Result<()> {
-        let mut tokens = self.tokens();
-        if tokens.contains_key(&rule_set.anchor_key) {
-            return Err(err(format!(
-                "firewall guard is already installed for uid {}",
-                rule_set.anchor_key
-            )));
+    fn acquire_session(&self, rule_set: LinuxFirewallRuleSet) -> Result<()> {
+        let mut sessions = self.lock_sessions();
+        if let Some(state) = sessions.get_mut(&rule_set.anchor_key) {
+            if state.rule_set.interface_name != rule_set.interface_name
+                || state.rule_set.socket_owner != rule_set.socket_owner
+            {
+                return Err(session_conflict_error(&state.rule_set));
+            }
+            state.refcount += 1;
+            return Ok(());
         }
 
         let mut guard = LinuxFirewallGuard::new_root(rule_set.clone());
         guard.install()?;
         guard.disarm();
-        tokens.insert(rule_set.anchor_key, "linux-firewall".to_string());
+        sessions.insert(
+            rule_set.anchor_key,
+            SessionState {
+                rule_set,
+                refcount: 1,
+            },
+        );
         Ok(())
+    }
+
+    /// Drop one reference to the UID's session; tear the rules down only when
+    /// the last concurrent session ends, so an early-exiting session cannot
+    /// strip the firewall out from under a still-running one.
+    fn release_session(&self, uid: u32) {
+        let mut sessions = self.lock_sessions();
+        let Some(state) = sessions.get_mut(&uid) else {
+            return;
+        };
+        state.refcount -= 1;
+        if state.refcount > 0 {
+            return;
+        }
+        if let Some(state) = sessions.remove(&uid) {
+            teardown_session(&state);
+        }
+    }
+
+    /// Uninstall every remaining session's firewall state. Used on shutdown
+    /// so a stopped helper does not leave rules behind.
+    fn teardown_all_sessions(&self) {
+        let mut sessions = self.lock_sessions();
+        while let Some((_, state)) = sessions.pop_first() {
+            teardown_session(&state);
+        }
     }
 
     fn run_session(
@@ -224,67 +327,64 @@ impl HelperDaemon {
         let spec = LaunchSpec::read_json(spec_path)?;
         ensure_session_group()?;
         let selected = validated_vpn_interface(interface_name)?;
+        let launch = validate_launch(&spec, peer.uid)?;
 
         #[cfg(target_os = "macos")]
-        {
-            let rule_set = PFRuleSet::new_group(
-                selected.name,
-                peer.uid,
-                LIANYAOHU_GROUP_GID,
-                selected.ipv4_peer_addresses.first().cloned(),
-            );
-            let rules_path = write_rules(&rule_set)?;
-
-            if let Err(error) = self.install_rule_set(&rule_set, &rules_path) {
-                let _ = fs::remove_file(rules_path);
-                return Err(error);
-            }
-            let run_result =
-                run_launch_spec(&spec, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
-            self.uninstall(peer.uid);
-            let _ = fs::remove_file(rules_path);
-
-            run_result.map(|code| format!("exit {code}"))
-        }
-
+        let rule_set = PFRuleSet::new_group(
+            selected.name,
+            peer.uid,
+            LIANYAOHU_GROUP_GID,
+            selected.ipv4_peer_addresses.first().cloned(),
+        );
         #[cfg(target_os = "linux")]
-        {
-            let rule_set =
-                LinuxFirewallRuleSet::new_group(selected.name, peer.uid, LIANYAOHU_GROUP_GID);
-            self.install_rule_set(&rule_set)?;
-            let run_result =
-                run_launch_spec(&spec, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
-            self.uninstall(peer.uid);
+        let rule_set =
+            LinuxFirewallRuleSet::new_group(selected.name, peer.uid, LIANYAOHU_GROUP_GID);
 
-            run_result.map(|code| format!("exit {code}"))
+        self.acquire_session(rule_set)?;
+        let run_result =
+            run_launch_spec(&launch, peer.uid, peer.gid, LIANYAOHU_GROUP_GID, stdio_fds);
+        self.release_session(peer.uid);
+
+        run_result.map(|code| format!("exit {code}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn session_conflict_error(active: &PFRuleSet) -> lianyaohu_core::Error {
+    err(format!(
+        "uid {} already has an active session on {} ({}); concurrent sessions must use the same \
+         interface and scope, or wait for the running session to exit",
+        active.anchor_key,
+        active.interface_name,
+        active.socket_owner.description(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn session_conflict_error(active: &LinuxFirewallRuleSet) -> lianyaohu_core::Error {
+    err(format!(
+        "uid {} already has an active session on {} ({}); concurrent sessions must use the same \
+         interface and scope, or wait for the running session to exit",
+        active.anchor_key,
+        active.interface_name,
+        active.socket_owner.description(),
+    ))
+}
+
+fn teardown_session(state: &SessionState) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_pf(&["-a", &state.rule_set.anchor_name(), "-F", "rules"]);
+        if let Some(token) = &state.enable_token {
+            let _ = run_pf(&["-X", token]);
         }
+        let _ = fs::remove_file(&state.rules_path);
     }
 
-    fn uninstall(&self, uid: u32) {
-        #[cfg(target_os = "macos")]
-        {
-            let rule_set = PFRuleSet::new_user("utun0", uid, None);
-            let mut tokens = self.tokens();
-            let _ = run_pf(&["-a", &rule_set.anchor_name(), "-F", "rules"]);
-            if let Some(token) = tokens.remove(&uid) {
-                let _ = run_pf(&["-X", &token]);
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let mut user_guard =
-                LinuxFirewallGuard::new_root(LinuxFirewallRuleSet::new_user("tun0", uid));
-            user_guard.uninstall();
-            let mut group_guard = LinuxFirewallGuard::new_root(LinuxFirewallRuleSet::new_group(
-                "tun0",
-                uid,
-                LIANYAOHU_GROUP_GID,
-            ));
-            group_guard.uninstall();
-            let mut tokens = self.tokens();
-            tokens.remove(&uid);
-        }
+    #[cfg(target_os = "linux")]
+    {
+        let mut guard = LinuxFirewallGuard::new_root(state.rule_set.clone());
+        guard.uninstall();
     }
 }
 
@@ -294,19 +394,137 @@ struct PeerCredentials {
     gid: u32,
 }
 
+/// Launch inputs the helper has validated itself. The client-supplied spec is
+/// untrusted — any local user can connect to the helper socket — so the
+/// sandbox policy roots are derived server-side: the home directory comes
+/// from the passwd database for the authenticated peer UID, cwd/tmpdir must
+/// be real directories (tmpdir owned by the caller), and the environment is
+/// re-sanitized with the same policy the client claims to have applied. The
+/// client's sandbox_profile text is ignored entirely.
+struct ValidatedLaunch {
+    command: Vec<String>,
+    cwd: String,
+    home: String,
+    tmpdir: String,
+    environment: BTreeMap<String, String>,
+}
+
+fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
+    spec.validate()?;
+    let home = home_directory_for_uid(uid)?;
+    let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
+    let cwd = validated_directory("working directory", Path::new(&spec.cwd), None)?;
+    let tmpdir = spec
+        .environment
+        .get("TMPDIR")
+        .ok_or_else(|| err("launch environment is missing TMPDIR"))?;
+    let tmpdir = validated_directory("temporary directory", Path::new(tmpdir), Some(uid))?;
+
+    // Treat the entire client environment as untrusted extras: privacy and
+    // injection blocklists apply, and the sandbox roots are pinned to the
+    // values validated above.
+    let environment =
+        env_policy::sanitize(&BTreeMap::new(), &home, &cwd, &tmpdir, &spec.environment);
+
+    Ok(ValidatedLaunch {
+        command: spec.command.clone(),
+        cwd,
+        home,
+        tmpdir,
+        environment,
+    })
+}
+
+fn validated_directory(what: &str, path: &Path, required_owner: Option<u32>) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !path.is_absolute() {
+        return Err(err(format!("{what} {} is not absolute", path.display())));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| err(format!("{what} {}: {error}", path.display())))?;
+    if canonical == Path::new("/") {
+        return Err(err(format!("{what} must not be the filesystem root")));
+    }
+    let metadata = fs::metadata(&canonical)?;
+    if !metadata.is_dir() {
+        return Err(err(format!(
+            "{what} {} is not a directory",
+            canonical.display()
+        )));
+    }
+    if let Some(owner) = required_owner
+        && metadata.uid() != owner
+    {
+        return Err(err(format!(
+            "{what} {} is not owned by uid {owner}",
+            canonical.display()
+        )));
+    }
+    canonical
+        .to_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| err(format!("{what} {} is not valid UTF-8", canonical.display())))
+}
+
+fn home_directory_for_uid(uid: u32) -> Result<String> {
+    let mut buffer_len = 1024usize;
+    loop {
+        let mut passwd = unsafe { mem::zeroed::<libc::passwd>() };
+        let mut buffer = vec![0u8; buffer_len];
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut passwd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buffer_len < 1024 * 1024 {
+            buffer_len *= 2;
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc).into());
+        }
+        if result.is_null() {
+            return Err(err(format!("no passwd entry for uid {uid}")));
+        }
+        let dir = unsafe { CStr::from_ptr(passwd.pw_dir) };
+        return Ok(dir
+            .to_str()
+            .map_err(|_| err(format!("home directory for uid {uid} is not valid UTF-8")))?
+            .to_string());
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn run_launch_spec(
-    spec: &LaunchSpec,
+    launch: &ValidatedLaunch,
     uid: u32,
     primary_gid: u32,
     session_gid: u32,
     mut stdio_fds: Vec<OwnedFd>,
 ) -> Result<i32> {
+    static LAUNCH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
     let run_dir = Path::new("/var/run/lianyaohu");
     fs::create_dir_all(run_dir)?;
     chmod(run_dir, 0o755)?;
-    let profile_path = run_dir.join(format!("profile-{uid}-{}.sb", std::process::id()));
-    fs::write(&profile_path, &spec.sandbox_profile)?;
+    // Unique per launch: two concurrent sessions for one uid must not race on
+    // the same profile file.
+    let profile_path = run_dir.join(format!(
+        "profile-{uid}-{}-{}.sb",
+        std::process::id(),
+        LAUNCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // The profile is rebuilt here from the validated roots; the client's
+    // profile text is never consumed.
+    let profile = SandboxProfile::new(&launch.home, &launch.cwd, &launch.tmpdir).render();
+    fs::write(&profile_path, profile)?;
     chown(
         &profile_path,
         uid as libc::uid_t,
@@ -348,10 +566,10 @@ fn run_launch_spec(
         .arg("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(profile_arg)
-        .args(&spec.command)
-        .current_dir(&spec.cwd)
+        .args(&launch.command)
+        .current_dir(&launch.cwd)
         .env_clear()
-        .envs(&spec.environment)
+        .envs(&launch.environment)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -367,7 +585,7 @@ fn run_launch_spec(
 
 #[cfg(target_os = "linux")]
 fn run_launch_spec(
-    spec: &LaunchSpec,
+    launch: &ValidatedLaunch,
     uid: u32,
     primary_gid: u32,
     session_gid: u32,
@@ -376,18 +594,20 @@ fn run_launch_spec(
     let stdin = File::from(stdio_fds.remove(0));
     let stdout = File::from(stdio_fds.remove(0));
     let stderr = File::from(stdio_fds.remove(0));
-    let executable = spec
+    let executable = launch
         .command
         .first()
         .ok_or_else(|| err("launch spec command is empty"))?;
-    let sandbox = LinuxSandbox::from_environment(spec.cwd.as_str(), &spec.environment)?;
+    // Sandbox roots come from the helper-validated launch, not from whatever
+    // HOME/TMPDIR the client put in the spec.
+    let sandbox = LinuxSandbox::new(&launch.home, &launch.cwd, &launch.tmpdir);
 
     let mut command = Command::new(executable);
     command
-        .args(&spec.command[1..])
-        .current_dir(&spec.cwd)
+        .args(&launch.command[1..])
+        .current_dir(&launch.cwd)
         .env_clear()
-        .envs(&spec.environment)
+        .envs(&launch.environment)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -427,6 +647,20 @@ pub fn drop_exec(args: &[String]) -> Result<()> {
         }
         if libc::setuid(uid as libc::uid_t) != 0 {
             return Err(err(format!("setuid {uid}: {}", io::Error::last_os_error())));
+        }
+        // macOS has no PR_SET_NO_NEW_PRIVS; verify the drop is complete and
+        // irreversible before exec'ing the (caller-chosen) command. setuid(uid)
+        // from root sets the saved uid too, so regaining root must fail.
+        if libc::getuid() != uid as libc::uid_t || libc::geteuid() != uid as libc::uid_t {
+            return Err(err("drop-exec: uid drop did not take effect"));
+        }
+        if libc::getgid() != gid as libc::gid_t || libc::getegid() != gid as libc::gid_t {
+            return Err(err("drop-exec: gid drop did not take effect"));
+        }
+        if uid != 0 && libc::setuid(0) == 0 {
+            return Err(err(
+                "drop-exec: credential drop is reversible; refusing to exec",
+            ));
         }
     }
     let error = Command::new(&command[0]).args(&command[1..]).exec();
@@ -817,7 +1051,30 @@ fn chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<()> {
     }
 }
 
-fn install_signal_handlers() {
+/// Write end of the shutdown self-pipe. The signal handler's only job is to
+/// push the signal number into this pipe; everything else happens on a normal
+/// thread where non-async-signal-safe work (unlink, pfctl, exit handlers) is
+/// legal.
+static SIGNAL_PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn handle_signal(signal: libc::c_int) {
+    let fd = SIGNAL_PIPE_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = signal as u8;
+        unsafe {
+            libc::write(fd, ptr::from_ref(&byte).cast(), 1);
+        }
+    }
+}
+
+fn install_signal_handlers(daemon: HelperDaemon) -> Result<()> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    SIGNAL_PIPE_WRITE_FD.store(fds[1], Ordering::Relaxed);
+    let read_fd = fds[0];
+    thread::spawn(move || shutdown_on_signal(read_fd, daemon));
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -828,15 +1085,24 @@ fn install_signal_handlers() {
             handle_signal as *const () as libc::sighandler_t,
         );
     }
+    Ok(())
 }
 
-extern "C" fn handle_signal(signal: libc::c_int) {
-    if let Ok(path) = CString::new(SOCKET_PATH) {
-        unsafe {
-            libc::unlink(path.as_ptr());
+fn shutdown_on_signal(read_fd: libc::c_int, daemon: HelperDaemon) {
+    let mut byte = 0u8;
+    loop {
+        let received = unsafe { libc::read(read_fd, ptr::from_mut(&mut byte).cast(), 1) };
+        if received == 1 {
+            break;
         }
+        if received < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return;
     }
-    std::process::exit(128 + signal);
+    let _ = fs::remove_file(SOCKET_PATH);
+    daemon.teardown_all_sessions();
+    std::process::exit(128 + i32::from(byte));
 }
 
 #[cfg(test)]
@@ -879,5 +1145,108 @@ mod tests {
         ] {
             assert!(parse_drop_exec_args(case).is_err(), "{case:?}");
         }
+    }
+
+    #[test]
+    fn home_directory_for_current_uid_resolves() {
+        let uid = unsafe { libc::getuid() };
+        let home = home_directory_for_uid(uid).unwrap();
+
+        assert!(home.starts_with('/'));
+        assert!(Path::new(&home).is_dir());
+    }
+
+    #[test]
+    fn validated_directory_rejects_bad_inputs() {
+        assert!(validated_directory("test", Path::new("relative/path"), None).is_err());
+        assert!(validated_directory("test", Path::new("/"), None).is_err());
+        assert!(validated_directory("test", Path::new("/nonexistent-lianyaohu"), None).is_err());
+        // Owned by root, not by an arbitrary high uid.
+        assert!(validated_directory("test", Path::new("/usr"), Some(4_000_000)).is_err());
+        assert!(validated_directory("test", Path::new("/usr"), None).is_ok());
+    }
+
+    // A temporary directory owned by the calling uid, as the launcher's
+    // per-launch tmpdir is; the helper rejects a tmpdir the caller does not
+    // own, so tests that expect success must supply an owned one rather than
+    // the shared, root-owned system temp root.
+    fn owned_tmpdir() -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lianyaohu-helper-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn validate_launch_rebuilds_environment_and_ignores_client_profile() {
+        let uid = unsafe { libc::getuid() };
+        let home = validated_directory(
+            "home",
+            Path::new(&home_directory_for_uid(uid).unwrap()),
+            Some(uid),
+        )
+        .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let tmpdir = owned_tmpdir();
+        let spec = LaunchSpec::new(
+            vec!["/bin/echo".to_string(), "ok".to_string()],
+            cwd.to_string_lossy().to_string(),
+            BTreeMap::from([
+                ("TMPDIR".to_string(), tmpdir.to_string_lossy().to_string()),
+                ("HOME".to_string(), "/somewhere/forged".to_string()),
+                ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+                (
+                    "DYLD_INSERT_LIBRARIES".to_string(),
+                    "/tmp/evil.dylib".to_string(),
+                ),
+                ("MY_AGENT_FLAG".to_string(), "1".to_string()),
+            ]),
+            "(allow default)",
+        );
+
+        let launch = validate_launch(&spec, uid).unwrap();
+        let _ = fs::remove_dir_all(&tmpdir);
+
+        // Home comes from the passwd database, not the client environment.
+        assert_eq!(launch.home, home);
+        assert_eq!(launch.environment.get("HOME"), Some(&home));
+        // Injection vectors are stripped even though the client sent them.
+        assert!(!launch.environment.contains_key("LD_PRELOAD"));
+        assert!(!launch.environment.contains_key("DYLD_INSERT_LIBRARIES"));
+        // Benign agent configuration passes through.
+        assert_eq!(
+            launch.environment.get("MY_AGENT_FLAG").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            launch
+                .environment
+                .get("LIANYAOHU_SANDBOX")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn validate_launch_rejects_forged_tmpdir() {
+        let uid = unsafe { libc::getuid() };
+        let cwd = std::env::current_dir().unwrap();
+        // /usr is not owned by the caller (unless running as root, where the
+        // ownership check cannot fail this way; skip there).
+        if uid == 0 {
+            return;
+        }
+        let spec = LaunchSpec::new(
+            vec!["/bin/echo".to_string()],
+            cwd.to_string_lossy().to_string(),
+            BTreeMap::from([("TMPDIR".to_string(), "/usr".to_string())]),
+            "(version 1)",
+        );
+
+        assert!(validate_launch(&spec, uid).is_err());
     }
 }

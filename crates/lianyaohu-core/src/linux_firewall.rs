@@ -28,21 +28,28 @@ pub struct LinuxFirewallRuleSet {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinuxSocketOwner {
     User(u32),
-    Group(u32),
+    /// Match both the socket's UID and its GID. The session GID alone is
+    /// shared by every helper-run session on the machine, so matching the
+    /// caller's UID too keeps one user's rules from capturing another user's
+    /// agent traffic.
+    UserAndGroup(u32, u32),
 }
 
 impl LinuxSocketOwner {
-    pub fn clause(self) -> (&'static str, String) {
+    pub fn clause(self) -> Vec<(&'static str, String)> {
         match self {
-            Self::User(uid) => ("--uid-owner", uid.to_string()),
-            Self::Group(gid) => ("--gid-owner", gid.to_string()),
+            Self::User(uid) => vec![("--uid-owner", uid.to_string())],
+            Self::UserAndGroup(uid, gid) => vec![
+                ("--uid-owner", uid.to_string()),
+                ("--gid-owner", gid.to_string()),
+            ],
         }
     }
 
     pub fn description(self) -> String {
         match self {
             Self::User(uid) => format!("uid {uid}"),
-            Self::Group(gid) => format!("gid {gid}"),
+            Self::UserAndGroup(uid, gid) => format!("uid {uid} gid {gid}"),
         }
     }
 }
@@ -60,7 +67,7 @@ impl LinuxFirewallRuleSet {
         Self {
             interface_name: interface_name.into(),
             anchor_key: anchor_uid,
-            socket_owner: LinuxSocketOwner::Group(gid),
+            socket_owner: LinuxSocketOwner::UserAndGroup(anchor_uid, gid),
         }
     }
 
@@ -84,10 +91,18 @@ impl LinuxFirewallRuleSet {
         lines.join("\n") + "\n"
     }
 
+    fn owner_match_args(&self) -> Vec<String> {
+        let mut args = vec!["-m".to_string(), "owner".to_string()];
+        for (flag, value) in self.socket_owner.clause() {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+        args
+    }
+
     fn setup_commands(&self, family: IpFamily) -> Vec<Vec<String>> {
         let mut commands = Vec::new();
         let chain = self.chain_name();
-        let (owner_flag, owner_value) = self.socket_owner.clause();
         let cidrs = match family {
             IpFamily::V4 => LAN4_CIDRS,
             IpFamily::V6 => LAN6_CIDRS,
@@ -109,53 +124,45 @@ impl LinuxFirewallRuleSet {
             "RETURN",
         ]);
         commands.push(vec!["-w", "-A", &chain, "-j", "REJECT"]);
-        commands.push(vec![
-            "-w",
-            "-I",
-            "OUTPUT",
-            "1",
-            "-m",
-            "owner",
-            owner_flag,
-            &owner_value,
-            "-j",
-            &chain,
-        ]);
+
+        let mut commands = commands
+            .into_iter()
+            .map(|command| {
+                command
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut jump = vec![
+            "-w".to_string(),
+            "-I".to_string(),
+            "OUTPUT".to_string(),
+            "1".to_string(),
+        ];
+        jump.extend(self.owner_match_args());
+        jump.extend(["-j".to_string(), chain]);
+        commands.push(jump);
 
         commands
-            .into_iter()
-            .map(|command| command.into_iter().map(ToString::to_string).collect())
-            .collect()
     }
 
     fn cleanup_commands(&self) -> Vec<(IpFamily, Vec<String>)> {
         let chain = self.chain_name();
-        let (owner_flag, owner_value) = self.socket_owner.clause();
+        let mut delete_jump = vec!["-w".to_string(), "-D".to_string(), "OUTPUT".to_string()];
+        delete_jump.extend(self.owner_match_args());
+        delete_jump.extend(["-j".to_string(), chain.clone()]);
         [IpFamily::V4, IpFamily::V6]
             .into_iter()
             .flat_map(|family| {
                 [
-                    vec![
-                        "-w",
-                        "-D",
-                        "OUTPUT",
-                        "-m",
-                        "owner",
-                        owner_flag,
-                        &owner_value,
-                        "-j",
-                        &chain,
-                    ],
-                    vec!["-w", "-F", &chain],
-                    vec!["-w", "-X", &chain],
+                    delete_jump.clone(),
+                    vec!["-w".to_string(), "-F".to_string(), chain.clone()],
+                    vec!["-w".to_string(), "-X".to_string(), chain.clone()],
                 ]
                 .into_iter()
-                .map(move |command| {
-                    (
-                        family,
-                        command.into_iter().map(ToString::to_string).collect(),
-                    )
-                })
+                .map(move |command| (family, command))
             })
             .collect()
     }
@@ -300,12 +307,17 @@ mod tests {
     fn generated_rules_block_lan_and_non_selected_interfaces() {
         let rules = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000).render();
 
-        assert!(rules.contains("# Scope: packets owned by gid 2000000."));
+        // Session rules must match the caller's UID as well as the shared
+        // session GID; a group-only match would let one user's rules capture
+        // another user's agent traffic.
+        assert!(rules.contains("# Scope: packets owned by uid 1000 gid 2000000."));
         assert!(rules.contains("iptables -w -A LYH-1000 -o lo -j RETURN"));
         assert!(rules.contains("iptables -w -A LYH-1000 -d 10.0.0.0/8 -j REJECT"));
         assert!(rules.contains("iptables -w -A LYH-1000 -o tun0 -j RETURN"));
         assert!(rules.contains("iptables -w -A LYH-1000 -j REJECT"));
-        assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --gid-owner 2000000 -j LYH-1000"));
+        assert!(rules.contains(
+            "iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 --gid-owner 2000000 -j LYH-1000"
+        ));
         assert!(rules.contains("ip6tables -w -A LYH-1000 -d fc00::/7 -j REJECT"));
     }
 
