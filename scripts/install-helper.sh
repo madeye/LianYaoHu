@@ -10,6 +10,9 @@ GROUP_NAME="_lianyaohu"
 GROUP_GID="2000000"
 OS="$(uname -s)"
 
+tmp_group="$(mktemp)"
+trap 'rm -f "$tmp_group"' EXIT
+
 if [[ -n "${LIANYAOHU_HELPER_BINARY:-}" ]]; then
   HELPER_BINARY="$LIANYAOHU_HELPER_BINARY"
 elif [[ -x "$ROOT/bin/lianyaohu" && ! -f "$ROOT/Cargo.toml" ]]; then
@@ -25,15 +28,13 @@ if [[ "$OS" == "Linux" ]]; then
   sudo install -d -m 755 /usr/local/libexec
   sudo install -m 755 "$HELPER_BINARY" "$BIN"
 
-  if getent group "$GROUP_NAME" >/tmp/lianyaohu-group.$$ 2>/dev/null; then
-    existing_gid="$(awk -F: '{print $3; exit}' /tmp/lianyaohu-group.$$)"
-    rm -f /tmp/lianyaohu-group.$$
+  if getent group "$GROUP_NAME" >"$tmp_group" 2>/dev/null; then
+    existing_gid="$(awk -F: '{print $3; exit}' "$tmp_group")"
     if [[ "$existing_gid" != "$GROUP_GID" ]]; then
       echo "${GROUP_NAME} exists with gid ${existing_gid}, expected ${GROUP_GID}" >&2
       exit 1
     fi
   else
-    rm -f /tmp/lianyaohu-group.$$
     conflicting_group="$(getent group "$GROUP_GID" 2>/dev/null | awk -F: '{print $1; exit}' || true)"
     if [[ -n "$conflicting_group" ]]; then
       echo "gid ${GROUP_GID} is already assigned to group ${conflicting_group}" >&2
@@ -90,15 +91,13 @@ sudo install -m 755 "$HELPER_BINARY" "$BIN"
 # Remove the split-binary helper from installs that predate the merged binary.
 sudo rm -f /usr/local/libexec/lianyaohu-helper
 
-if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >/tmp/lianyaohu-group.$$ 2>/dev/null; then
-  existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' /tmp/lianyaohu-group.$$)"
-  rm -f /tmp/lianyaohu-group.$$
+if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >"$tmp_group" 2>/dev/null; then
+  existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' "$tmp_group")"
   if [[ "$existing_gid" != "$GROUP_GID" ]]; then
     echo "${GROUP_NAME} exists with gid ${existing_gid}, expected ${GROUP_GID}" >&2
     exit 1
   fi
 else
-  rm -f /tmp/lianyaohu-group.$$
   conflicting_group="$(sudo dscl . -list /Groups PrimaryGroupID | awk -v gid="$GROUP_GID" '$2 == gid {print $1; exit}')"
   if [[ -n "$conflicting_group" ]]; then
     echo "gid ${GROUP_GID} is already assigned to group ${conflicting_group}" >&2

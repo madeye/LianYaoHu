@@ -99,7 +99,6 @@ impl SandboxProfile {
     (sysctl-name-prefix "hw.optional.")
     (sysctl-name-prefix "hw.perflevel")
     (sysctl-name "kern.argmax")
-    (sysctl-name "kern.bootargs")
     ; uname(3) reads kern.hostname for the nodename field and fails entirely
     ; when it is denied, breaking Ruby's Etc.uname and therefore Homebrew.
     ; The hostname leaks the machine name; stronger identifiers (kern.uuid)
@@ -219,7 +218,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::process::Command;
     #[cfg(target_os = "macos")]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Tests run on parallel threads; naming scratch paths by wall-clock
+    // timestamp lets two tests collide on the same nanosecond and delete each
+    // other's files mid-run (flaky "execvp: No such file or directory").
+    // A per-process counter is unique by construction.
+    #[cfg(target_os = "macos")]
+    fn unique_test_id() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
 
     #[test]
     fn profile_allows_home_and_cwd_writable_but_denies_identity_surfaces() {
@@ -250,6 +259,7 @@ mod tests {
         assert!(profile.contains(r#"(subpath "/Library/Keychains")"#));
         assert!(profile.contains(r#"(sysctl-name "kern.hostname")"#));
         assert!(!profile.contains(r#"(sysctl-name "kern.uuid")"#));
+        assert!(!profile.contains(r#"(sysctl-name "kern.bootargs")"#));
         assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
         assert!(profile.contains(r#"(subpath "/dev/fd")"#));
         assert!(profile.contains(r#"(global-name "com.apple.system.opendirectoryd.libinfo")"#));
@@ -418,12 +428,11 @@ mod tests {
             return;
         }
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let marker = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(format!(".lianyaohu-write-test-{nanos}"));
+        let marker = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(format!(
+            ".lianyaohu-write-test-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
 
         let result = run_in_sandbox(&["/usr/bin/touch", &marker.to_string_lossy()]);
 
@@ -431,6 +440,28 @@ mod tests {
         let _ = fs::remove_file(&marker);
         assert_eq!(result.status, 0, "{}", result.output);
         assert!(written);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_blocks_setuid_exec() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // macOS has no PR_SET_NO_NEW_PRIVS, but Seatbelt refuses to exec
+        // setuid/setgid binaries from a sandboxed process, so a sandboxed
+        // agent cannot escalate through setuid-root helpers. This pins that
+        // behavior: if it ever regresses, the launch path needs an explicit
+        // privilege-transition lock.
+        let result = run_in_sandbox(&["/usr/bin/sudo", "-n", "true"]);
+
+        assert_ne!(result.status, 0, "setuid exec unexpectedly succeeded");
+        assert!(
+            result.output.contains("Operation not permitted"),
+            "expected exec of setuid binary to be denied by the sandbox: {}",
+            result.output
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -514,11 +545,11 @@ mod tests {
     ) -> SandboxRun {
         let cwd = std::env::current_dir().unwrap();
         let home = std::env::var("HOME").unwrap();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmpdir = std::env::temp_dir().join(format!("lianyaohu-test-{nanos}"));
+        let tmpdir = std::env::temp_dir().join(format!(
+            "lianyaohu-test-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
         fs::create_dir_all(&tmpdir).unwrap();
         let command = build_command(&tmpdir);
         let profile = SandboxProfile::new(&home, cwd.to_string_lossy(), tmpdir.to_string_lossy());

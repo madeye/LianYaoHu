@@ -23,9 +23,12 @@ interpreters, git, node, and installed code-agent CLIs can start.
 `/opt/homebrew` is writable so agents can `brew install` the tools they need.
 
 On Linux, Landlock applies a deny-default filesystem ruleset. `$HOME`, the
-selected working directory, the per-launch tmpdir, `/tmp`, `/var/tmp`, and
-`/dev` are writable; `/bin`, `/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/opt`,
-and the process' own `/proc` entries are read-only. If the kernel does not
+selected working directory, the per-launch tmpdir, `/tmp`, `/var/tmp`,
+`/dev/pts`, and `/dev/shm` are writable, plus the individual device files
+`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`,
+`/dev/tty`, and `/dev/ptmx` (the rest of `/dev` is not granted); `/bin`,
+`/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/opt`, and the process' own
+`/proc` entries are read-only. If the kernel does not
 support Landlock, launch fails instead of silently degrading to firewall-only
 mode.
 
@@ -95,7 +98,12 @@ On macOS, `network-bind` and `network-inbound` are denied except on the
 loopback interface, so agents can run localhost-only servers (OAuth login
 callbacks such as `claude /login`, local dev servers) that are unreachable
 from the network.
-On Linux, seccomp also denies bind/listen/accept, mount and namespace escapes,
+On Linux, `bind`/`listen`/`accept` are denied entirely — including loopback —
+because seccomp cannot inspect the sockaddr to distinguish a localhost bind
+from a network one. This is intentional: OAuth-style localhost callback flows
+do not work inside the Linux sandbox; complete such logins outside LianYaoHu
+(or on macOS) first.
+On Linux, seccomp also denies mount and namespace escapes,
 ptrace/process-memory inspection, BPF/perf/userfault/io_uring setup, keyring
 APIs, module loading, reboot/accounting/syslog, and other kernel-control
 syscalls. `socket(2)` is limited to Unix sockets and IPv4/IPv6 stream or
@@ -144,3 +152,9 @@ arbitrary code-agent tools. The sandbox boundary for the agent is the generated
 On Linux, the process sandbox depends on kernel Landlock and seccomp support.
 LianYaoHu does not build a private mount namespace or overlay filesystem; it
 uses Landlock path rules for filesystem access and seccomp for syscall classes.
+
+macOS has no `PR_SET_NO_NEW_PRIVS`. Instead, Seatbelt refuses to exec
+setuid/setgid binaries from inside the generated sandbox profile, so the agent
+cannot escalate through setuid-root helpers such as `sudo`; a regression test
+pins this behavior. On Linux the helper sets `PR_SET_NO_NEW_PRIVS` in the
+child before Landlock and seccomp.

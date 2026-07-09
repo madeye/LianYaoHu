@@ -1,8 +1,9 @@
 use crate::{Result, err};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_LAUNCH_SPEC_BYTES: u64 = 1024 * 1024;
@@ -43,10 +44,18 @@ impl LaunchSpec {
         Ok(())
     }
 
+    // The spec carries the agent's environment (API keys, tokens); create it
+    // owner-only so other local users cannot read it out of the temp tree.
     pub fn write_json(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let json = serde_json::to_vec(self)?;
-        fs::write(path, json)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&json)?;
         Ok(())
     }
 
