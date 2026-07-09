@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LianYaoHu one-line uninstaller.
 #
-#   curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/uninstall.sh | bash
+#   curl -fsSL https://lyh.maxlv.net/uninstall.sh | bash
 #
 # Tears down the root helper (LaunchDaemon on macOS, systemd service on Linux)
 # and the hidden `_lianyaohu` group, then removes the `lianyaohu` and `lyh`

@@ -4,7 +4,7 @@ export default defineConfig({
   title: 'LianYaoHu',
   description:
     'Run code agents inside a constrained sandbox, forced through a selected VPN interface.',
-  base: '/LianYaoHu/',
+  base: '/',
   cleanUrls: true,
   themeConfig: {
     nav: [
