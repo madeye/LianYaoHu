@@ -6,6 +6,29 @@ guard while forcing agent traffic through a selected VPN interface. macOS uses
 `sandbox-exec` plus PF on `utun*`; Linux uses Landlock/seccomp plus
 owner-scoped iptables/ip6tables rules on `tun*` or `wg*`.
 
+## Install
+
+One line downloads the latest release for your platform, verifies its
+SHA-256, installs the `lianyaohu` and `lyh` binaries into `/usr/local/bin`,
+and installs the root firewall helper:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/install.sh | bash
+```
+
+Prebuilt releases cover Apple Silicon macOS (`aarch64-apple-darwin`) and
+x86-64 Linux (`x86_64-unknown-linux-gnu`); on other platforms the installer
+tells you to build from source. Pass options after `bash -s --` to skip the
+root helper (`--no-helper`), pin a version (`--version v0.1.3`), or change the
+install directory (`--bin-dir ~/.local/bin`).
+
+Uninstall — removes the root helper, the hidden `_lianyaohu` group, and the
+binaries:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madeye/LianYaoHu/main/scripts/uninstall.sh | bash
+```
+
 ## Run
 
 ```sh
