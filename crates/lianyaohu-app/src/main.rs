@@ -1,4 +1,5 @@
 mod helper_daemon;
+mod tui;
 
 use lianyaohu_core::config::{self, ConfigFile, MergedConfig, trust};
 use lianyaohu_core::env_policy;
@@ -200,17 +201,23 @@ fn run(args: Vec<String>) -> Result<i32> {
     // A configured interface that is gone should fall back to selection, not
     // hard-fail like an explicit --vpn flag.
     let config_interface = effective.defaults.vpn_interface.clone();
-    let selected_interface = match options.vpn_interface.as_deref() {
-        Some(name) => select_interface(Some(name))?,
+    let (selected_interface, save_default) = match options.vpn_interface.as_deref() {
+        Some(name) => (select_by_name(name)?, false),
         None => match config_interface.as_deref() {
-            None => select_interface(None)?,
-            Some(name) => select_interface(Some(name)).or_else(|error| {
-                eprintln!("warning: configured VPN interface {name}: {error}");
-                select_interface(None)
-            })?,
+            None => select_interactively(options.no_tui)?,
+            Some(name) => match select_by_name(name) {
+                Ok(interface) => (interface, false),
+                Err(error) => {
+                    eprintln!("warning: configured VPN interface {name}: {error}");
+                    select_interactively(options.no_tui)?
+                }
+            },
         },
     };
     validate_vpn_interface(&selected_interface)?;
+    if save_default {
+        save_vpn_default(&options, &home, &selected_interface.name);
+    }
 
     // Config-file env merges under CLI --env extras (CLI wins per key); both
     // still go through the sanitize block/allow lists.
@@ -725,7 +732,7 @@ fn parse(args: Vec<String>) -> Result<Options> {
     Ok(options)
 }
 
-fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
+fn active_interfaces() -> Result<Vec<NetworkInterface>> {
     let interfaces = vpn_interfaces()?;
     if interfaces.is_empty() {
         return Err(err(format!(
@@ -733,204 +740,69 @@ fn select_interface(requested: Option<&str>) -> Result<NetworkInterface> {
             vpn_interface_description()
         )));
     }
+    Ok(interfaces)
+}
 
-    if let Some(name) = requested {
-        return interfaces
-            .into_iter()
-            .find(|interface| interface.name == name)
-            .ok_or_else(|| err(format!("{name} was not found among active VPN interfaces")));
-    }
+fn select_by_name(name: &str) -> Result<NetworkInterface> {
+    active_interfaces()?
+        .into_iter()
+        .find(|interface| interface.name == name)
+        .ok_or_else(|| err(format!("{name} was not found among active VPN interfaces")))
+}
 
-    let interactive =
-        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
-    let selected = if interactive {
-        select_interface_interactive(&interfaces)?
+/// Interactive selection: the ratatui quick-pick on a TTY (unless `--no-tui`),
+/// the classic numbered prompt otherwise. Returns the interface and whether
+/// the user asked to persist it as the config default.
+fn select_interactively(no_tui: bool) -> Result<(NetworkInterface, bool)> {
+    let interfaces = active_interfaces()?;
+    if tui::stdin_is_tty() && !no_tui {
+        match tui::quick_pick(&interfaces)? {
+            tui::QuickPickOutcome::Chosen { name, save } => {
+                // The picker refreshes its list live, so the chosen name may
+                // postdate our snapshot; re-resolve before trusting it.
+                let interface = interfaces
+                    .iter()
+                    .find(|interface| interface.name == name)
+                    .cloned()
+                    .or_else(|| {
+                        vpn_interfaces()
+                            .ok()
+                            .and_then(|list| list.into_iter().find(|i| i.name == name))
+                    })
+                    .ok_or_else(|| err(format!("{name} disappeared during selection")))?;
+                Ok((interface, save))
+            }
+            tui::QuickPickOutcome::Cancelled => Err(err("VPN interface selection cancelled")),
+        }
     } else {
-        select_interface_numbered(&interfaces)?
+        let index = tui::fallback::select_numbered(&interfaces)?;
+        Ok((interfaces[index].clone(), false))
+    }
+}
+
+/// Persists the chosen interface as `[defaults] vpn_interface` in the global
+/// config. Failures only warn: not being able to save a preference must never
+/// stop a launch.
+fn save_vpn_default(options: &Options, home: &str, name: &str) {
+    let xdg = env::var("XDG_CONFIG_HOME").ok();
+    let path = options
+        .config_path
+        .clone()
+        .unwrap_or_else(|| config::global_config_path(home, xdg.as_deref()));
+    let mut file = match ConfigFile::load(&path) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(error) => {
+            eprintln!("warning: not saving default VPN interface: {error}");
+            return;
+        }
     };
-    Ok(interfaces[selected].clone())
-}
-
-fn interface_entry(offset: usize, interface: &NetworkInterface) -> String {
-    let state = if interface.is_up() && interface.is_running() {
-        "up"
-    } else {
-        "down"
-    };
-    format!(
-        "{}. {} [{}] {}",
-        offset + 1,
-        interface.name,
-        state,
-        interface.address_summary()
-    )
-}
-
-// Non-TTY fallback (piped stdin, scripts): keep the classic numbered prompt.
-fn select_interface_numbered(interfaces: &[NetworkInterface]) -> Result<usize> {
-    println!("Select VPN interface ({}):", vpn_interface_description());
-    for (offset, interface) in interfaces.iter().enumerate() {
-        println!("  {}", interface_entry(offset, interface));
-    }
-    print!("choice> ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let selected = input.trim().parse::<usize>()?;
-    if selected == 0 || selected > interfaces.len() {
-        return Err(err("invalid VPN interface selection"));
-    }
-    Ok(selected - 1)
-}
-
-fn select_interface_interactive(interfaces: &[NetworkInterface]) -> Result<usize> {
-    println!(
-        "Select VPN interface ({}); ↑/↓ to highlight, Enter to confirm, q to cancel:",
-        vpn_interface_description()
-    );
-    let terminal = RawTerminal::enable()?;
-    print!("\x1b[?25l");
-    let mut selected = 0usize;
-    render_interface_menu(interfaces, selected, false)?;
-    loop {
-        match terminal.read_key()? {
-            Key::Up => {
-                selected = selected.checked_sub(1).unwrap_or(interfaces.len() - 1);
-            }
-            Key::Down => selected = (selected + 1) % interfaces.len(),
-            Key::Enter => return Ok(selected),
-            Key::Digit(digit) if (1..=interfaces.len()).contains(&digit) => {
-                render_interface_menu(interfaces, digit - 1, true)?;
-                return Ok(digit - 1);
-            }
-            Key::Cancel => return Err(err("VPN interface selection cancelled")),
-            _ => continue,
-        }
-        render_interface_menu(interfaces, selected, true)?;
-    }
-}
-
-fn render_interface_menu(
-    interfaces: &[NetworkInterface],
-    selected: usize,
-    redraw: bool,
-) -> Result<()> {
-    let mut stdout = io::stdout();
-    if redraw {
-        write!(stdout, "\x1b[{}A", interfaces.len())?;
-    }
-    for (offset, interface) in interfaces.iter().enumerate() {
-        let entry = interface_entry(offset, interface);
-        if offset == selected {
-            writeln!(stdout, "\r\x1b[2K\x1b[7m> {entry}\x1b[0m")?;
-        } else {
-            writeln!(stdout, "\r\x1b[2K  {entry}")?;
-        }
-    }
-    stdout.flush()?;
-    Ok(())
-}
-
-enum Key {
-    Up,
-    Down,
-    Enter,
-    Digit(usize),
-    Cancel,
-    Other,
-}
-
-// Puts stdin into raw mode for the picker; Drop restores the terminal and the
-// cursor even when selection errors or is cancelled. ISIG is disabled so
-// Ctrl-C cancels cleanly through the same path instead of killing the process
-// with the terminal still in raw mode.
-struct RawTerminal {
-    original: libc::termios,
-    raw: libc::termios,
-}
-
-impl RawTerminal {
-    fn enable() -> Result<Self> {
-        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-            return Err(err("failed to read terminal attributes"));
-        }
-        let mut raw = original;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-            return Err(err("failed to enable terminal raw mode"));
-        }
-        Ok(Self { original, raw })
-    }
-
-    fn read_key(&self) -> Result<Key> {
-        let Some(byte) = self.read_byte(true)? else {
-            return Err(err("stdin closed during VPN interface selection"));
-        };
-        Ok(match byte {
-            b'\r' | b'\n' => Key::Enter,
-            0x03 | b'q' => Key::Cancel,
-            byte @ b'1'..=b'9' => Key::Digit(usize::from(byte - b'0')),
-            0x1b => {
-                let first = self.read_byte(false)?;
-                if first.is_none() {
-                    // Bare Escape: no continuation bytes arrived.
-                    return Ok(Key::Cancel);
-                }
-                let second = if first == Some(b'[') {
-                    self.read_byte(false)?
-                } else {
-                    None
-                };
-                match second {
-                    Some(b'A') => Key::Up,
-                    Some(b'B') => Key::Down,
-                    _ => Key::Other,
-                }
-            }
-            _ => Key::Other,
-        })
-    }
-
-    fn read_byte(&self, blocking: bool) -> Result<Option<u8>> {
-        let mut settings = self.raw;
-        settings.c_cc[libc::VMIN] = if blocking { 1 } else { 0 };
-        settings.c_cc[libc::VTIME] = if blocking { 0 } else { 1 };
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &settings) } != 0 {
-            return Err(err("failed to adjust terminal read mode"));
-        }
-        let mut byte = 0u8;
-        loop {
-            let count = unsafe {
-                libc::read(
-                    libc::STDIN_FILENO,
-                    std::ptr::from_mut(&mut byte).cast::<libc::c_void>(),
-                    1,
-                )
-            };
-            if count == 1 {
-                return Ok(Some(byte));
-            }
-            if count == 0 {
-                return Ok(None);
-            }
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                return Err(error.into());
-            }
-        }
-    }
-}
-
-impl Drop for RawTerminal {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
-        let mut stdout = io::stdout();
-        let _ = write!(stdout, "\x1b[?25h");
-        let _ = stdout.flush();
+    file.defaults.vpn_interface = Some(name.to_string());
+    match file.save(&path) {
+        Ok(()) => eprintln!(
+            "saved {name} as the default VPN interface in {}",
+            path.display()
+        ),
+        Err(error) => eprintln!("warning: could not save default VPN interface: {error}"),
     }
 }
 

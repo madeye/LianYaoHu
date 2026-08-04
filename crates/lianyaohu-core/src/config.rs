@@ -106,6 +106,30 @@ impl ConfigFile {
         toml::to_string_pretty(self).map_err(|error| err(error.to_string()))
     }
 
+    /// Writes the config with owner-only permissions, creating parent
+    /// directories as needed. A group/world-writable policy file would let
+    /// another local user rewrite the sandbox.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| err(format!("{}: {error}", parent.display())))?;
+        }
+        let text = self.to_toml()?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| err(format!("{}: {error}", path.display())))?;
+        file.write_all(text.as_bytes())
+            .map_err(|error| err(format!("{}: {error}", path.display())))?;
+        Ok(())
+    }
+
     /// Rejects sections that make no sense in a per-project file: `[defaults]`
     /// holds machine-specific knobs (the VPN interface, firewall toggles) that
     /// do not belong in a repository checkout.
@@ -745,6 +769,20 @@ narrow_home = true
             trust_store_path("/Users/me", Some("")),
             PathBuf::from("/Users/me/.config/lianyaohu/trusted.toml")
         );
+    }
+
+    #[test]
+    fn save_round_trips_with_owner_only_permissions() {
+        let dir = scratch_dir("save");
+        let path = dir.join("nested").join("config.toml");
+        let config = ConfigFile::parse(SAMPLE).unwrap();
+
+        config.save(&path).unwrap();
+
+        assert_eq!(ConfigFile::load(&path).unwrap().unwrap(), config);
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
