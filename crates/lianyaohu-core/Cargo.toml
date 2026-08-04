@@ -1,10 +1,19 @@
 [package]
 name = "lianyaohu-core"
+description = "Core library for LianYaoHu: sandbox profiles (seatbelt/Landlock/seccomp), VPN-scoped firewall rule generation (PF/iptables), typed sandbox policy, layered TOML config, and the root-helper protocol"
 edition.workspace = true
 homepage.workspace = true
+keywords = ["sandbox", "vpn", "firewall", "landlock", "seatbelt"]
+categories = ["os", "network-programming"]
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 version.workspace = true
+
+[package.metadata.docs.rs]
+# The macOS modules (pf, sandbox_profile) are cfg-gated; build both platforms
+# so docs.rs shows the whole API surface.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [dependencies]
 libc.workspace = true
