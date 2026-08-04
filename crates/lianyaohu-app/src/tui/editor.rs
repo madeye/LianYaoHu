@@ -68,13 +68,29 @@ const HOME_MENU: &[(Screen, &str)] = &[
 ];
 
 /// Which list an active text input feeds. Network pane order: allow, deny,
-/// lan_allow. Path pane order: writable, read_only.
+/// lan_allow. Path pane order: writable, read_only. `Proxy` is not a list:
+/// it fans out into the standard proxy environment variables.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputTarget {
     Network { pane: usize, edit: Option<usize> },
     Path { pane: usize, edit: Option<usize> },
     DenyPath { edit: Option<usize> },
+    Proxy,
 }
+
+/// Environment variables the proxy setting fans out to. Both cases are set:
+/// curl only honors lowercase `http_proxy`, while many tools read uppercase.
+const PROXY_ENV_KEYS: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+];
+const NO_PROXY_KEYS: &[&str] = &["NO_PROXY", "no_proxy"];
+const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
+const PROXY_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"];
 
 #[derive(Clone, Debug)]
 struct InputState {
@@ -288,14 +304,58 @@ impl Editor {
         self.status = Some(message.into());
     }
 
-    /// Validates one input buffer for its target list; `Ok` value is the
+    /// The proxy URL currently configured in this scope's `[env]`, if any.
+    fn proxy_url(&self) -> Option<String> {
+        self.scope_view().env.get("HTTPS_PROXY").cloned()
+    }
+
+    /// Sets or clears the proxy environment variables in the scope draft.
+    fn set_proxy(&mut self, url: Option<&str>) {
+        let env = &mut self.scope_draft().env;
+        match url {
+            Some(url) => {
+                for key in PROXY_ENV_KEYS {
+                    env.insert((*key).to_string(), url.to_string());
+                }
+                for key in NO_PROXY_KEYS {
+                    env.insert((*key).to_string(), NO_PROXY_VALUE.to_string());
+                }
+            }
+            None => {
+                for key in PROXY_ENV_KEYS.iter().chain(NO_PROXY_KEYS) {
+                    env.remove(*key);
+                }
+            }
+        }
+    }
+
+    /// Validates one input buffer for its target; `Ok` value is the
     /// normalized entry actually stored.
     fn validate_entry(&self, target: InputTarget, buffer: &str) -> Result<String> {
         let trimmed = buffer.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && !matches!(target, InputTarget::Proxy) {
             return Err(err("entry is empty"));
         }
         match target {
+            // Empty clears the proxy; otherwise scheme://host[:port].
+            InputTarget::Proxy => {
+                if trimmed.is_empty() {
+                    return Ok(String::new());
+                }
+                let (scheme, rest) = trimmed
+                    .split_once("://")
+                    .ok_or_else(|| err("expected scheme://host:port (empty clears)"))?;
+                if !PROXY_SCHEMES.contains(&scheme) {
+                    return Err(err(format!(
+                        "scheme must be one of: {}",
+                        PROXY_SCHEMES.join(", ")
+                    )));
+                }
+                if rest.is_empty() || rest.chars().any(char::is_whitespace) {
+                    return Err(err("expected scheme://host:port"));
+                }
+                Ok(trimmed.to_string())
+            }
             InputTarget::Network { pane, .. } => {
                 let rule = DestRule::parse(trimmed)?;
                 if pane == 2 {
@@ -331,6 +391,18 @@ impl Editor {
                 Step::Redraw
             }
             Ok(entry) => {
+                if matches!(input.target, InputTarget::Proxy) {
+                    let url = (!entry.is_empty()).then_some(entry.as_str());
+                    let cleared = url.is_none();
+                    self.set_proxy(url);
+                    self.input = None;
+                    if cleared {
+                        self.set_status("proxy cleared");
+                    } else {
+                        self.set_status(format!("proxy set to {entry}"));
+                    }
+                    return Step::Redraw;
+                }
                 let list: &mut Vec<String> = match input.target {
                     InputTarget::Network { pane, .. } => {
                         let network = &mut self.scope_draft().network;
@@ -343,11 +415,13 @@ impl Editor {
                     InputTarget::Path { pane: 0, .. } => &mut self.scope_draft().paths.writable,
                     InputTarget::Path { .. } => &mut self.scope_draft().paths.read_only,
                     InputTarget::DenyPath { .. } => &mut self.scope_draft().paths.deny,
+                    InputTarget::Proxy => unreachable!("handled above"),
                 };
                 let edit = match input.target {
                     InputTarget::Network { edit, .. }
                     | InputTarget::Path { edit, .. }
                     | InputTarget::DenyPath { edit } => edit,
+                    InputTarget::Proxy => None,
                 };
                 match edit {
                     Some(index) if index < list.len() => list[index] = entry,
@@ -615,6 +689,13 @@ impl Editor {
                     Some(NetAction::Allow) | None => Some(NetAction::Deny),
                 };
                 network.default_action = action;
+                Step::Redraw
+            }
+            KeyCode::Char('p') => {
+                self.input = Some(InputState::new(
+                    InputTarget::Proxy,
+                    self.proxy_url().unwrap_or_default(),
+                ));
                 Step::Redraw
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
@@ -936,14 +1017,16 @@ fn keybar_text(editor: &Editor) -> String {
             InputTarget::Path { .. } | InputTarget::DenyPath { .. } => {
                 "Enter confirm · Tab complete · Esc cancel".to_string()
             }
-            InputTarget::Network { .. } => "Enter confirm · Esc cancel".to_string(),
+            InputTarget::Network { .. } | InputTarget::Proxy => {
+                "Enter confirm · Esc cancel".to_string()
+            }
         };
     }
     match editor.screen {
         Screen::Home => "↑↓/1-5 select · Enter open · s scope · Ctrl-S review · q quit · ? help",
         Screen::Interface => "↑↓ select · Enter set default (global) · Esc back · ? help",
         Screen::Network => {
-            "Tab pane · a add · e edit · d delete · u undo · m default allow/deny · Esc back"
+            "Tab pane · a add · e edit · d delete · u undo · m default · p proxy · Esc back"
         }
         Screen::Paths => {
             "Tab pane · a add · e edit · d delete · u undo · Space narrow-home · Esc back"
@@ -984,13 +1067,18 @@ fn home_summaries(editor: &Editor) -> [String; 5] {
         .map(|name| format!("{name} (global)"))
         .unwrap_or_else(|| "not set — prompted each run".to_string());
     let network = format!(
-        "{} allow · {} deny · {} LAN exceptions · default {}",
+        "{} allow · {} deny · {} LAN exceptions · default {}{}",
         view.network.allow.len(),
         view.network.deny.len(),
         view.network.lan_allow.len(),
         match view.network.default_action {
             Some(lianyaohu_core::policy::NetAction::Deny) => "deny",
             _ => "allow",
+        },
+        if editor.proxy_url().is_some() {
+            " · proxy"
+        } else {
+            ""
         }
     );
     let paths = format!(
@@ -1109,8 +1197,12 @@ fn draw_string_list(
 }
 
 fn draw_network(frame: &mut Frame, editor: &Editor, area: Rect) {
-    let [note_area, panes_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(area);
+    let [note_area, proxy_area, panes_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(4),
+    ])
+    .areas(area);
     let default_action = match editor.scope_view().network.default_action {
         Some(lianyaohu_core::policy::NetAction::Deny) => {
             "default: DENY — only allow-listed destinations may leave (m toggles)"
@@ -1118,6 +1210,16 @@ fn draw_network(frame: &mut Frame, editor: &Editor, area: Rect) {
         _ => "default: allow — all non-LAN destinations may leave on the VPN (m toggles)",
     };
     frame.render_widget(Paragraph::new(default_action), note_area);
+    let proxy_line = match editor.proxy_url() {
+        Some(url) => format!(
+            "proxy: {url} — sets HTTP(S)_PROXY/ALL_PROXY for the agent (p edits; pair with DENY \
+             for proxy-or-nothing)"
+        ),
+        None => {
+            "proxy: none (p to set — with default DENY this gives proxy-or-nothing)".to_string()
+        }
+    };
+    frame.render_widget(Paragraph::new(proxy_line), proxy_area);
 
     let [allow_area, deny_area, lan_area] = Layout::horizontal([
         Constraint::Percentage(34),
@@ -1308,6 +1410,7 @@ fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
         InputTarget::Path { pane: 0, .. } => "Writable path (absolute or ~/...)",
         InputTarget::Path { .. } => "Read-only path (absolute or ~/...)",
         InputTarget::DenyPath { .. } => "Deny path (absolute or ~/...)",
+        InputTarget::Proxy => "Proxy URL (http://host:port or socks5://host:port; empty clears)",
     };
     let mut lines = vec![Line::from(format!("> {}", input.buffer))];
     if let Some(error) = &input.error {
@@ -1341,6 +1444,8 @@ fn draw_help_overlay(frame: &mut Frame, body: Rect) {
         "u          undo the last delete",
         "Space      toggle checkbox (narrow-home, presets)",
         "m          toggle network default allow/deny",
+        "p          set/clear the proxy (HTTP(S)_PROXY/ALL_PROXY env vars);",
+        "           combine with default DENY for proxy-or-nothing",
         "Ctrl-S     jump to Review & save",
         "Esc / q    back; on Home: quit (asks when unsaved)",
         "",
@@ -1702,6 +1807,58 @@ mod tests {
         assert!(store.is_approved(&dir.to_string_lossy(), &digest));
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn proxy_input_fans_out_env_vars_and_clears_them() {
+        let mut editor = test_editor();
+        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Char('p')));
+        type_text(&mut editor, "http://127.0.0.1:7890");
+        editor.update(press(KeyCode::Enter));
+        assert!(editor.input.is_none());
+        let env = &editor.global.env;
+        for key in PROXY_ENV_KEYS {
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some("http://127.0.0.1:7890")
+            );
+        }
+        assert_eq!(
+            env.get("NO_PROXY").map(String::as_str),
+            Some(NO_PROXY_VALUE)
+        );
+        assert_eq!(env.len(), PROXY_ENV_KEYS.len() + NO_PROXY_KEYS.len());
+
+        // Reopening pre-fills the current value; clearing it removes all keys.
+        editor.update(press(KeyCode::Char('p')));
+        assert_eq!(
+            editor.input.as_ref().unwrap().buffer,
+            "http://127.0.0.1:7890"
+        );
+        for _ in 0.."http://127.0.0.1:7890".len() {
+            editor.update(press(KeyCode::Backspace));
+        }
+        editor.update(press(KeyCode::Enter));
+        assert!(editor.global.env.is_empty());
+        assert_eq!(editor.status.as_deref(), Some("proxy cleared"));
+    }
+
+    #[test]
+    fn proxy_input_rejects_bad_urls() {
+        let mut editor = test_editor();
+        editor.update(press(KeyCode::Char('2')));
+        for bad in ["127.0.0.1:7890", "ftp://x:1", "http://has space:1"] {
+            editor.update(press(KeyCode::Char('p')));
+            type_text(&mut editor, bad);
+            editor.update(press(KeyCode::Enter));
+            assert!(
+                editor.input.as_ref().unwrap().error.is_some(),
+                "should reject {bad:?}"
+            );
+            editor.update(press(KeyCode::Esc));
+            assert!(editor.global.env.is_empty());
+        }
     }
 
     #[test]

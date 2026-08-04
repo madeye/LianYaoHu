@@ -121,6 +121,13 @@ design. `narrow_home = true` replaces the blanket writable `$HOME` with just
 the agent state dirs, the working directory, and the launch tmpdir; `$HOME`
 stays readable.
 
+**Proxy-or-nothing**: combine `default = "deny"` with the standard proxy
+variables in `[env]` (press `p` on the TUI's Network screen to set them in
+one step). Tools that honor `HTTP(S)_PROXY`/`ALL_PROXY` reach the proxy —
+loopback is always passed, so a local proxy needs no allow entry (a remote
+one needs `allow = ["ip:port"]`) — and anything that ignores them and dials
+out directly is blocked by the firewall.
+
 ### Project files and trust
 
 `.lianyaohu.toml` is discovered by walking up from `--cwd` (stopping at
