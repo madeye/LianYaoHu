@@ -1,8 +1,12 @@
 [package]
 name = "lianyaohu-app"
+description = "LianYaoHu (炼妖壶): run Claude Code, Codex, or another code agent in a sandbox with VPN-only egress — sanitized environment, seatbelt/Landlock, and a helper-managed PF/iptables guard, with a guided config TUI"
 edition.workspace = true
 homepage.workspace = true
+keywords = ["sandbox", "vpn", "claude", "codex", "agent"]
+categories = ["command-line-utilities", "development-tools"]
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 version.workspace = true
 # Keep `cargo run -p lianyaohu-app` working now that the crate has two [[bin]] targets.

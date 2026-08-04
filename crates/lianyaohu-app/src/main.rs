@@ -1,3 +1,9 @@
+//! LianYaoHu (炼妖壶) launcher binary, installed as `lianyaohu` and `lyh`.
+//!
+//! Runs a code agent inside the platform sandbox with VPN-only egress, and
+//! doubles as the root helper daemon (`lianyaohu helper`) and the guided
+//! configuration TUI (`lyh config`). See <https://lyh.maxlv.net/> for usage.
+
 mod helper_daemon;
 mod tui;
 
