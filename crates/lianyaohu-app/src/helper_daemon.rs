@@ -6,7 +6,7 @@ use lianyaohu_core::interfaces::{utun_interfaces, validate_utun};
 use lianyaohu_core::interfaces::{
     validate_vpn_interface as validate_platform_vpn_interface, vpn_interfaces,
 };
-use lianyaohu_core::launch::LaunchSpec;
+use lianyaohu_core::launch::{LAUNCH_SPEC_VERSION, LaunchSpec};
 #[cfg(target_os = "linux")]
 use lianyaohu_core::linux_firewall::{
     LIANYAOHU_GROUP_GID, LIANYAOHU_GROUP_NAME, LinuxFirewallGuard, LinuxFirewallRuleSet,
@@ -17,6 +17,7 @@ use lianyaohu_core::linux_sandbox::LinuxSandbox;
 use lianyaohu_core::pf::{
     LIANYAOHU_GROUP_GID, LIANYAOHU_GROUP_NAME, PFRuleSet, parse_enable_token,
 };
+use lianyaohu_core::policy::{PathPolicy, SandboxPolicy, lexically_normalized_absolute};
 #[cfg(target_os = "macos")]
 use lianyaohu_core::sandbox_profile::SandboxProfile;
 use lianyaohu_core::{Result, err};
@@ -238,6 +239,13 @@ impl HelperDaemon {
                     Ok("not installed".to_string())
                 }
             }
+            // Capability probe for version negotiation: clients with a
+            // non-default sandbox policy require a helper that understands
+            // versioned specs, and an old helper answers this verb with an
+            // error line — which is exactly the negative signal they need.
+            HelperRequest::Capabilities => {
+                Ok(format!("policy=1 spec_version={LAUNCH_SPEC_VERSION}"))
+            }
         }
     }
 
@@ -275,9 +283,10 @@ impl HelperDaemon {
         // PF's enable-reference count.
         let mut sessions = self.lock_sessions();
         if let Some(state) = sessions.get_mut(&rule_set.anchor_key) {
-            if state.rule_set.interface_name != rule_set.interface_name
-                || state.rule_set.socket_owner != rule_set.socket_owner
-            {
+            // Whole-rule-set equality: the rules live under one anchor per
+            // UID, so sessions differing in ANY way — interface, owner scope,
+            // or network policy — cannot both be enforced at once.
+            if state.rule_set != rule_set {
                 return Err(session_conflict_error(&state.rule_set));
             }
             state.refcount += 1;
@@ -327,9 +336,10 @@ impl HelperDaemon {
     fn acquire_session(&self, rule_set: LinuxFirewallRuleSet) -> Result<()> {
         let mut sessions = self.lock_sessions();
         if let Some(state) = sessions.get_mut(&rule_set.anchor_key) {
-            if state.rule_set.interface_name != rule_set.interface_name
-                || state.rule_set.socket_owner != rule_set.socket_owner
-            {
+            // Whole-rule-set equality: the rules live under one chain per
+            // UID, so sessions differing in ANY way — interface, owner scope,
+            // or network policy — cannot both be enforced at once.
+            if state.rule_set != rule_set {
                 return Err(session_conflict_error(&state.rule_set));
             }
             state.refcount += 1;
@@ -399,10 +409,12 @@ impl HelperDaemon {
             peer.uid,
             LIANYAOHU_GROUP_GID,
             selected.ipv4_peer_addresses.first().cloned(),
-        );
+        )
+        .with_network(launch.policy.network.clone());
         #[cfg(target_os = "linux")]
         let rule_set =
-            LinuxFirewallRuleSet::new_group(selected.name, peer.uid, LIANYAOHU_GROUP_GID);
+            LinuxFirewallRuleSet::new_group(selected.name, peer.uid, LIANYAOHU_GROUP_GID)
+                .with_network(launch.policy.network.clone());
 
         self.acquire_session(rule_set)?;
         let run_result =
@@ -417,7 +429,8 @@ impl HelperDaemon {
 fn session_conflict_error(active: &PFRuleSet) -> lianyaohu_core::Error {
     err(format!(
         "uid {} already has an active session on {} ({}); concurrent sessions must use the same \
-         interface and scope, or wait for the running session to exit",
+         interface, scope, and network policy — align the configs, or wait for the running \
+         session to exit",
         active.anchor_key,
         active.interface_name,
         active.socket_owner.description(),
@@ -428,7 +441,8 @@ fn session_conflict_error(active: &PFRuleSet) -> lianyaohu_core::Error {
 fn session_conflict_error(active: &LinuxFirewallRuleSet) -> lianyaohu_core::Error {
     err(format!(
         "uid {} already has an active session on {} ({}); concurrent sessions must use the same \
-         interface and scope, or wait for the running session to exit",
+         interface, scope, and network policy — align the configs, or wait for the running \
+         session to exit",
         active.anchor_key,
         active.interface_name,
         active.socket_owner.description(),
@@ -462,15 +476,19 @@ struct PeerCredentials {
 /// untrusted — any local user can connect to the helper socket — so the
 /// sandbox policy roots are derived server-side: the home directory comes
 /// from the passwd database for the authenticated peer UID, cwd/tmpdir must
-/// be real directories (tmpdir owned by the caller), and the environment is
-/// re-sanitized with the same policy the client claims to have applied. The
-/// client's sandbox_profile text is ignored entirely.
+/// be real directories (tmpdir owned by the caller), the environment is
+/// re-sanitized with the same policy the client claims to have applied, and
+/// the sandbox policy is re-validated field by field (widenings need caller
+/// ownership; see validate_policy). The client's sandbox_profile text is
+/// ignored entirely.
+#[derive(Debug)]
 struct ValidatedLaunch {
     command: Vec<String>,
     cwd: String,
     home: String,
     tmpdir: String,
     environment: BTreeMap<String, String>,
+    policy: SandboxPolicy,
 }
 
 fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
@@ -483,6 +501,7 @@ fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
         .get("TMPDIR")
         .ok_or_else(|| err("launch environment is missing TMPDIR"))?;
     let tmpdir = validated_directory("temporary directory", Path::new(tmpdir), Some(uid))?;
+    let policy = validate_policy(spec.policy.as_ref(), uid, &home)?;
 
     // Treat the entire client environment as untrusted extras: privacy and
     // injection blocklists apply, and the sandbox roots are pinned to the
@@ -496,6 +515,104 @@ fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
         home,
         tmpdir,
         environment,
+        policy,
+    })
+}
+
+/// System prefixes an extra WRITABLE path may never live under, even when the
+/// caller somehow owns a directory there. The caller-ownership check is the
+/// primary gate; this list is belt and braces for trojanable system surfaces.
+const WRITABLE_SYSTEM_DENYLIST: &[&str] = &[
+    "/etc",
+    "/private/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/var/run",
+    "/private/var/run",
+    "/var/db",
+    "/private/var/db",
+    "/opt/homebrew",
+];
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Re-validates a client-supplied sandbox policy. The network policy and path
+/// tightenings (deny entries, narrow-home state dirs) only need grammar and
+/// containment checks — worst case the client restricts itself. Widenings are
+/// held to the same standard as the launch roots: canonicalized against the
+/// real filesystem, and extra writable paths must be owned by the caller and
+/// outside system prefixes.
+fn validate_policy(
+    spec_policy: Option<&SandboxPolicy>,
+    uid: u32,
+    caller_home: &str,
+) -> Result<SandboxPolicy> {
+    let Some(policy) = spec_policy else {
+        return Ok(SandboxPolicy::default());
+    };
+    // Grammar, list caps, and lan_allow ⊆ blocked-LAN containment — never
+    // trust the client's claim of having validated.
+    policy.validate()?;
+
+    let mut writable = Vec::new();
+    for entry in &policy.paths.writable {
+        let canonical = validated_directory("extra writable path", Path::new(entry), Some(uid))?;
+        if WRITABLE_SYSTEM_DENYLIST
+            .iter()
+            .any(|prefix| path_has_prefix(&canonical, prefix))
+        {
+            return Err(err(format!(
+                "extra writable path {canonical} is inside a protected system prefix"
+            )));
+        }
+        writable.push(canonical);
+    }
+
+    let mut read_only = Vec::new();
+    for entry in &policy.paths.read_only {
+        let canonical = validated_directory("extra read-only path", Path::new(entry), None)?;
+        // Reading other users' homes is exactly what the sandbox exists to
+        // prevent; a read-only grant must not reopen it.
+        for home_root in ["/Users", "/home"] {
+            if path_has_prefix(&canonical, home_root) && !path_has_prefix(&canonical, caller_home) {
+                return Err(err(format!(
+                    "extra read-only path {canonical} is inside another user's home directory"
+                )));
+            }
+        }
+        read_only.push(canonical);
+    }
+
+    // Tightenings: lexical normalization only. Deny targets need not exist
+    // (they may be created later) and are never resolved through symlinks —
+    // canonicalizing a missing path would fail anyway.
+    let deny = policy
+        .paths
+        .deny
+        .iter()
+        .map(|entry| lexically_normalized_absolute(entry))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(SandboxPolicy {
+        network: policy.network.clone(),
+        paths: PathPolicy {
+            writable,
+            read_only,
+            deny,
+            narrow_home: policy.paths.narrow_home,
+            // Relative, `..`-free entries (checked by policy.validate above);
+            // joined against the passwd-derived home at render time, so a
+            // client can never smuggle an absolute path through narrow-home.
+            agent_state_dirs: policy.paths.agent_state_dirs.clone(),
+        },
     })
 }
 
@@ -585,9 +702,11 @@ fn run_launch_spec(
         std::process::id(),
         LAUNCH_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    // The profile is rebuilt here from the validated roots; the client's
-    // profile text is never consumed.
-    let profile = SandboxProfile::new(&launch.home, &launch.cwd, &launch.tmpdir).render();
+    // The profile is rebuilt here from the validated roots and the validated
+    // policy; the client's profile text is never consumed.
+    let profile = SandboxProfile::new(&launch.home, &launch.cwd, &launch.tmpdir)
+        .with_paths(launch.policy.paths.clone())
+        .render();
     fs::write(&profile_path, profile)?;
     chown(
         &profile_path,
@@ -663,8 +782,9 @@ fn run_launch_spec(
         .first()
         .ok_or_else(|| err("launch spec command is empty"))?;
     // Sandbox roots come from the helper-validated launch, not from whatever
-    // HOME/TMPDIR the client put in the spec.
-    let sandbox = LinuxSandbox::new(&launch.home, &launch.cwd, &launch.tmpdir);
+    // HOME/TMPDIR the client put in the spec; same for the path policy.
+    let sandbox = LinuxSandbox::new(&launch.home, &launch.cwd, &launch.tmpdir)
+        .with_paths(launch.policy.paths.clone());
 
     let mut command = Command::new(executable);
     command
@@ -1396,5 +1516,134 @@ mod tests {
         );
 
         assert!(validate_launch(&spec, uid).is_err());
+    }
+
+    use lianyaohu_core::policy::{DestRule, NetworkPolicy};
+
+    fn base_spec(tmpdir: &Path) -> LaunchSpec {
+        LaunchSpec::new(
+            vec!["/bin/echo".to_string(), "ok".to_string()],
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            BTreeMap::from([("TMPDIR".to_string(), tmpdir.to_string_lossy().to_string())]),
+            "(version 1)",
+        )
+    }
+
+    #[test]
+    fn legacy_spec_validates_to_default_policy() {
+        let uid = unsafe { libc::getuid() };
+        let tmpdir = owned_tmpdir();
+
+        let launch = validate_launch(&base_spec(&tmpdir), uid).unwrap();
+        let _ = fs::remove_dir_all(&tmpdir);
+
+        assert!(launch.policy.is_default());
+    }
+
+    #[test]
+    fn validate_launch_rejects_future_spec_versions() {
+        let uid = unsafe { libc::getuid() };
+        let tmpdir = owned_tmpdir();
+        let mut spec = base_spec(&tmpdir);
+        spec.spec_version = LAUNCH_SPEC_VERSION + 1;
+
+        let error = validate_launch(&spec, uid).unwrap_err();
+        let _ = fs::remove_dir_all(&tmpdir);
+
+        assert!(
+            error.to_string().contains("newer than this helper"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_policy_accepts_owned_writable_and_rebuilds_canonical_paths() {
+        let uid = unsafe { libc::getuid() };
+        let caller_home = home_directory_for_uid(uid).unwrap();
+        let extra = owned_tmpdir();
+        let mut policy = SandboxPolicy::default();
+        policy.paths.writable = vec![extra.to_string_lossy().to_string()];
+        policy.paths.deny = vec!["/tmp//x/y".to_string()];
+        policy.paths.narrow_home = true;
+
+        let validated = validate_policy(Some(&policy), uid, &caller_home).unwrap();
+        // The writable extra comes back canonicalized (macOS temp dirs live
+        // behind /var -> /private/var).
+        let canonical = extra.canonicalize().unwrap();
+        let _ = fs::remove_dir_all(&extra);
+        assert_eq!(validated.paths.writable, [canonical.to_string_lossy()]);
+        // Deny entries are lexically normalized.
+        assert_eq!(validated.paths.deny, ["/tmp/x/y"]);
+        assert!(validated.paths.narrow_home);
+    }
+
+    #[test]
+    fn validate_policy_rejects_hostile_paths() {
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            return;
+        }
+        let caller_home = home_directory_for_uid(uid).unwrap();
+
+        // Not caller-owned.
+        let mut policy = SandboxPolicy::default();
+        policy.paths.writable = vec!["/usr".to_string()];
+        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+
+        // Caller-owned checks cannot save a protected prefix: simulate by
+        // pointing at /etc (fails ownership on the canonical path first, but
+        // the denylist also covers it for a root caller).
+        let mut policy = SandboxPolicy::default();
+        policy.paths.writable = vec!["/etc".to_string()];
+        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+
+        // Another user's home is off-limits even read-only.
+        let other_home = if cfg!(target_os = "macos") {
+            "/Users"
+        } else {
+            "/home"
+        };
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![other_home.to_string()];
+        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+
+        // Absolute agent_state_dirs entries never pass.
+        let mut policy = SandboxPolicy::default();
+        policy.paths.agent_state_dirs = vec!["/absolute".to_string()];
+        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+
+        // Oversized lists are rejected before any filesystem work.
+        let mut policy = SandboxPolicy::default();
+        policy.paths.deny = (0..=lianyaohu_core::policy::MAX_RULES_PER_LIST)
+            .map(|i| format!("/deny/{i}"))
+            .collect();
+        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+    }
+
+    #[test]
+    fn validate_policy_rejects_lan_allow_outside_blocked_ranges() {
+        let uid = unsafe { libc::getuid() };
+        let caller_home = home_directory_for_uid(uid).unwrap();
+        let policy = SandboxPolicy {
+            network: NetworkPolicy {
+                lan_allow: vec![DestRule::parse("0.0.0.0/0").unwrap()],
+                ..NetworkPolicy::default()
+            },
+            ..SandboxPolicy::default()
+        };
+
+        let error = validate_policy(Some(&policy), uid, &caller_home).unwrap_err();
+        assert!(error.to_string().contains("blocked LAN ranges"), "{error}");
+    }
+
+    #[test]
+    fn capabilities_verb_parses_and_reports_policy_support() {
+        assert_eq!(
+            lianyaohu_core::helper::parse_request("capabilities\n").unwrap(),
+            HelperRequest::Capabilities
+        );
     }
 }
