@@ -82,6 +82,100 @@ struct InputState {
     buffer: String,
     cursor: usize,
     error: Option<String>,
+    /// Non-error feedback, e.g. the candidate list from an ambiguous Tab
+    /// completion.
+    hint: Option<String>,
+}
+
+impl InputState {
+    fn new(target: InputTarget, buffer: String) -> Self {
+        Self {
+            target,
+            cursor: buffer.len(),
+            buffer,
+            error: None,
+            hint: None,
+        }
+    }
+}
+
+/// Readdir-based completion for the path inputs: completes the last component
+/// against the (tilde-expanded) parent directory. Returns the new buffer and
+/// an optional candidate hint when the match is ambiguous.
+fn complete_path(home: &str, buffer: &str) -> Option<(String, Option<String>)> {
+    let position = buffer.rfind('/')?;
+    let (dir_part, prefix) = buffer.split_at(position + 1);
+    let expanded_dir = expand_tilde(dir_part, Path::new(home));
+    if !expanded_dir.starts_with('/') {
+        return None;
+    }
+    let entries = std::fs::read_dir(&expanded_dir).ok()?;
+    let mut names: Vec<(String, bool)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let is_dir = entry.file_type().ok().is_some_and(|kind| kind.is_dir());
+            name.starts_with(prefix).then_some((name, is_dir))
+        })
+        .collect();
+    // Shell convention: hidden entries only complete when explicitly asked.
+    if !prefix.starts_with('.') {
+        names.retain(|(name, _)| !name.starts_with('.'));
+    }
+    names.sort();
+    match names.as_slice() {
+        [] => None,
+        [(name, is_dir)] => {
+            let mut completed = format!("{dir_part}{name}");
+            if *is_dir {
+                completed.push('/');
+            }
+            Some((completed, None))
+        }
+        many => {
+            let common = longest_common_prefix(many.iter().map(|(name, _)| name.as_str()));
+            let hint = many
+                .iter()
+                .take(8)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("  ");
+            Some((format!("{dir_part}{common}"), Some(hint)))
+        }
+    }
+}
+
+fn longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> String {
+    let Some(first) = names.next() else {
+        return String::new();
+    };
+    let mut common = first.to_string();
+    for name in names {
+        while !name.starts_with(&common) {
+            common.pop();
+        }
+    }
+    common
+}
+
+/// A deleted entry retained for one-shot undo, pinned to the scope and list
+/// it came from so a scope switch cannot restore it into the wrong file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Deleted {
+    scope: Scope,
+    list: ListRef,
+    index: usize,
+    entry: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListRef {
+    NetworkAllow,
+    NetworkDeny,
+    NetworkLanAllow,
+    PathWritable,
+    PathReadOnly,
+    PathDeny,
 }
 
 enum Step {
@@ -115,9 +209,45 @@ struct Editor {
     status: Option<String>,
     help: bool,
     confirm_quit: bool,
+    undo: Option<Deleted>,
 }
 
 impl Editor {
+    fn list_mut(&mut self, scope: Scope, list: ListRef) -> &mut Vec<String> {
+        let file = match scope {
+            Scope::Global => &mut self.global,
+            Scope::Project => &mut self.project,
+        };
+        match list {
+            ListRef::NetworkAllow => &mut file.network.allow,
+            ListRef::NetworkDeny => &mut file.network.deny,
+            ListRef::NetworkLanAllow => &mut file.network.lan_allow,
+            ListRef::PathWritable => &mut file.paths.writable,
+            ListRef::PathReadOnly => &mut file.paths.read_only,
+            ListRef::PathDeny => &mut file.paths.deny,
+        }
+    }
+
+    fn record_delete(&mut self, list: ListRef, index: usize, entry: String) {
+        self.set_status(format!("deleted {entry} — u to undo"));
+        self.undo = Some(Deleted {
+            scope: self.scope,
+            list,
+            index,
+            entry,
+        });
+    }
+
+    fn undo_delete(&mut self) -> Step {
+        let Some(deleted) = self.undo.take() else {
+            return Step::Continue;
+        };
+        let list = self.list_mut(deleted.scope, deleted.list);
+        let index = deleted.index.min(list.len());
+        list.insert(index, deleted.entry.clone());
+        self.set_status(format!("restored {}", deleted.entry));
+        Step::Redraw
+    }
     fn scope_draft(&mut self) -> &mut ConfigFile {
         match self.scope {
             Scope::Global => &mut self.global,
@@ -243,11 +373,28 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Enter => self.commit_input(),
+            KeyCode::Tab
+                if matches!(
+                    input.target,
+                    InputTarget::Path { .. } | InputTarget::DenyPath { .. }
+                ) =>
+            {
+                // Disjoint field borrows: `input` borrows self.input, the
+                // completion only reads self.home_dir.
+                if let Some((completed, hint)) = complete_path(&self.home_dir, &input.buffer) {
+                    input.cursor = completed.len();
+                    input.buffer = completed;
+                    input.error = None;
+                    input.hint = hint;
+                }
+                Step::Redraw
+            }
             KeyCode::Backspace => {
                 if input.cursor > 0 {
                     input.cursor -= 1;
                     input.buffer.remove(input.cursor);
                     input.error = None;
+                    input.hint = None;
                 }
                 Step::Redraw
             }
@@ -265,6 +412,7 @@ impl Editor {
                 input.buffer.insert(input.cursor, character);
                 input.cursor += 1;
                 input.error = None;
+                input.hint = None;
                 Step::Redraw
             }
             _ => Step::Continue,
@@ -304,6 +452,9 @@ impl Editor {
                 Scope::Project => Scope::Global,
             };
             return Step::Redraw;
+        }
+        if key.code == KeyCode::Char('u') {
+            return self.undo_delete();
         }
         match self.screen {
             Screen::Home => self.update_home(key),
@@ -413,30 +564,26 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Char('a') => {
-                self.input = Some(InputState {
-                    target: InputTarget::Network {
+                self.input = Some(InputState::new(
+                    InputTarget::Network {
                         pane: self.net_pane,
                         edit: None,
                     },
-                    buffer: String::new(),
-                    cursor: 0,
-                    error: None,
-                });
+                    String::new(),
+                ));
                 Step::Redraw
             }
             KeyCode::Char('e') => {
                 let index = self.net_selected[self.net_pane];
                 if index < lengths[self.net_pane] {
                     let buffer = self.network_lists()[self.net_pane][index].clone();
-                    self.input = Some(InputState {
-                        target: InputTarget::Network {
+                    self.input = Some(InputState::new(
+                        InputTarget::Network {
                             pane: self.net_pane,
                             edit: Some(index),
                         },
-                        cursor: buffer.len(),
                         buffer,
-                        error: None,
-                    });
+                    ));
                 }
                 Step::Redraw
             }
@@ -444,17 +591,19 @@ impl Editor {
                 let pane = self.net_pane;
                 let index = self.net_selected[pane];
                 if index < lengths[pane] {
-                    let network = &mut self.scope_draft().network;
-                    let list = match pane {
-                        0 => &mut network.allow,
-                        1 => &mut network.deny,
-                        _ => &mut network.lan_allow,
+                    let list_ref = match pane {
+                        0 => ListRef::NetworkAllow,
+                        1 => ListRef::NetworkDeny,
+                        _ => ListRef::NetworkLanAllow,
                     };
-                    list.remove(index);
+                    let scope = self.scope;
+                    let list = self.list_mut(scope, list_ref);
+                    let entry = list.remove(index);
                     let length = list.len();
                     if self.net_selected[pane] >= length && length > 0 {
                         self.net_selected[pane] = length - 1;
                     }
+                    self.record_delete(list_ref, index, entry);
                 }
                 Step::Redraw
             }
@@ -497,30 +646,26 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Char('a') => {
-                self.input = Some(InputState {
-                    target: InputTarget::Path {
+                self.input = Some(InputState::new(
+                    InputTarget::Path {
                         pane: self.path_pane,
                         edit: None,
                     },
-                    buffer: String::new(),
-                    cursor: 0,
-                    error: None,
-                });
+                    String::new(),
+                ));
                 Step::Redraw
             }
             KeyCode::Char('e') => {
                 let index = self.path_selected[self.path_pane];
                 if index < lengths[self.path_pane] {
                     let buffer = self.path_lists()[self.path_pane][index].clone();
-                    self.input = Some(InputState {
-                        target: InputTarget::Path {
+                    self.input = Some(InputState::new(
+                        InputTarget::Path {
                             pane: self.path_pane,
                             edit: Some(index),
                         },
-                        cursor: buffer.len(),
                         buffer,
-                        error: None,
-                    });
+                    ));
                 }
                 Step::Redraw
             }
@@ -528,17 +673,19 @@ impl Editor {
                 let pane = self.path_pane;
                 let index = self.path_selected[pane];
                 if index < lengths[pane] {
-                    let paths = &mut self.scope_draft().paths;
-                    let list = if pane == 0 {
-                        &mut paths.writable
+                    let list_ref = if pane == 0 {
+                        ListRef::PathWritable
                     } else {
-                        &mut paths.read_only
+                        ListRef::PathReadOnly
                     };
-                    list.remove(index);
+                    let scope = self.scope;
+                    let list = self.list_mut(scope, list_ref);
+                    let entry = list.remove(index);
                     let length = list.len();
                     if self.path_selected[pane] >= length && length > 0 {
                         self.path_selected[pane] = length - 1;
                     }
+                    self.record_delete(list_ref, index, entry);
                 }
                 Step::Redraw
             }
@@ -599,12 +746,10 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Char('a') => {
-                self.input = Some(InputState {
-                    target: InputTarget::DenyPath { edit: None },
-                    buffer: String::new(),
-                    cursor: 0,
-                    error: None,
-                });
+                self.input = Some(InputState::new(
+                    InputTarget::DenyPath { edit: None },
+                    String::new(),
+                ));
                 Step::Redraw
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -613,8 +758,13 @@ impl Editor {
                     let index = self.preset_selected - SENSITIVE_PRESETS.len();
                     if let Some(entry) = custom.get(index) {
                         let entry = entry.clone();
-                        let deny = &mut self.scope_draft().paths.deny;
-                        deny.retain(|existing| *existing != entry);
+                        let scope = self.scope;
+                        let deny = self.list_mut(scope, ListRef::PathDeny);
+                        if let Some(position) = deny.iter().position(|existing| *existing == entry)
+                        {
+                            deny.remove(position);
+                            self.record_delete(ListRef::PathDeny, position, entry);
+                        }
                     }
                     let rows = self.preset_rows();
                     if self.preset_selected >= rows && rows > 0 {
@@ -781,17 +931,24 @@ fn draw(frame: &mut Frame, editor: &Editor) {
 }
 
 fn keybar_text(editor: &Editor) -> String {
-    if editor.input.is_some() {
-        return "Enter confirm · Esc cancel".to_string();
+    if let Some(input) = &editor.input {
+        return match input.target {
+            InputTarget::Path { .. } | InputTarget::DenyPath { .. } => {
+                "Enter confirm · Tab complete · Esc cancel".to_string()
+            }
+            InputTarget::Network { .. } => "Enter confirm · Esc cancel".to_string(),
+        };
     }
     match editor.screen {
         Screen::Home => "↑↓/1-5 select · Enter open · s scope · Ctrl-S review · q quit · ? help",
         Screen::Interface => "↑↓ select · Enter set default (global) · Esc back · ? help",
         Screen::Network => {
-            "Tab pane · a add · e edit · d delete · m toggle default allow/deny · Esc back"
+            "Tab pane · a add · e edit · d delete · u undo · m default allow/deny · Esc back"
         }
-        Screen::Paths => "Tab pane · a add · e edit · d delete · Space narrow-home · Esc back",
-        Screen::Presets => "↑↓ select · Space toggle · a add custom · d delete custom · Esc back",
+        Screen::Paths => {
+            "Tab pane · a add · e edit · d delete · u undo · Space narrow-home · Esc back"
+        }
+        Screen::Presets => "↑↓ select · Space toggle · a add custom · d delete · u undo · Esc back",
         Screen::Review => "Enter save all · g global only · p project only · Esc back",
     }
     .to_string()
@@ -1124,7 +1281,7 @@ fn draw_review(frame: &mut Frame, editor: &Editor, area: Rect) {
 }
 
 fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
-    let height = 4;
+    let height = 5;
     let area = Rect {
         x: body.x + 2,
         y: body.y + body.height.saturating_sub(height + 1),
@@ -1156,6 +1313,9 @@ fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
     if let Some(error) = &input.error {
         lines.push(Line::from(format!("✗ {error}")));
     }
+    if let Some(hint) = &input.hint {
+        lines.push(Line::from(hint.clone()));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title)),
         area,
@@ -1176,8 +1336,9 @@ fn draw_help_overlay(frame: &mut Frame, body: Rect) {
     frame.render_widget(Clear, area);
     let lines: Vec<Line> = [
         "s          switch scope (global config vs project .lianyaohu.toml)",
-        "Tab        switch pane on list screens",
+        "Tab        switch pane on list screens; complete paths in inputs",
         "a / e / d  add / edit / delete an entry",
+        "u          undo the last delete",
         "Space      toggle checkbox (narrow-home, presets)",
         "m          toggle network default allow/deny",
         "Ctrl-S     jump to Review & save",
@@ -1241,6 +1402,7 @@ pub fn run_config_editor(home: &str, xdg: Option<&str>, cwd: &Path) -> Result<()
         status: None,
         help: false,
         confirm_quit: false,
+        undo: None,
     };
     editor.refresh_interfaces();
 
@@ -1317,6 +1479,7 @@ mod tests {
             status: None,
             help: false,
             confirm_quit: false,
+            undo: None,
         }
     }
 
@@ -1542,6 +1705,75 @@ mod tests {
     }
 
     #[test]
+    fn delete_records_undo_and_u_restores_into_the_same_scope() {
+        let mut editor = test_editor();
+        editor.global.network.allow = vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()];
+        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Char('d')));
+        assert_eq!(editor.global.network.allow, ["9.9.9.9"]);
+        assert!(editor.status.as_deref().unwrap().contains("u to undo"));
+
+        // Even after switching scope, undo restores into the ORIGINAL scope.
+        editor.update(press(KeyCode::Char('s')));
+        editor.update(press(KeyCode::Char('u')));
+        assert_eq!(editor.global.network.allow, ["1.1.1.1", "9.9.9.9"]);
+        assert!(editor.project.network.allow.is_empty());
+        // Undo is one-shot.
+        assert!(matches!(
+            editor.update(press(KeyCode::Char('u'))),
+            Step::Continue
+        ));
+    }
+
+    #[test]
+    fn tab_completion_extends_path_inputs() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ID: AtomicU32 = AtomicU32::new(0);
+        let scratch = std::env::temp_dir().join(format!(
+            "lianyaohu-complete-test-{}-{}",
+            std::process::id(),
+            ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(scratch.join("models")).unwrap();
+        std::fs::create_dir_all(scratch.join("moments")).unwrap();
+        std::fs::write(scratch.join("notes.txt"), "x").unwrap();
+
+        let mut editor = test_editor();
+        editor.home_dir = scratch.to_string_lossy().to_string();
+        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('a')));
+
+        // Unique match completes fully and appends '/' for directories.
+        type_text(&mut editor, "~/n");
+        editor.update(press(KeyCode::Tab));
+        assert_eq!(editor.input.as_ref().unwrap().buffer, "~/notes.txt");
+
+        // Ambiguous match extends to the common prefix and offers candidates.
+        let mut editor2 = test_editor();
+        editor2.home_dir = scratch.to_string_lossy().to_string();
+        editor2.update(press(KeyCode::Char('3')));
+        editor2.update(press(KeyCode::Char('a')));
+        type_text(&mut editor2, "~/m");
+        editor2.update(press(KeyCode::Tab));
+        let input = editor2.input.as_ref().unwrap();
+        assert_eq!(input.buffer, "~/mo");
+        assert!(input.hint.as_deref().unwrap().contains("models"));
+        assert!(input.hint.as_deref().unwrap().contains("moments"));
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn longest_common_prefix_basics() {
+        assert_eq!(
+            longest_common_prefix(["models", "moments"].into_iter()),
+            "mo"
+        );
+        assert_eq!(longest_common_prefix(["abc"].into_iter()), "abc");
+        assert_eq!(longest_common_prefix(["a", "b"].into_iter()), "");
+    }
+
+    #[test]
     fn render_smoke_all_screens() {
         let mut editor = test_editor();
         editor.global.network.allow = vec!["140.82.112.0/20:443".to_string()];
@@ -1593,6 +1825,7 @@ mod tests {
             buffer: "1.2.3".to_string(),
             cursor: 5,
             error: Some("invalid".to_string()),
+            hint: None,
         });
         let rendered = render(&editor);
         assert!(rendered.contains("Add allow rule"));

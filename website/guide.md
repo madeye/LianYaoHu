@@ -65,6 +65,84 @@ By default it:
 - blocks LAN destinations and non-selected-interface egress for only the
   guarded agent tree.
 
+## Configuration
+
+Everything you can pass as a flag (and the sandbox policy below) can be
+persisted, so a configured machine launches with plain `lyh -- claude`.
+Two TOML files layer together, and command-line flags win over both:
+
+```
+CLI flags  >  ./.lianyaohu.toml (project)  >  ~/.config/lianyaohu/config.toml (global)  >  built-ins
+```
+
+The guided TUI edits both files — pick the VPN interface with a live status
+pane, manage network rules and path grants, and toggle sensitive-path
+denials, then save from the Review screen:
+
+```sh
+lyh config        # full-screen editor (lyh setup is an alias)
+lyh config show   # print the merged effective config with per-key provenance
+lyh config path   # print the config file locations
+```
+
+The interactive interface picker also offers `s` to save the chosen
+interface as the default, so the prompt disappears from the next run.
+
+The full schema (`$XDG_CONFIG_HOME` is honored for the global file):
+
+```toml
+[defaults]                # global file only; rejected in project files
+vpn_interface = "utun5"
+firewall = true
+shared_user_firewall = false
+allow_non_default_route = false
+command = ["claude"]
+
+[env]                     # extra environment; the sanitize block-lists still apply
+MY_AGENT_FLAG = "1"
+
+[network]
+default = "allow"         # "deny" = only allow-listed destinations may leave
+allow = ["140.82.112.0/20", "151.101.0.1:443"]
+deny = ["169.254.169.254", "10.99.0.0/16:8000-8100"]
+lan_allow = ["192.168.1.10:22"]   # holes in the LAN block; must stay inside it
+
+[paths]
+writable = ["/Volumes/DATA/models"]
+read_only = ["/Volumes/DATA/reference"]
+deny = ["~/.ssh", "~/.aws"]        # seatbelt-enforced; best-effort warning on Linux
+narrow_home = false
+agent_state_dirs = [".claude", ".claude.json", ".codex", ".config", ".cache"]
+```
+
+Destination rules are typed `ADDR[/PREFIX][:PORT[-PORT]]` — IPv6 with a port
+needs brackets (`[2606:50c0::]:443`), and DNS hostnames are rejected by
+design. `narrow_home = true` replaces the blanket writable `$HOME` with just
+the agent state dirs, the working directory, and the launch tmpdir; `$HOME`
+stays readable.
+
+### Project files and trust
+
+`.lianyaohu.toml` is discovered by walking up from `--cwd` (stopping at
+`$HOME`), which means it arrives with a repository checkout — so it is
+treated like `direnv`: anything that **tightens** the sandbox
+(`network.deny`, `paths.deny`, `narrow_home`, `default = "deny"`) applies
+automatically, while anything that **widens** it (`network.allow`,
+`lan_allow`, `paths.writable`, `paths.read_only`, `agent_state_dirs`,
+`[env]`) needs a hash-pinned approval:
+
+```sh
+lyh config trust    # approve the discovered project file (re-run after edits)
+lyh config revoke   # withdraw the approval
+```
+
+On a terminal, an unapproved file prompts once; in scripts the widenings are
+stripped with a loud warning — a run is never silently widened and never
+blocked on a prompt. Saving a project file from `lyh config` records the
+approval automatically. Approvals live in
+`~/.config/lianyaohu/trusted.toml`, keyed by directory and content hash, so
+any edit to the file invalidates them.
+
 ## Root helper
 
 Firewall enforcement and dedicated-group isolation require root. LianYaoHu uses
@@ -104,12 +182,31 @@ their own configuration and credential state.
 ```text
 usage:
   lianyaohu [options] [-- agent [args...]]
+  lianyaohu config [show|path|trust [DIR]|revoke [DIR]]
+
+subcommands:
+  config                      Open the guided configuration TUI (alias: setup).
+  config show                 Print the merged effective config with provenance.
+  config path                 Print the config file paths.
+  config trust / revoke       Manage project-file approvals.
 
 options:
   --vpn NAME                  Select a VPN interface without prompting
                               (macOS: utun*, Linux: tun* or wg*).
   --cwd PATH                  Working directory exposed to the agent.
   --env NAME=VALUE            Add an environment variable unless it is privacy-blocked.
+  --config PATH               Use PATH as the global config file.
+  --no-config                 Ignore all configuration files for this run.
+  --trust-project             Approve the discovered project file without prompting.
+  --no-tui                    Use the plain numbered prompt instead of the picker.
+  --allow-dest RULE           Allow a destination; repeatable. With [network]
+                              default = "deny", only allowed destinations pass.
+  --deny-dest RULE            Block a destination; repeatable.
+  --lan-allow RULE            Open a hole in the LAN block; repeatable.
+  --writable PATH             Extra writable path; repeatable.
+  --read-only PATH            Extra read-only path; repeatable.
+  --deny-path PATH            Deny access to PATH (macOS-enforced); repeatable.
+  --narrow-home               Writable $HOME becomes agent state dirs only.
   --no-firewall               Do not install the firewall guard. Alias: --no-pf.
   --shared-user-firewall      Use current-UID firewall rules. Alias: --shared-user-pf.
   --allow-non-default-route   Do not require the default route to use the selected VPN.
@@ -118,7 +215,7 @@ options:
   --print-firewall            Print generated firewall rules and exit. Alias: --print-pf.
 
 default command:
-  claude
+  claude (or [defaults] command from the config file)
 ```
 
 For inspection without applying the firewall:

@@ -72,6 +72,28 @@ By default it:
 - blocks LAN destinations and non-selected-interface egress for only the
   guarded agent tree.
 
+## Configuration
+
+Everything persists, so a configured machine launches with plain
+`lyh -- claude`. A guided full-screen TUI edits the layered TOML config —
+VPN interface with live status, destination allow/deny lists and LAN
+exceptions, extra writable/read-only paths, sensitive-path denials
+(`~/.ssh`, `~/.aws`, …), and a narrow-home mode:
+
+```sh
+lyh config        # guided editor (alias: lyh setup)
+lyh config show   # merged effective config with per-key provenance
+```
+
+Two files layer under the command line
+(`CLI flags > ./.lianyaohu.toml > ~/.config/lianyaohu/config.toml`). A
+project `.lianyaohu.toml` arrives with the checkout, so it is trusted like
+direnv: restrictions apply automatically, while anything that widens the
+sandbox needs a hash-pinned `lyh config trust`. Custom policies are
+re-validated by the root helper — see the
+[security model](https://lyh.maxlv.net/security-model) and the
+[configuration guide](https://lyh.maxlv.net/guide) for details.
+
 ## Root Helper
 
 Firewall enforcement and dedicated-group isolation require root. LianYaoHu uses
