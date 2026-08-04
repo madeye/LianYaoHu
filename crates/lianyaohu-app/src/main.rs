@@ -492,22 +492,25 @@ fn prompt_trust(path: &Path, widenings: &[&str]) -> Result<bool> {
     Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
 }
 
-/// `lyh config [show|path|trust|revoke]` / `lyh setup`. The bare form prints
-/// the effective configuration for now; the guided TUI takes this entry point
-/// over once it lands.
+/// `lyh config [show|path|trust|revoke]` / `lyh setup`. The bare form opens
+/// the guided TUI editor on a TTY and falls back to `show` otherwise.
 fn run_config_command(args: &[String]) -> Result<i32> {
     let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
     let xdg = env::var("XDG_CONFIG_HOME").ok();
     let cwd = env::current_dir()?;
 
     match args.get(1).map(String::as_str) {
+        None if tui::stdin_is_tty() => {
+            tui::run_config_editor(&home, xdg.as_deref(), &cwd)?;
+            Ok(0)
+        }
         None | Some("show") => {
             let global_path = config::global_config_path(&home, xdg.as_deref());
             let global = ConfigFile::load(&global_path)?;

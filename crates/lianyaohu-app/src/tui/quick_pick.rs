@@ -114,35 +114,7 @@ impl Model {
     }
 
     fn detail_lines(&self) -> Vec<String> {
-        let interface = self.selected_interface();
-        let state = match (interface.is_up(), interface.is_running()) {
-            (true, true) => "UP, RUNNING".to_string(),
-            (true, false) => "UP, not running".to_string(),
-            _ => "DOWN".to_string(),
-        };
-        let ipv4 = if interface.ipv4_addresses.is_empty() {
-            "—".to_string()
-        } else if let Some(peer) = interface.ipv4_peer_addresses.first() {
-            format!("{} -> {peer}", interface.ipv4_addresses.join(", "))
-        } else {
-            interface.ipv4_addresses.join(", ")
-        };
-        let ipv6 = if interface.ipv6_addresses.is_empty() {
-            "—".to_string()
-        } else {
-            interface.ipv6_addresses.join(", ")
-        };
-        let default_route = match &self.default_route {
-            Some(name) if *name == interface.name => "yes (matches)".to_string(),
-            Some(name) => format!("no (default is {name})"),
-            None => "unknown".to_string(),
-        };
-        vec![
-            format!("state:         {state}"),
-            format!("ipv4:          {ipv4}"),
-            format!("ipv6:          {ipv6}"),
-            format!("default route: {default_route}"),
-        ]
+        super::interface_detail_lines(self.selected_interface(), self.default_route.as_deref())
     }
 
     fn keybar(&self) -> String {
