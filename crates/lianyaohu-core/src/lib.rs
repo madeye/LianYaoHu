@@ -1,3 +1,4 @@
+pub mod config;
 pub mod env_policy;
 pub mod helper;
 pub mod interfaces;
@@ -8,6 +9,7 @@ pub mod linux_firewall;
 pub mod linux_sandbox;
 #[cfg(target_os = "macos")]
 pub mod pf;
+pub mod policy;
 pub mod route;
 #[cfg(target_os = "macos")]
 pub mod sandbox_profile;
