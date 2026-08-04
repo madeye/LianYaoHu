@@ -1,3 +1,4 @@
+use crate::policy::SandboxPolicy;
 use crate::{Result, err};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -8,12 +9,24 @@ use std::path::Path;
 
 const MAX_LAUNCH_SPEC_BYTES: u64 = 1024 * 1024;
 
+/// The newest spec revision this build understands. Legacy specs carry no
+/// version field (0); specs with a custom sandbox policy carry 2.
+pub const LAUNCH_SPEC_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LaunchSpec {
     pub command: Vec<String>,
     pub cwd: String,
     pub environment: BTreeMap<String, String>,
     pub sandbox_profile: String,
+    /// 0 for legacy specs. A helper older than the spec must refuse to run it
+    /// rather than silently ignore fields it does not understand — silent
+    /// partial enforcement is the one failure a security tool cannot have.
+    #[serde(default)]
+    pub spec_version: u32,
+    /// `None` means exactly the built-in policy (today's behavior).
+    #[serde(default)]
+    pub policy: Option<SandboxPolicy>,
 }
 
 impl LaunchSpec {
@@ -28,7 +41,17 @@ impl LaunchSpec {
             cwd: cwd.into(),
             environment,
             sandbox_profile: sandbox_profile.into(),
+            spec_version: 0,
+            policy: None,
         }
+    }
+
+    /// Attaches a custom sandbox policy, upgrading the spec to the versioned
+    /// format so an older helper rejects it instead of ignoring the policy.
+    pub fn with_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.spec_version = LAUNCH_SPEC_VERSION;
+        self.policy = Some(policy);
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -40,6 +63,16 @@ impl LaunchSpec {
         }
         if self.sandbox_profile.is_empty() {
             return Err(err("launch spec sandbox profile is empty"));
+        }
+        if self.spec_version > LAUNCH_SPEC_VERSION {
+            return Err(err(format!(
+                "launch spec version {} is newer than this helper supports ({}); \
+                 update the helper with scripts/install-helper.sh",
+                self.spec_version, LAUNCH_SPEC_VERSION
+            )));
+        }
+        if let Some(policy) = &self.policy {
+            policy.validate()?;
         }
         Ok(())
     }

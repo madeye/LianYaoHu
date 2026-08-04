@@ -1,3 +1,4 @@
+use crate::policy::PathPolicy;
 use crate::{Result, err};
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -11,6 +12,7 @@ pub struct LinuxSandbox {
     pub home: PathBuf,
     pub cwd: PathBuf,
     pub tmpdir: PathBuf,
+    pub paths: PathPolicy,
 }
 
 impl LinuxSandbox {
@@ -23,7 +25,13 @@ impl LinuxSandbox {
             home: home.into(),
             cwd: cwd.into(),
             tmpdir: tmpdir.into(),
+            paths: PathPolicy::default(),
         }
+    }
+
+    pub fn with_paths(mut self, paths: PathPolicy) -> Self {
+        self.paths = paths;
+        self
     }
 
     pub fn from_environment(
@@ -56,8 +64,32 @@ impl LinuxSandbox {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        let read_only_extras = if self.paths.read_only.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", self.paths.read_only.join(", "))
+        };
+        let narrow_note = if self.paths.narrow_home {
+            format!(
+                "  narrow home: {} is read-only; writable state: {}\n",
+                self.home.display(),
+                self.paths.agent_state_dirs.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        // Landlock has no deny-inside-allow, so paths.deny cannot be enforced
+        // here; the summary must say so rather than imply protection.
+        let deny_note = if self.paths.deny.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  deny (NOT enforced on Linux; Landlock cannot deny inside an allowed tree): {}\n",
+                self.paths.deny.join(", ")
+            )
+        };
         format!(
-            "Linux sandbox:\n  writable: {writable}\n  writable devices: {devices}\n  read-only: /bin, /sbin, /usr, /lib, /lib64, /etc, /opt, /proc/self\n  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
+            "Linux sandbox:\n  writable: {writable}\n  writable devices: {devices}\n  read-only: /bin, /sbin, /usr, /lib, /lib64, /etc, /opt, /proc/self{read_only_extras}\n{narrow_note}{deny_note}  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
         )
     }
 }
@@ -130,15 +162,27 @@ fn apply_landlock(sandbox: &LinuxSandbox) -> Result<()> {
     let read_access = read_landlock_access(handled_access);
     let write_access = write_landlock_access(handled_access);
 
-    for path in read_only_paths() {
-        add_path_rule(ruleset_fd.0, &path, read_access)?;
+    // Landlock rejects directory-only access rights on non-directory rule
+    // targets, so file targets (device nodes, state files like ~/.claude.json)
+    // get the file-scoped subset.
+    let file_access = (read_access | write_access) & file_landlock_access();
+
+    for path in read_only_paths(sandbox) {
+        let access = if path.is_file() {
+            read_access & file_landlock_access()
+        } else {
+            read_access
+        };
+        add_path_rule(ruleset_fd.0, &path, access)?;
     }
     for path in writable_paths(sandbox) {
-        add_path_rule(ruleset_fd.0, &path, read_access | write_access)?;
+        let access = if path.is_file() {
+            file_access
+        } else {
+            read_access | write_access
+        };
+        add_path_rule(ruleset_fd.0, &path, access)?;
     }
-    // Landlock rejects directory-only access rights on non-directory rule
-    // targets, so device files get the file-scoped subset.
-    let file_access = (read_access | write_access) & file_landlock_access();
     for path in writable_device_files() {
         add_path_rule(ruleset_fd.0, &path, file_access)?;
     }
@@ -216,8 +260,8 @@ fn write_landlock_access(handled_access: u64) -> u64 {
             | LANDLOCK_ACCESS_FS_TRUNCATE)
 }
 
-fn read_only_paths() -> Vec<PathBuf> {
-    [
+fn read_only_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = [
         "/bin",
         "/sbin",
         "/usr",
@@ -230,12 +274,18 @@ fn read_only_paths() -> Vec<PathBuf> {
     ]
     .into_iter()
     .map(PathBuf::from)
-    .collect()
+    .collect();
+    // Narrow-home mode: home drops out of the writable set but stays readable
+    // so dotfiles and installed tooling keep working.
+    if sandbox.paths.narrow_home {
+        paths.push(sandbox.home.clone());
+    }
+    paths.extend(sandbox.paths.read_only.iter().map(PathBuf::from));
+    paths
 }
 
 fn writable_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
-    let mut paths = [
-        sandbox.home.clone(),
+    let mut candidates = vec![
         sandbox.cwd.clone(),
         sandbox.tmpdir.clone(),
         PathBuf::from("/tmp"),
@@ -244,10 +294,20 @@ fn writable_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
         // the rest of /dev is covered by the device-file list below.
         PathBuf::from("/dev/pts"),
         PathBuf::from("/dev/shm"),
-    ]
-    .into_iter()
-    .filter_map(safe_writable_path)
-    .collect::<Vec<_>>();
+    ];
+    if sandbox.paths.narrow_home {
+        for entry in &sandbox.paths.agent_state_dirs {
+            candidates.push(sandbox.home.join(entry));
+        }
+    } else {
+        candidates.push(sandbox.home.clone());
+    }
+    candidates.extend(sandbox.paths.writable.iter().map(PathBuf::from));
+
+    let mut paths = candidates
+        .into_iter()
+        .filter_map(safe_writable_path)
+        .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
     paths
@@ -613,6 +673,71 @@ mod tests {
         assert!(!writable.iter().any(|path| path == Path::new("/var/..")));
         assert!(writable.contains(&PathBuf::from("/tmp")));
         assert!(!sandbox.render_summary().contains("writable: /,"));
+    }
+
+    #[test]
+    fn narrow_home_swaps_home_for_state_entries() {
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh")
+            .with_paths(PathPolicy {
+                narrow_home: true,
+                agent_state_dirs: vec![".claude".into(), ".claude.json".into()],
+                ..PathPolicy::default()
+            });
+
+        let writable = writable_paths(&sandbox);
+        assert!(!writable.contains(&PathBuf::from("/home/alice")));
+        assert!(writable.contains(&PathBuf::from("/home/alice/.claude")));
+        assert!(writable.contains(&PathBuf::from("/home/alice/.claude.json")));
+        assert!(writable.contains(&PathBuf::from("/home/alice/project")));
+
+        let read_only = read_only_paths(&sandbox);
+        assert!(read_only.contains(&PathBuf::from("/home/alice")));
+    }
+
+    #[test]
+    fn extra_policy_paths_join_the_rule_lists() {
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh")
+            .with_paths(PathPolicy {
+                writable: vec!["/data/models".into()],
+                read_only: vec!["/data/reference".into()],
+                ..PathPolicy::default()
+            });
+
+        assert!(writable_paths(&sandbox).contains(&PathBuf::from("/data/models")));
+        assert!(read_only_paths(&sandbox).contains(&PathBuf::from("/data/reference")));
+        // Extras never smuggle the filesystem root in.
+        let hostile = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh")
+            .with_paths(PathPolicy {
+                writable: vec!["/".into(), "relative".into()],
+                ..PathPolicy::default()
+            });
+        let writable = writable_paths(&hostile);
+        assert!(!writable.iter().any(|path| path == Path::new("/")));
+        assert!(!writable.iter().any(|path| path == Path::new("relative")));
+    }
+
+    #[test]
+    fn summary_reports_unenforced_deny_paths() {
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh")
+            .with_paths(PathPolicy {
+                deny: vec!["/home/alice/.ssh".into()],
+                read_only: vec!["/data/reference".into()],
+                narrow_home: true,
+                ..PathPolicy::default()
+            });
+        let summary = sandbox.render_summary();
+
+        assert!(summary.contains("NOT enforced on Linux"));
+        assert!(summary.contains("/home/alice/.ssh"));
+        assert!(summary.contains("/data/reference"));
+        assert!(summary.contains("narrow home"));
+
+        // The default policy keeps the historical summary, with no policy
+        // markers.
+        let plain =
+            LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh").render_summary();
+        assert!(!plain.contains("NOT enforced"));
+        assert!(!plain.contains("narrow home"));
     }
 
     #[test]

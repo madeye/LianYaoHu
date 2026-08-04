@@ -42,6 +42,19 @@ impl PFHelperClient {
         self.send("status\n")
     }
 
+    /// Probes whether the running helper understands versioned launch specs
+    /// with a custom sandbox policy. An old helper answers the unknown verb
+    /// with an error line — that error IS the negative signal, so this returns
+    /// `Ok(false)` for it and only propagates transport failures.
+    pub fn supports_policy(&self) -> Result<bool> {
+        let response = self.send("capabilities\n")?;
+        Ok(response.ok
+            && response
+                .message
+                .split_whitespace()
+                .any(|token| token == "policy=1"))
+    }
+
     pub fn run_session(&self, interface_name: &str, spec_path: &Path) -> Result<i32> {
         let spec_path = spec_path
             .to_str()
@@ -130,6 +143,9 @@ pub fn parse_request(line: &str) -> Result<HelperRequest> {
     if trimmed == "status" {
         return Ok(HelperRequest::Status);
     }
+    if trimmed == "capabilities" {
+        return Ok(HelperRequest::Capabilities);
+    }
     if let Some(interface_name) = trimmed.strip_prefix("install ") {
         if interface_name.is_empty() || interface_name.contains(char::is_whitespace) {
             return Err(err("invalid helper install interface"));
@@ -168,6 +184,7 @@ pub enum HelperRequest {
     },
     Uninstall,
     Status,
+    Capabilities,
 }
 
 impl Default for PFHelperClient {

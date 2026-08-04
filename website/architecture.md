@@ -29,22 +29,29 @@ launcher and the helper, so both sides always render identical rules:
 |---|---|
 | `interfaces` | Enumerate interfaces via `getifaddrs`, collect IPv4/IPv6 and point-to-point peer addresses; supported VPN interfaces are `utun*` on macOS and `tun*`/`wg*` on Linux. |
 | `route` | Ask the platform route tool which interface would carry `1.1.1.1` (`/sbin/route -n get` on macOS, `ip route get` on Linux). |
-| `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow loopback-only bind/inbound, outbound TCP/UDP, and the mDNSResponder socket). |
-| `linux_sandbox` | Linux: build and apply the child sandbox (`PR_SET_NO_NEW_PRIVS`, Landlock filesystem rules, and seccomp-BPF syscall filtering). Launch fails if Landlock is unavailable. |
+| `policy` | Typed sandbox policy shared by launcher and helper: `SandboxPolicy` (network + path customization), the `DestRule` grammar (`ADDR[/PREFIX][:PORT[-PORT]]`, parsed into `IpAddr`/prefix/port — never free text), the blocked-LAN constants, list caps, and lexical path validation. |
+| `config` | Layered TOML configuration: `ConfigFile` schema (`deny_unknown_fields` throughout), XDG global path + upward `.lianyaohu.toml` discovery, merge with per-key provenance, widening detection/stripping, and the hash-pinned trust store (`trusted.toml`). |
+| `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow loopback-only bind/inbound, outbound TCP/UDP, and the mDNSResponder socket). Applies the path policy: extra writable/read-only subpaths, narrow-home mode, and user deny rules appended last (seatbelt is last-match-wins). |
+| `linux_sandbox` | Linux: build and apply the child sandbox (`PR_SET_NO_NEW_PRIVS`, Landlock filesystem rules, and seccomp-BPF syscall filtering). Applies the path policy (extras, narrow-home); deny paths are reported as unenforced. Launch fails if Landlock is unavailable. |
 | `env_policy` | Sanitize the child environment: allowlist of operational variables and agent credentials (`ANTHROPIC_*`, `OPENAI_*`, `GIT_*`, …), blocklist of host-identity surfaces (`SSH_*`, `XPC_*`, hostname/MAC/serial/timezone markers); forces `TZ=UTC` and sets `LIANYAOHU_SANDBOX=1`. |
-| `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, and the rendered sandbox profile/summary field. |
-| `pf` | macOS: `PFRuleSet` renders the PF anchor rules for a `(utun, socket owner)` pair; the default helper path matches the `_lianyaohu` group, while the fallback path matches the caller UID. `PFGuard` installs fallback rules via the helper or sudo and uninstalls on `Drop`. |
-| `linux_firewall` | Linux: `LinuxFirewallRuleSet` renders and installs iptables/ip6tables OUTPUT chains for a `(tun/wg, socket owner)` pair; the default helper path matches `_lianyaohu`, while the fallback path matches the caller UID. |
-| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, while `install <utun>`, `uninstall`, and `status` remain for the current-UID fallback. |
+| `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, the rendered sandbox profile/summary field, and (spec v2) the typed `SandboxPolicy`. A helper older than the spec's version refuses to run it. |
+| `pf` | macOS: `PFRuleSet` renders the PF anchor rules for a `(utun, socket owner, network policy)` tuple; the default helper path matches the `_lianyaohu` group, while the fallback path matches the caller UID. `PFGuard` installs fallback rules via the helper or sudo and uninstalls on `Drop`. |
+| `linux_firewall` | Linux: `LinuxFirewallRuleSet` renders and installs iptables/ip6tables OUTPUT chains for a `(tun/wg, socket owner, network policy)` tuple; the default helper path matches `_lianyaohu`, while the fallback path matches the caller UID. |
+| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, `capabilities` probes policy support for version negotiation, and `install <utun>`, `uninstall`, `status` remain for the current-UID fallback. |
 
 ### `lianyaohu-app` (launcher)
 
 `run()` is a straight pipeline; every step must pass before the agent starts:
 
 1. Parse options (`--vpn`, `--cwd`, `--env`, `--no-pf`, `--shared-user-pf`,
-   `--allow-non-default-route`, print/inspect modes).
-2. Select the VPN interface — from `--vpn` or an interactive prompt — and
-   validate it for the current platform.
+   `--allow-non-default-route`, policy flags, print/inspect modes), then load
+   and merge the layered configuration (global file, trust-checked project
+   file, CLI overrides) and build the typed `SandboxPolicy` from the result.
+2. Select the VPN interface — from `--vpn`, the configured default, or the
+   interactive picker (a ratatui inline quick-pick with a live detail pane;
+   a numbered stdin prompt for non-TTY runs and `--no-tui`) — and validate
+   it for the current platform. The full-screen `lyh config` editor manages
+   the persistent configuration.
 3. Sanitize the environment, then build the platform sandbox from `$HOME`, the
    canonicalized working directory, and a fresh per-launch tmpdir.
 4. Build the default group-scoped firewall rules for helper launches, or the
@@ -85,6 +92,14 @@ that owns the privileged half of firewall enforcement:
 - Also accepts `install <interface>`, `uninstall`, and `status` for the
   `--shared-user-firewall` fallback. In that path generated rules are scoped
   to the peer UID.
+- Answers `capabilities` with its supported spec features (`policy=1
+  spec_version=2`). Clients probe this before sending a non-default sandbox
+  policy; an old helper answers the unknown verb with an error line, which is
+  the client's signal to hard-error instead of running with a silently
+  narrower policy. The helper re-validates every policy field it receives —
+  ownership and canonicalization for extra writable paths, a system-prefix
+  denylist, other-users'-home rejection for read-only extras, LAN-exception
+  containment, and list caps — before rebuilding the profile and rules.
 - The interface name must be supported for the platform and must be live and
   addressed at install time.
 - On macOS, writes rules to `/var/run/lianyaohu/rules-<uid>-<utun>.pf` (mode

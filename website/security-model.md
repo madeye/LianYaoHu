@@ -49,6 +49,32 @@ ordinary group-based project access intact.
 On Linux, the helper drops to the caller UID and `_lianyaohu` effective GID
 before applying `PR_SET_NO_NEW_PRIVS`, Landlock, and seccomp in the child.
 
+### Path customization
+
+The configuration layer can add to — or narrow — the default grants:
+
+- **Extra writable / read-only paths** are widenings, so the helper
+  re-validates them like the launch roots: canonicalized against the real
+  filesystem, never `/`, and writable extras must be **owned by the caller**
+  and outside a protected-prefix denylist (`/etc`, `/usr`, `/System`,
+  `/Library`, `/var/db`, …). Read-only extras may not reach into another
+  user's home.
+- **Denied paths** (`paths.deny`, e.g. `~/.ssh`) are rendered as the *final*
+  seatbelt rules, so they override every allow — the entries become
+  unreadable and unwritable even inside the writable `$HOME`. **Linux cannot
+  enforce these**: Landlock has no deny-inside-allow, so the launcher warns
+  at startup and `--print-profile` reports them as unenforced. Do not move a
+  macOS config to Linux and assume `~/.ssh` is still protected.
+- **Narrow-home mode** replaces the blanket writable `$HOME` with per-entry
+  grants for the configured agent state locations (plus cwd and the launch
+  tmpdir); `$HOME` stays readable so dotfiles and installed tooling keep
+  working. This is enforced identically on both platforms and is the
+  strongest filesystem posture.
+
+The helper never trusts client-supplied paths: every field of the policy is
+re-validated server-side, and the client's rendered profile text is ignored
+entirely (see [Architecture](/architecture)).
+
 ## Environment
 
 The launcher passes a small set of operational variables and common code-agent
@@ -84,14 +110,29 @@ passwd database for the authenticated peer UID, and a working directory and
 temporary directory that must be real directories (the temporary directory
 owned by the caller) — and re-sanitizes the launch environment with the same
 privacy and injection blocklists the launcher applies. The client's profile
-text is never consumed. Before exec on macOS, the `drop-exec` trampoline
-verifies the credential drop took effect and cannot be reversed.
+text is never consumed. A custom sandbox policy travels as typed fields in
+the versioned launch spec and is re-validated field by field: destination
+rules arrive pre-parsed (address, prefix, port range — never free text), the
+LAN-exception containment check runs again helper-side, list lengths are
+capped, and the path rules go through the ownership checks described under
+*Path customization*. Only `Display` of typed values ever reaches the
+`pfctl`/iptables rule text, so config strings cannot inject rules. Before
+exec on macOS, the `drop-exec` trampoline verifies the credential drop took
+effect and cannot be reversed.
+
+**Version negotiation.** An old helper would silently drop spec fields it
+does not know — the user would believe `network.deny` is enforced when it is
+not. The client therefore probes the helper's capabilities before sending
+any non-default policy and hard-errors when the helper predates policy
+support; a default policy ships as a legacy spec that old and new helpers
+handle identically. The helper likewise rejects specs newer than itself.
 
 Firewall sessions are reference-counted per UID: concurrent launches by the
 same user share one set of rules, which are removed only when the last session
 ends, so an early-exiting session cannot strip the guard from a running one.
-Concurrent sessions for one UID must use the same VPN interface and scope;
-a mismatching launch is refused rather than silently weakening either session.
+Concurrent sessions for one UID must use the same VPN interface, scope, and
+network policy (the rules live under a single anchor/chain per UID); a
+mismatching launch is refused rather than silently weakening either session.
 The helper also caps concurrent connections — globally and per UID, so one
 user's long-lived sessions cannot occupy every worker slot — and, on
 SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only
@@ -154,6 +195,30 @@ On Linux, the installed iptables/ip6tables chains:
 - reject other traffic opened by the caller's UID with the `_lianyaohu`
   effective GID.
 
+### Network customization
+
+The configuration layer inserts typed rules into both rule sets at fixed
+points in the first-match-wins order:
+
+- **LAN exceptions** (`lan_allow`) render *before* the LAN blocks, opening a
+  hole for a specific host or subnet (a NAS, a local dev server). Every entry
+  must be fully contained in the blocked LAN ranges — this is validated in
+  the client, the editor, and again in the helper, because an uncontained
+  entry (say `0.0.0.0/0`) would otherwise bypass the VPN-only guarantee
+  entirely.
+- **Denied destinations** (`network.deny`) render *after* the LAN blocks and
+  *before* any pass rule, so they carve holes out of the allows (e.g. a
+  cloud metadata address, a port range).
+- **Default-deny mode** (`default = "deny"`) replaces the blanket
+  on-interface pass with one pass per `network.allow` entry plus a terminal
+  block: only allow-listed destinations may leave, and still only on the
+  selected interface.
+
+Rules with ports expand to TCP and UDP matches; IPv4 and IPv6 rules go only
+to their family's program. Entries are IP literals by design — accepting DNS
+names would make the root helper resolve untrusted names, and resolution
+itself is a time-of-check race against the firewall.
+
 ### DNS resolution
 
 On macOS, the sandbox profile lets the agent reach the system resolver over the
@@ -176,6 +241,29 @@ default-route invariant:
   cannot make another interface carry the default route.
 - If the system default route changes while the agent runs, DNS can leave the
   tunnel even though the agent's sockets remain pinned.
+
+## Configuration Trust
+
+Configuration is layered: a global `~/.config/lianyaohu/config.toml` the user
+owns, and an optional `.lianyaohu.toml` discovered upward from the working
+directory. The project file arrives with a repository checkout, so it is
+attacker-influenced by definition. The trust policy splits its keys:
+
+- **Tightenings** — `network.default = "deny"`, `network.deny`,
+  `paths.deny`, `narrow_home` — apply automatically. The worst a hostile
+  repository can do with them is restrict its own sandbox.
+- **Widenings** — `network.allow`, `lan_allow`, `paths.writable`,
+  `paths.read_only`, `agent_state_dirs`, and `[env]` (environment variables
+  can redirect credentials, e.g. `ANTHROPIC_BASE_URL`) — require a
+  hash-pinned approval in `~/.config/lianyaohu/trusted.toml`, in the style
+  of `direnv allow`. Any edit to the file invalidates the approval.
+
+Without an approval, an interactive run prompts once; a non-interactive run
+strips the widenings and warns loudly. A run is never silently widened, and
+a scripted run is never blocked on a prompt. Unknown keys in any config file
+are hard errors — in a security policy, a typo like `narow_home` must not be
+a silent no-op. Group- or world-writable config or trust-store files draw a
+warning, since a writable trust store would defeat the hash pinning.
 
 ## Known Limits
 

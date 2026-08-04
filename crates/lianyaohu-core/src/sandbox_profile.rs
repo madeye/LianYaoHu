@@ -1,7 +1,10 @@
+use crate::policy::PathPolicy;
+
 pub struct SandboxProfile {
     pub home: String,
     pub cwd: String,
     pub tmpdir: String,
+    pub paths: PathPolicy,
 }
 
 impl SandboxProfile {
@@ -10,13 +13,18 @@ impl SandboxProfile {
             home: home.into(),
             cwd: cwd.into(),
             tmpdir: tmpdir.into(),
+            paths: PathPolicy::default(),
         }
     }
 
+    pub fn with_paths(mut self, paths: PathPolicy) -> Self {
+        self.paths = paths;
+        self
+    }
+
     pub fn render(&self) -> String {
-        let home = scheme_string(&self.home);
-        let cwd = scheme_string(&self.cwd);
-        let tmpdir = scheme_string(&self.tmpdir);
+        let home_write_section = self.home_write_section();
+        let user_sections = self.user_sections();
         let home_global_preferences = scheme_string(&format!(
             "{}/Library/Preferences/.GlobalPreferences.plist",
             self.home
@@ -128,15 +136,7 @@ impl SandboxProfile {
     (subpath "/sbin")
     (subpath "/usr"))
 
-; $HOME is writable so agents can maintain their own state (~/.claude,
-; ~/.codex, credential and cache files). The identity-surface denials above
-; still win over this allow. /opt/homebrew is writable so agents can
-; brew install the tools they need.
-(allow file-read* file-write* file-map-executable
-    (subpath "{home}")
-    (subpath "{cwd}")
-    (subpath "{tmpdir}")
-    (subpath "/opt/homebrew"))
+{home_write_section}
 
 ; /dev/fd is how bash implements process substitution (/dev/fd/62); Homebrew
 ; uses it on every run.
@@ -197,8 +197,88 @@ impl SandboxProfile {
     (remote tcp "*:*")
     (remote udp "*:*")
     (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
-"#
+{user_sections}"#
         )
+    }
+
+    /// The writable-roots allow block. In default mode this must render
+    /// byte-identical to the historical fixed block; extra writable paths from
+    /// the user policy are appended inside the same allow.
+    fn home_write_section(&self) -> String {
+        let home = scheme_string(&self.home);
+        let cwd = scheme_string(&self.cwd);
+        let tmpdir = scheme_string(&self.tmpdir);
+        let mut extras = String::new();
+        for path in &self.paths.writable {
+            extras.push_str(&format!("\n    (subpath \"{}\")", scheme_string(path)));
+        }
+
+        if self.paths.narrow_home {
+            // Both (literal ...) and (subpath ...) are emitted per state entry
+            // so file entries like `.claude.json` match without stat-ing.
+            let mut state = String::new();
+            for entry in &self.paths.agent_state_dirs {
+                let path = scheme_string(&format!("{}/{}", self.home, entry));
+                state.push_str(&format!(
+                    "\n    (literal \"{path}\")\n    (subpath \"{path}\")"
+                ));
+            }
+            format!(
+                r#"; Narrow-home mode: $HOME stays readable and executable so dotfiles and
+; installed tooling keep working, but only agent state locations (plus the
+; working directory and the launch tmpdir) are writable. /opt/homebrew is
+; writable so agents can brew install the tools they need.
+(allow file-read* file-map-executable
+    (subpath "{home}"))
+(allow file-read* file-write* file-map-executable{state}
+    (subpath "{cwd}")
+    (subpath "{tmpdir}")
+    (subpath "/opt/homebrew"){extras})"#
+            )
+        } else {
+            format!(
+                r#"; $HOME is writable so agents can maintain their own state (~/.claude,
+; ~/.codex, credential and cache files). The identity-surface denials above
+; still win over this allow. /opt/homebrew is writable so agents can
+; brew install the tools they need.
+(allow file-read* file-write* file-map-executable
+    (subpath "{home}")
+    (subpath "{cwd}")
+    (subpath "{tmpdir}")
+    (subpath "/opt/homebrew"){extras})"#
+            )
+        }
+    }
+
+    /// User-policy blocks appended after everything else. Seatbelt is
+    /// last-match-wins, so the deny block being the final rules in the profile
+    /// is what lets it override every allow above, including the writable
+    /// roots. Empty when the policy is default, keeping the rendered profile
+    /// byte-identical to the historical output.
+    fn user_sections(&self) -> String {
+        let mut out = String::new();
+        if !self.paths.read_only.is_empty() {
+            out.push_str("\n; Extra read-only paths from the user policy.\n(allow file-read*");
+            for path in &self.paths.read_only {
+                out.push_str(&format!("\n    (subpath \"{}\")", scheme_string(path)));
+            }
+            out.push_str(")\n");
+        }
+        if !self.paths.deny.is_empty() {
+            out.push_str(
+                "\n; Denied paths from the user policy. Seatbelt is last-match-wins, so\n\
+                 ; these must remain the final rules to override every allow above.\n\
+                 (deny file-read* file-write*",
+            );
+            for path in &self.paths.deny {
+                let path = scheme_string(path);
+                out.push_str(&format!(
+                    "\n    (literal \"{path}\")\n    (subpath \"{path}\")"
+                ));
+            }
+            out.push_str(")\n");
+        }
+        out
     }
 }
 
@@ -273,6 +353,105 @@ mod tests {
     #[test]
     fn escapes_scheme_strings() {
         assert_eq!(scheme_string(r#"/tmp/a"b\c"#), r#"/tmp/a\"b\\c"#);
+    }
+
+    #[test]
+    fn default_policy_renders_without_user_sections() {
+        let profile =
+            SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
+
+        // The default policy must not introduce any generated markers; combined
+        // with the exact writable-block assertion above, this pins the default
+        // render to the historical profile.
+        assert!(!profile.contains("user policy"));
+        assert!(!profile.contains("Narrow-home"));
+        assert!(profile.ends_with(
+            "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n"
+        ));
+    }
+
+    #[test]
+    fn extra_paths_render_in_policy_order() {
+        let paths = PathPolicy {
+            writable: vec!["/Volumes/DATA/models".into()],
+            read_only: vec!["/Volumes/DATA/reference".into()],
+            deny: vec!["/Users/example/.ssh".into(), "/Users/example/.aws".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        // Extra writable paths join the existing writable allow.
+        assert!(profile.contains(
+            r#"(allow file-read* file-write* file-map-executable
+    (subpath "/Users/example")
+    (subpath "/Users/example/project")
+    (subpath "/tmp/lyh")
+    (subpath "/opt/homebrew")
+    (subpath "/Volumes/DATA/models"))"#
+        ));
+        assert!(profile.contains(
+            r#"(allow file-read*
+    (subpath "/Volumes/DATA/reference"))"#
+        ));
+        // Deny rules cover read and write, and are the FINAL rules in the
+        // profile — seatbelt is last-match-wins, so anything after them would
+        // override the denial.
+        let deny_block = r#"(deny file-read* file-write*
+    (literal "/Users/example/.ssh")
+    (subpath "/Users/example/.ssh")
+    (literal "/Users/example/.aws")
+    (subpath "/Users/example/.aws"))"#;
+        assert!(profile.contains(deny_block));
+        let deny_at = profile.find(deny_block).unwrap();
+        let outbound_at = profile.find("(allow network-outbound").unwrap();
+        assert!(deny_at > outbound_at, "deny block must come last");
+        assert!(profile.trim_end().ends_with(deny_block));
+    }
+
+    #[test]
+    fn narrow_home_grants_state_dirs_not_home() {
+        let paths = PathPolicy {
+            narrow_home: true,
+            agent_state_dirs: vec![".claude".into(), ".claude.json".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        // Home is readable/executable but no longer blanket-writable.
+        assert!(profile.contains(
+            r#"(allow file-read* file-map-executable
+    (subpath "/Users/example"))"#
+        ));
+        assert!(!profile.contains(
+            r#"(allow file-read* file-write* file-map-executable
+    (subpath "/Users/example")
+"#
+        ));
+        // State entries are writable as both literal (files) and subpath.
+        assert!(profile.contains(r#"(literal "/Users/example/.claude.json")"#));
+        assert!(profile.contains(r#"(subpath "/Users/example/.claude")"#));
+        assert!(profile.contains(r#"(subpath "/Users/example/project")"#));
+        assert!(profile.contains(r#"(subpath "/opt/homebrew")"#));
+    }
+
+    #[test]
+    fn user_paths_are_scheme_escaped() {
+        let paths = PathPolicy {
+            writable: vec![r#"/tmp/a"b\c"#.into()],
+            deny: vec![r#"/tmp/d"e"#.into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        assert!(profile.contains(r#"(subpath "/tmp/a\"b\\c")"#));
+        assert!(profile.contains(r#"(subpath "/tmp/d\"e")"#));
+        assert!(!profile.contains(r#"a"b"#));
     }
 
     #[cfg(target_os = "macos")]
@@ -553,14 +732,28 @@ mod tests {
         fs::create_dir_all(&tmpdir).unwrap();
         let command = build_command(&tmpdir);
         let profile = SandboxProfile::new(&home, cwd.to_string_lossy(), tmpdir.to_string_lossy());
-        let profile_path = tmpdir.join("profile.sb");
+        let result = run_profile(&profile, &tmpdir, command);
+        let _ = fs::remove_dir_all(&tmpdir);
+        result
+    }
+
+    // Runs a command under an arbitrary profile; the caller owns tmpdir
+    // creation and cleanup. The child's environment is sanitized against the
+    // profile's own home/cwd/tmpdir so runtime tests can use a scratch home.
+    #[cfg(target_os = "macos")]
+    fn run_profile(
+        profile: &SandboxProfile,
+        tmpdir: &std::path::Path,
+        command: Vec<String>,
+    ) -> SandboxRun {
+        let profile_path = tmpdir.join(format!("profile-{}.sb", unique_test_id()));
         fs::write(&profile_path, profile.render()).unwrap();
 
         let input_env = std::env::vars().collect::<BTreeMap<_, _>>();
         let clean_env = env_policy::sanitize(
             &input_env,
-            &home,
-            &cwd.to_string_lossy(),
+            &profile.home,
+            &profile.cwd,
             &tmpdir.to_string_lossy(),
             &BTreeMap::new(),
         );
@@ -569,13 +762,12 @@ mod tests {
             .arg("-f")
             .arg(&profile_path)
             .args(command)
-            .current_dir(&cwd)
+            .current_dir(&profile.cwd)
             .env_clear()
             .envs(clean_env)
             .output()
             .unwrap();
 
-        let _ = fs::remove_dir_all(&tmpdir);
         SandboxRun {
             status: output.status.code().unwrap_or(1),
             output: format!(
@@ -584,5 +776,128 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
+    }
+
+    // Scratch layout for policy runtime tests: home and the launch tmpdir must
+    // be SIBLINGS — if home lived inside the granted tmpdir, the tmpdir's
+    // writable subpath rule would make home writable and mask the behavior
+    // under test.
+    #[cfg(target_os = "macos")]
+    fn scratch_home_layout() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "lianyaohu-policy-test-{}-{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // Seatbelt matches canonical vnode paths, and macOS temp dirs live
+        // behind the /var -> /private/var symlink; production paths are always
+        // canonicalized (helper validated_directory), so mirror that here.
+        let root = root.canonicalize().unwrap();
+        let home = root.join("home");
+        let tmpdir = root.join("tmp");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&tmpdir).unwrap();
+        (root, home, tmpdir)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn narrow_home_profile_restricts_home_writes() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        let (root, home, tmpdir) = scratch_home_layout();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let paths = PathPolicy {
+            narrow_home: true,
+            agent_state_dirs: vec![".claude".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        )
+        .with_paths(paths);
+
+        let blocked = home.join("blocked");
+        let denied = run_profile(
+            &profile,
+            &tmpdir,
+            vec!["/usr/bin/touch".into(), blocked.to_string_lossy().into()],
+        );
+        let allowed_target = home.join(".claude").join("ok");
+        let allowed = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/touch".into(),
+                allowed_target.to_string_lossy().into(),
+            ],
+        );
+
+        let blocked_exists = blocked.exists();
+        let allowed_exists = allowed_target.exists();
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(denied.status, 0, "write outside state dirs must fail");
+        assert!(!blocked_exists);
+        assert_eq!(
+            allowed.status, 0,
+            "state dir write failed: {}",
+            allowed.output
+        );
+        assert!(allowed_exists);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_paths_block_reads_inside_writable_home() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        let (root, home, tmpdir) = scratch_home_layout();
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("secret"), "key material").unwrap();
+        fs::write(home.join("readable"), "fine").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let paths = PathPolicy {
+            deny: vec![ssh_dir.to_string_lossy().into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        )
+        .with_paths(paths);
+
+        let denied = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                ssh_dir.join("secret").to_string_lossy().into(),
+            ],
+        );
+        let allowed = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                home.join("readable").to_string_lossy().into(),
+            ],
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(
+            denied.status, 0,
+            "deny path was readable despite writable home"
+        );
+        assert_eq!(allowed.status, 0, "control read failed: {}", allowed.output);
     }
 }
