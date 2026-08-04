@@ -1,3 +1,4 @@
+use crate::policy::{DestRule, IpNetwork, LAN4_BLOCKED, LAN6_BLOCKED, NetAction, NetworkPolicy};
 use crate::{Result, err};
 use std::path::Path;
 use std::process::Command;
@@ -5,24 +6,12 @@ use std::process::Command;
 pub const LIANYAOHU_GROUP_NAME: &str = "_lianyaohu";
 pub const LIANYAOHU_GROUP_GID: u32 = 2_000_000;
 
-const LAN4_CIDRS: &[&str] = &[
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-];
-
-const LAN6_CIDRS: &[&str] = &["::/128", "fe80::/10", "fc00::/7", "ff00::/8"];
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinuxFirewallRuleSet {
     pub interface_name: String,
     pub anchor_key: u32,
     pub socket_owner: LinuxSocketOwner,
+    pub network: NetworkPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +49,7 @@ impl LinuxFirewallRuleSet {
             interface_name: interface_name.into(),
             anchor_key: uid,
             socket_owner: LinuxSocketOwner::User(uid),
+            network: NetworkPolicy::default(),
         }
     }
 
@@ -68,7 +58,13 @@ impl LinuxFirewallRuleSet {
             interface_name: interface_name.into(),
             anchor_key: anchor_uid,
             socket_owner: LinuxSocketOwner::UserAndGroup(anchor_uid, gid),
+            network: NetworkPolicy::default(),
         }
+    }
+
+    pub fn with_network(mut self, network: NetworkPolicy) -> Self {
+        self.network = network;
+        self
     }
 
     pub fn chain_name(&self) -> String {
@@ -101,39 +97,74 @@ impl LinuxFirewallRuleSet {
     }
 
     fn setup_commands(&self, family: IpFamily) -> Vec<Vec<String>> {
-        let mut commands = Vec::new();
         let chain = self.chain_name();
-        let cidrs = match family {
-            IpFamily::V4 => LAN4_CIDRS,
-            IpFamily::V6 => LAN6_CIDRS,
+        let lan_blocked: &[IpNetwork] = match family {
+            IpFamily::V4 => &LAN4_BLOCKED,
+            IpFamily::V6 => &LAN6_BLOCKED,
+        };
+        let family_rules = |rules: &[DestRule]| -> Vec<DestRule> {
+            rules
+                .iter()
+                .filter(|rule| rule.net.is_ipv4() == matches!(family, IpFamily::V4))
+                .cloned()
+                .collect()
         };
 
-        commands.push(vec!["-w", "-N", &chain]);
-        commands.push(vec!["-w", "-F", &chain]);
-        commands.push(vec!["-w", "-A", &chain, "-o", "lo", "-j", "RETURN"]);
-        for cidr in cidrs {
-            commands.push(vec!["-w", "-A", &chain, "-d", cidr, "-j", "REJECT"]);
-        }
-        commands.push(vec![
-            "-w",
-            "-A",
-            &chain,
-            "-o",
-            &self.interface_name,
-            "-j",
-            "RETURN",
-        ]);
-        commands.push(vec!["-w", "-A", &chain, "-j", "REJECT"]);
+        let args =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
 
-        let mut commands = commands
-            .into_iter()
-            .map(|command| {
-                command
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let mut commands = vec![
+            args(&["-w", "-N", &chain]),
+            args(&["-w", "-F", &chain]),
+            args(&["-w", "-A", &chain, "-o", "lo", "-j", "RETURN"]),
+        ];
+        // Rule order inside the chain is first-match-wins: LAN exceptions
+        // must precede the LAN REJECTs, and user denies must precede any
+        // RETURN that could match the same destination.
+        for rule in family_rules(&self.network.lan_allow) {
+            commands.extend(self.destination_commands(&chain, &rule, None, "RETURN"));
+        }
+        for lan in lan_blocked {
+            commands.push(args(&[
+                "-w",
+                "-A",
+                &chain,
+                "-d",
+                &lan.cidr(),
+                "-j",
+                "REJECT",
+            ]));
+        }
+        for rule in family_rules(&self.network.deny) {
+            commands.extend(self.destination_commands(&chain, &rule, None, "REJECT"));
+        }
+        match self.network.default_action {
+            NetAction::Allow => {
+                commands.push(args(&[
+                    "-w",
+                    "-A",
+                    &chain,
+                    "-o",
+                    &self.interface_name,
+                    "-j",
+                    "RETURN",
+                ]));
+            }
+            NetAction::Deny => {
+                // Only allow-listed destinations may leave, and only on the
+                // selected interface; everything else falls through to the
+                // terminal REJECT.
+                for rule in family_rules(&self.network.allow) {
+                    commands.extend(self.destination_commands(
+                        &chain,
+                        &rule,
+                        Some(&self.interface_name),
+                        "RETURN",
+                    ));
+                }
+            }
+        }
+        commands.push(args(&["-w", "-A", &chain, "-j", "REJECT"]));
 
         let mut jump = vec![
             "-w".to_string(),
@@ -146,6 +177,45 @@ impl LinuxFirewallRuleSet {
         commands.push(jump);
 
         commands
+    }
+
+    /// Builds the `-A` command(s) for one typed destination rule. Rules with a
+    /// port spec expand to a tcp and a udp command because `--dport` requires
+    /// a protocol match. Arguments stay argv vectors end to end — no shell —
+    /// and only `Display` of typed values reaches them.
+    fn destination_commands(
+        &self,
+        chain: &str,
+        rule: &DestRule,
+        out_interface: Option<&str>,
+        target: &str,
+    ) -> Vec<Vec<String>> {
+        let mut base = vec!["-w".to_string(), "-A".to_string(), chain.to_string()];
+        if let Some(interface) = out_interface {
+            base.extend(["-o".to_string(), interface.to_string()]);
+        }
+        base.extend(["-d".to_string(), rule.net.cidr()]);
+        match rule.port_spec() {
+            None => {
+                base.extend(["-j".to_string(), target.to_string()]);
+                vec![base]
+            }
+            Some(spec) => ["tcp", "udp"]
+                .into_iter()
+                .map(|proto| {
+                    let mut command = base.clone();
+                    command.extend([
+                        "-p".to_string(),
+                        proto.to_string(),
+                        "--dport".to_string(),
+                        spec.clone(),
+                        "-j".to_string(),
+                        target.to_string(),
+                    ]);
+                    command
+                })
+                .collect(),
+        }
     }
 
     fn cleanup_commands(&self) -> Vec<(IpFamily, Vec<String>)> {
@@ -432,5 +502,104 @@ mod tests {
         assert!(rules.contains("# Scope: packets owned by uid 1000."));
         assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 -j LYH-1000"));
         assert!(rules.contains("iptables -w -A LYH-1000 -o wg0 -j RETURN"));
+    }
+
+    fn policy(entries: &[(&str, &str)]) -> NetworkPolicy {
+        let mut network = NetworkPolicy::default();
+        for (list, entry) in entries {
+            let rule = DestRule::parse(entry).unwrap();
+            match *list {
+                "allow" => network.allow.push(rule),
+                "deny" => network.deny.push(rule),
+                "lan_allow" => network.lan_allow.push(rule),
+                other => panic!("unknown list {other}"),
+            }
+        }
+        network
+    }
+
+    #[test]
+    fn lan_exceptions_precede_lan_blocks_and_denies_precede_interface_return() {
+        let rules = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000)
+            .with_network(policy(&[
+                ("lan_allow", "192.168.1.10:22"),
+                ("deny", "169.254.169.254"),
+            ]))
+            .render();
+
+        let lan_allow_tcp =
+            "iptables -w -A LYH-1000 -d 192.168.1.10/32 -p tcp --dport 22 -j RETURN";
+        let lan_allow_udp =
+            "iptables -w -A LYH-1000 -d 192.168.1.10/32 -p udp --dport 22 -j RETURN";
+        let lan_block = "iptables -w -A LYH-1000 -d 192.168.0.0/16 -j REJECT";
+        let deny = "iptables -w -A LYH-1000 -d 169.254.169.254/32 -j REJECT";
+        let interface_return = "iptables -w -A LYH-1000 -o tun0 -j RETURN";
+        for line in [
+            lan_allow_tcp,
+            lan_allow_udp,
+            lan_block,
+            deny,
+            interface_return,
+        ] {
+            assert!(rules.contains(line), "missing: {line}\n{rules}");
+        }
+        // First-match-wins ordering inside the chain.
+        assert!(rules.find(lan_allow_tcp).unwrap() < rules.find(lan_block).unwrap());
+        assert!(rules.find(lan_block).unwrap() < rules.find(deny).unwrap());
+        assert!(rules.find(deny).unwrap() < rules.find(interface_return).unwrap());
+        // The LAN-block REJECT for 169.254.0.0/16 also precedes the deny; the
+        // specific deny entry still renders for non-LAN metadata addresses.
+    }
+
+    #[test]
+    fn default_deny_mode_scopes_returns_to_allow_list() {
+        let mut network = policy(&[("allow", "140.82.112.0/20:443"), ("allow", "1.1.1.1")]);
+        network.default_action = NetAction::Deny;
+        let rules = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000)
+            .with_network(network)
+            .render();
+
+        // No blanket interface RETURN in deny mode.
+        assert!(!rules.contains("iptables -w -A LYH-1000 -o tun0 -j RETURN\n"));
+        assert!(rules.contains(
+            "iptables -w -A LYH-1000 -o tun0 -d 140.82.112.0/20 -p tcp --dport 443 -j RETURN"
+        ));
+        assert!(rules.contains(
+            "iptables -w -A LYH-1000 -o tun0 -d 140.82.112.0/20 -p udp --dport 443 -j RETURN"
+        ));
+        assert!(rules.contains("iptables -w -A LYH-1000 -o tun0 -d 1.1.1.1/32 -j RETURN"));
+        // Terminal REJECT still closes the chain.
+        assert!(rules.contains("iptables -w -A LYH-1000 -j REJECT"));
+    }
+
+    #[test]
+    fn rules_route_to_matching_family_program() {
+        let rules = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000)
+            .with_network(policy(&[
+                ("deny", "10.99.0.0/16:8000-8100"),
+                ("deny", "[2001:db8::]/32:443"),
+            ]))
+            .render();
+
+        assert!(rules.contains(
+            "iptables -w -A LYH-1000 -d 10.99.0.0/16 -p tcp --dport 8000:8100 -j REJECT"
+        ));
+        assert!(
+            rules
+                .contains("ip6tables -w -A LYH-1000 -d 2001:db8::/32 -p tcp --dport 443 -j REJECT")
+        );
+        // v4 rules never reach ip6tables and vice versa.
+        assert!(!rules.contains("ip6tables -w -A LYH-1000 -d 10.99.0.0/16"));
+        assert!(!rules.contains("iptables -w -A LYH-1000 -d 2001:db8::/32"));
+    }
+
+    #[test]
+    fn default_network_policy_renders_identically_to_legacy() {
+        let plain = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000).render();
+        let with_default = LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000)
+            .with_network(NetworkPolicy::default())
+            .render();
+        assert_eq!(plain, with_default);
+        assert!(!plain.contains("--dport"));
     }
 }

@@ -1,4 +1,5 @@
 use crate::helper::PFHelperClient;
+use crate::policy::{DestRule, IpNetwork, LAN4_BLOCKED, LAN6_BLOCKED, NetAction, NetworkPolicy};
 use crate::{Result, err};
 use std::fs;
 use std::io;
@@ -13,6 +14,7 @@ pub struct PFRuleSet {
     pub anchor_key: u32,
     pub socket_owner: SocketOwner,
     pub route_ipv4_gateway: Option<String>,
+    pub network: NetworkPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +54,7 @@ impl PFRuleSet {
             anchor_key: uid,
             socket_owner: SocketOwner::User(uid),
             route_ipv4_gateway,
+            network: NetworkPolicy::default(),
         }
     }
 
@@ -66,7 +69,13 @@ impl PFRuleSet {
             anchor_key: anchor_uid,
             socket_owner: SocketOwner::UserAndGroup(anchor_uid, gid),
             route_ipv4_gateway,
+            network: NetworkPolicy::default(),
         }
+    }
+
+    pub fn with_network(mut self, network: NetworkPolicy) -> Self {
+        self.network = network;
+        self
     }
 
     pub fn anchor_name(&self) -> String {
@@ -75,41 +84,142 @@ impl PFRuleSet {
 
     pub fn render(&self) -> String {
         let owner = self.socket_owner.clause();
-        let route_rule = self.route_ipv4_gateway.as_ref().map_or_else(
-            || {
-                "# No IPv4 route-to rule: selected utun has no point-to-point IPv4 peer."
-                    .to_string()
-            },
-            |gateway| {
-                format!(
-                    "pass out quick on ! {} route-to ({} {}) inet proto {{ tcp udp }} from any to any {} keep state",
-                    self.interface_name, self.interface_name, gateway, owner
-                )
-            },
-        );
+        let lan4 = LAN4_BLOCKED
+            .iter()
+            .map(IpNetwork::cidr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lan6 = LAN6_BLOCKED
+            .iter()
+            .map(IpNetwork::cidr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lan_allow_section = self.lan_allow_section(&owner);
+        let deny_section = self.deny_section(&owner);
+        let tail_section = self.tail_section(&owner);
 
+        // Every rule uses `quick`, so pf is first-match-wins here: LAN
+        // exceptions must precede the LAN blocks, and user denies must precede
+        // every pass that could match the same destination.
         format!(
             r#"# LianYaoHu agent network guard.
 # Scope: TCP/UDP sockets owned by {owner_description}.
 # Raw/route/system sockets are denied by the process sandbox profile.
 
-lianyaohu_lan4 = "{{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }}"
-lianyaohu_lan6 = "{{ ::/128, fe80::/10, fc00::/7, ff00::/8 }}"
+lianyaohu_lan4 = "{{ {lan4} }}"
+lianyaohu_lan6 = "{{ {lan6} }}"
 
 pass out quick on lo0 proto {{ tcp udp }} from any to any {owner} keep state
 
-block return out quick proto {{ tcp udp }} from any to $lianyaohu_lan4 {owner}
+{lan_allow_section}block return out quick proto {{ tcp udp }} from any to $lianyaohu_lan4 {owner}
 block return out quick inet6 proto {{ tcp udp }} from any to $lianyaohu_lan6 {owner}
 
-{route_rule}
-block return out quick on ! {interface_name} proto {{ tcp udp }} from any to any {owner}
-pass out quick on {interface_name} proto {{ tcp udp }} from any to any {owner} keep state
-"#,
+{deny_section}{tail_section}"#,
             owner_description = self.socket_owner.description(),
             owner = owner,
-            interface_name = self.interface_name
         )
     }
+
+    /// LAN exceptions rendered ahead of the LAN blocks. Empty for the default
+    /// policy so the rendered rules stay byte-identical to the historical
+    /// output.
+    fn lan_allow_section(&self, owner: &str) -> String {
+        if self.network.lan_allow.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "# LAN exceptions from the user policy; they must precede the LAN blocks.\n",
+        );
+        for rule in &self.network.lan_allow {
+            out.push_str(&format!(
+                "pass out quick {} {owner} keep state\n",
+                destination_clause(rule)
+            ));
+        }
+        out.push('\n');
+        out
+    }
+
+    /// User deny rules, after the LAN blocks and before any pass rule that
+    /// could match the same destination.
+    fn deny_section(&self, owner: &str) -> String {
+        if self.network.deny.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("# Denied destinations from the user policy.\n");
+        for rule in &self.network.deny {
+            out.push_str(&format!(
+                "block return out quick {} {owner}\n",
+                destination_clause(rule)
+            ));
+        }
+        out.push('\n');
+        out
+    }
+
+    /// The final interface-restriction rules. In default-allow mode this is
+    /// the historical route-to / block / pass tail; in default-deny mode only
+    /// allow-listed destinations may leave, and only on the selected
+    /// interface.
+    fn tail_section(&self, owner: &str) -> String {
+        match self.network.default_action {
+            NetAction::Allow => {
+                let route_rule = self.route_ipv4_gateway.as_ref().map_or_else(
+                    || {
+                        "# No IPv4 route-to rule: selected utun has no point-to-point IPv4 peer."
+                            .to_string()
+                    },
+                    |gateway| {
+                        format!(
+                            "pass out quick on ! {} route-to ({} {}) inet proto {{ tcp udp }} from any to any {} keep state",
+                            self.interface_name, self.interface_name, gateway, owner
+                        )
+                    },
+                );
+                format!(
+                    "{route_rule}\nblock return out quick on ! {iface} proto {{ tcp udp }} from any to any {owner}\npass out quick on {iface} proto {{ tcp udp }} from any to any {owner} keep state\n",
+                    iface = self.interface_name
+                )
+            }
+            NetAction::Deny => {
+                let mut out = String::from(
+                    "# Default-deny mode: only allow-listed destinations may leave, and only\n# on the selected interface.\n",
+                );
+                for rule in &self.network.allow {
+                    out.push_str(&format!(
+                        "pass out quick on {} {} {owner} keep state\n",
+                        self.interface_name,
+                        destination_clause(rule)
+                    ));
+                    if rule.net.is_ipv4()
+                        && let Some(gateway) = &self.route_ipv4_gateway
+                    {
+                        out.push_str(&format!(
+                            "pass out quick on ! {iface} route-to ({iface} {gateway}) {clause} {owner} keep state\n",
+                            iface = self.interface_name,
+                            clause = destination_clause(rule)
+                        ));
+                    }
+                }
+                out.push_str(&format!(
+                    "block return out quick proto {{ tcp udp }} from any to any {owner}\n"
+                ));
+                out
+            }
+        }
+    }
+}
+
+/// Renders a typed destination as a pf match clause. Only `Display` of typed
+/// addresses/prefixes/ports reaches the rule text — the pf config file is
+/// parsed by pfctl, so raw user strings must never be interpolated here.
+fn destination_clause(rule: &DestRule) -> String {
+    let family = if rule.net.is_ipv4() { "inet" } else { "inet6" };
+    let mut clause = format!("{family} proto {{ tcp udp }} from any to {}", rule.net);
+    if let Some(spec) = rule.port_spec() {
+        clause.push_str(&format!(" port {spec}"));
+    }
+    clause
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,5 +418,87 @@ mod tests {
             Some("12345")
         );
         assert_eq!(parse_enable_token("pf enabled\n"), None);
+    }
+
+    fn policy(entries: &[(&str, &str)]) -> NetworkPolicy {
+        let mut network = NetworkPolicy::default();
+        for (list, entry) in entries {
+            let rule = DestRule::parse(entry).unwrap();
+            match *list {
+                "allow" => network.allow.push(rule),
+                "deny" => network.deny.push(rule),
+                "lan_allow" => network.lan_allow.push(rule),
+                other => panic!("unknown list {other}"),
+            }
+        }
+        network
+    }
+
+    #[test]
+    fn default_network_policy_renders_identically_to_legacy() {
+        let plain = PFRuleSet::new_group("utun4", 501, 2_000_000, Some("10.9.0.1".into())).render();
+        let with_default = PFRuleSet::new_group("utun4", 501, 2_000_000, Some("10.9.0.1".into()))
+            .with_network(NetworkPolicy::default())
+            .render();
+        assert_eq!(plain, with_default);
+        assert!(!plain.contains("user policy"));
+        assert!(!plain.contains("Default-deny"));
+    }
+
+    #[test]
+    fn lan_exceptions_precede_lan_blocks_and_denies_precede_passes() {
+        let rules = PFRuleSet::new_group("utun4", 501, 2_000_000, None)
+            .with_network(policy(&[
+                ("lan_allow", "192.168.1.10:22"),
+                ("deny", "1.2.3.0/24:8000-8100"),
+                ("deny", "[2001:db8::]/32"),
+            ]))
+            .render();
+
+        let lan_allow = "pass out quick inet proto { tcp udp } from any to 192.168.1.10 port 22 user 501 group 2000000 keep state";
+        let lan_block = "block return out quick proto { tcp udp } from any to $lianyaohu_lan4 user 501 group 2000000";
+        let deny4 = "block return out quick inet proto { tcp udp } from any to 1.2.3.0/24 port 8000:8100 user 501 group 2000000";
+        let deny6 = "block return out quick inet6 proto { tcp udp } from any to 2001:db8::/32 user 501 group 2000000";
+        let pass = "pass out quick on utun4 proto { tcp udp } from any to any user 501 group 2000000 keep state";
+        for line in [lan_allow, lan_block, deny4, deny6, pass] {
+            assert!(rules.contains(line), "missing: {line}\n{rules}");
+        }
+        // pf rules here all use `quick`, so first match wins: exceptions
+        // before blocks, denies before passes.
+        assert!(rules.find(lan_allow).unwrap() < rules.find(lan_block).unwrap());
+        assert!(rules.find(lan_block).unwrap() < rules.find(deny4).unwrap());
+        assert!(rules.find(deny6).unwrap() < rules.find(pass).unwrap());
+    }
+
+    #[test]
+    fn default_deny_mode_replaces_blanket_pass() {
+        let mut network = policy(&[
+            ("allow", "140.82.112.0/20:443"),
+            ("allow", "[2606:50c0::]/32"),
+        ]);
+        network.default_action = NetAction::Deny;
+        let rules = PFRuleSet::new_group("utun4", 501, 2_000_000, Some("10.9.0.1".into()))
+            .with_network(network)
+            .render();
+
+        assert!(!rules.contains(
+            "pass out quick on utun4 proto { tcp udp } from any to any user 501 group 2000000 keep state"
+        ));
+        assert!(rules.contains(
+            "pass out quick on utun4 inet proto { tcp udp } from any to 140.82.112.0/20 port 443 user 501 group 2000000 keep state"
+        ));
+        // v4 allow entries also get a route-to pass when the utun has a
+        // point-to-point gateway; v6 entries do not (the gateway is IPv4).
+        assert!(rules.contains(
+            "pass out quick on ! utun4 route-to (utun4 10.9.0.1) inet proto { tcp udp } from any to 140.82.112.0/20 port 443 user 501 group 2000000 keep state"
+        ));
+        assert!(rules.contains(
+            "pass out quick on utun4 inet6 proto { tcp udp } from any to 2606:50c0::/32 user 501 group 2000000 keep state"
+        ));
+        assert!(!rules.contains("route-to (utun4 10.9.0.1) inet6"));
+        // Terminal block closes the anchor.
+        assert!(rules.trim_end().ends_with(
+            "block return out quick proto { tcp udp } from any to any user 501 group 2000000"
+        ));
     }
 }

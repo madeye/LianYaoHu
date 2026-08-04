@@ -360,6 +360,18 @@ impl DestRule {
     pub fn parse(entry: &str) -> Result<Self> {
         entry.parse()
     }
+
+    /// Port clause spec shared by pf and iptables: `443` or `8000:8100`.
+    /// `None` when the rule matches all ports.
+    pub fn port_spec(&self) -> Option<String> {
+        self.ports.map(|ports| {
+            if ports.start == ports.end {
+                ports.start.to_string()
+            } else {
+                format!("{}:{}", ports.start, ports.end)
+            }
+        })
+    }
 }
 
 impl fmt::Display for DestRule {
