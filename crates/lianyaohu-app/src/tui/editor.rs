@@ -23,7 +23,7 @@ use lianyaohu_core::{Result, err};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
@@ -1174,10 +1174,13 @@ fn draw_string_list(
             .map(|entry| ListItem::new(entry.clone()))
             .collect()
     };
+    // The focused pane gets a colored border so Tab focus is visible at a
+    // glance, not just a bold weight some terminals barely render.
     let block = if focused {
         Block::bordered()
             .title(title.to_string())
-            .border_style(Style::new().add_modifier(Modifier::BOLD))
+            .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     } else {
         Block::bordered().title(title.to_string())
     };
@@ -1928,6 +1931,36 @@ mod tests {
         );
         assert_eq!(longest_common_prefix(["abc"].into_iter()), "abc");
         assert_eq!(longest_common_prefix(["a", "b"].into_iter()), "");
+    }
+
+    #[test]
+    fn focused_pane_border_uses_highlight_color() {
+        let mut editor = test_editor();
+        editor.screen = Screen::Network;
+        editor.net_pane = 1; // Deny pane focused
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let cyan_cells: Vec<(u16, u16)> = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].style().fg == Some(Color::Cyan))
+            .collect();
+        assert!(
+            !cyan_cells.is_empty(),
+            "focused pane border must be highlighted in color"
+        );
+        // Exactly one of the three panes is highlighted: the cyan cells all
+        // fall inside the middle third of the width (the Deny pane).
+        let width = buffer.area.width;
+        assert!(
+            cyan_cells
+                .iter()
+                .all(|&(x, _)| x >= width / 3 - 1 && x < width / 3 * 2 + 1),
+            "only the focused pane may carry the highlight: {cyan_cells:?}"
+        );
     }
 
     #[test]
