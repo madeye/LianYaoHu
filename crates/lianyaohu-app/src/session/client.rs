@@ -172,13 +172,6 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
                     }
                 }
             }
-            // A sequence still incomplete at the end of the burst is a bare
-            // Esc (or unrelated bytes), not a key event mid-delivery.
-            if command.is_none()
-                && let KeyAction::Forward(mut bytes) = parser.flush()
-            {
-                forward.append(&mut bytes);
-            }
             if !forward.is_empty() && stream.write_all(&Frame::Input(forward).encode()).is_err() {
                 break AttachOutcome::SessionClosed;
             }
