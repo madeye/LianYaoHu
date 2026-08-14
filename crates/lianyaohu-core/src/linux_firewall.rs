@@ -71,6 +71,12 @@ impl LinuxFirewallRuleSet {
         format!("LYH-{}", self.anchor_key)
     }
 
+    /// Proxy-only mode: no VPN interface at all; only loopback egress (the
+    /// local proxy) may pass.
+    pub fn is_proxy_only(&self) -> bool {
+        self.interface_name == crate::interfaces::PROXY_ONLY_INTERFACE
+    }
+
     pub fn render(&self) -> String {
         let mut lines = vec![
             "# LianYaoHu Linux network guard.".to_string(),
@@ -120,9 +126,13 @@ impl LinuxFirewallRuleSet {
         ];
         // Rule order inside the chain is first-match-wins: LAN exceptions
         // must precede the LAN REJECTs, and user denies must precede any
-        // RETURN that could match the same destination.
-        for rule in family_rules(&self.network.lan_allow) {
-            commands.extend(self.destination_commands(&chain, &rule, None, "RETURN"));
+        // RETURN that could match the same destination. Proxy-only mode is
+        // strict: nothing but loopback leaves, so LAN exceptions configured
+        // for VPN launches do not apply.
+        if !self.is_proxy_only() {
+            for rule in family_rules(&self.network.lan_allow) {
+                commands.extend(self.destination_commands(&chain, &rule, None, "RETURN"));
+            }
         }
         for lan in lan_blocked {
             commands.push(args(&[
@@ -139,6 +149,10 @@ impl LinuxFirewallRuleSet {
             commands.extend(self.destination_commands(&chain, &rule, None, "REJECT"));
         }
         match self.network.default_action {
+            // Proxy-only: no interface RETURN and no allow-list RETURNs —
+            // everything falls through to the terminal REJECT, leaving only
+            // the loopback RETURN at the top of the chain.
+            _ if self.is_proxy_only() => {}
             NetAction::Allow => {
                 commands.push(args(&[
                     "-w",

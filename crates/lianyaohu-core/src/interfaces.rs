@@ -3,6 +3,11 @@ use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr;
 
+/// Sentinel "interface" for proxy-only mode: no VPN at all. The firewall
+/// blocks every direct egress except loopback, and the agent reaches the
+/// network only through a local proxy.
+pub const PROXY_ONLY_INTERFACE: &str = "none";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkInterface {
     pub name: String,
@@ -59,6 +64,21 @@ impl NetworkInterface {
         } else {
             addresses.join(", ")
         }
+    }
+
+    /// The synthetic proxy-only selection: not a real interface.
+    pub fn proxy_only() -> Self {
+        Self {
+            name: PROXY_ONLY_INTERFACE.to_string(),
+            flags: 0,
+            ipv4_addresses: Vec::new(),
+            ipv4_peer_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+        }
+    }
+
+    pub fn is_proxy_only(&self) -> bool {
+        self.name == PROXY_ONLY_INTERFACE
     }
 }
 

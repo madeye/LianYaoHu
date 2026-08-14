@@ -4,9 +4,9 @@
 
 use std::time::{Duration, Instant};
 
+use lianyaohu_core::Result;
 use lianyaohu_core::interfaces::{NetworkInterface, vpn_interfaces};
 use lianyaohu_core::route;
-use lianyaohu_core::{Result, err};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -41,7 +41,10 @@ enum Step {
 }
 
 impl Model {
-    fn new(interfaces: Vec<NetworkInterface>, default_route: Option<String>) -> Self {
+    /// The picker always appends the synthetic "none" (proxy-only) entry, so
+    /// selection works even with no VPN interface up at all.
+    fn new(mut interfaces: Vec<NetworkInterface>, default_route: Option<String>) -> Self {
+        interfaces.push(NetworkInterface::proxy_only());
         Self {
             interfaces,
             selected: 0,
@@ -98,12 +101,11 @@ impl Model {
         }
     }
 
-    /// Replaces the interface list with a fresh enumeration, keeping the
-    /// selection pinned to the same interface name when it still exists.
-    fn refresh(&mut self, interfaces: Vec<NetworkInterface>, default_route: Option<String>) {
-        if interfaces.is_empty() {
-            return;
-        }
+    /// Replaces the interface list with a fresh enumeration (plus the
+    /// synthetic "none" entry), keeping the selection pinned to the same
+    /// interface name when it still exists.
+    fn refresh(&mut self, mut interfaces: Vec<NetworkInterface>, default_route: Option<String>) {
+        interfaces.push(NetworkInterface::proxy_only());
         let current = self.selected_interface().name.clone();
         self.selected = interfaces
             .iter()
@@ -160,10 +162,14 @@ fn draw(frame: &mut Frame, model: &Model) {
         .iter()
         .enumerate()
         .map(|(offset, interface)| {
-            let up = interface.is_up() && interface.is_running();
+            let state = if interface.is_proxy_only() {
+                Span::styled("[proxy-only]", theme::dim_style())
+            } else {
+                theme::state_span(interface.is_up() && interface.is_running())
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{}. {} ", offset + 1, interface.name)),
-                theme::state_span(up),
+                state,
             ]))
         })
         .collect();
@@ -187,12 +193,10 @@ fn draw(frame: &mut Frame, model: &Model) {
     frame.render_widget(Paragraph::new(model.keybar()), keybar_area);
 }
 
-/// Runs the inline picker over the given interfaces. The caller has already
-/// checked that stdin/stdout are a TTY and the list is non-empty.
+/// Runs the inline picker over the given interfaces (the synthetic "none"
+/// proxy-only entry is always offered, so an empty list is fine). The caller
+/// has already checked that stdin/stdout are a TTY.
 pub fn quick_pick(interfaces: &[NetworkInterface]) -> Result<QuickPickOutcome> {
-    if interfaces.is_empty() {
-        return Err(err("no VPN interfaces to select"));
-    }
     let default_route = route::default_ipv4_interface().unwrap_or(None);
     let mut model = Model::new(interfaces.to_vec(), default_route);
 
@@ -268,20 +272,36 @@ mod tests {
 
     #[test]
     fn navigation_wraps_and_selects() {
+        // Two real interfaces plus the always-present "none" entry.
         let mut model = sample_model();
+        assert_eq!(model.interfaces.len(), 3);
         assert!(matches!(model.update(press(KeyCode::Down)), Step::Redraw));
         assert_eq!(model.selected, 1);
+        assert!(matches!(model.update(press(KeyCode::Down)), Step::Redraw));
+        assert_eq!(model.selected, 2);
+        assert_eq!(model.selected_interface().name, "none");
         assert!(matches!(model.update(press(KeyCode::Down)), Step::Redraw));
         assert_eq!(model.selected, 0);
         assert!(matches!(model.update(press(KeyCode::Up)), Step::Redraw));
-        assert_eq!(model.selected, 1);
+        assert_eq!(model.selected, 2);
 
+        model.selected = 1;
         match model.update(press(KeyCode::Enter)) {
             Step::Done(QuickPickOutcome::Chosen { name, save }) => {
                 assert_eq!(name, "utun5");
                 assert!(!save);
             }
             _ => panic!("expected selection"),
+        }
+    }
+
+    #[test]
+    fn none_entry_selects_proxy_only_mode() {
+        let mut model = Model::new(Vec::new(), None);
+        assert_eq!(model.interfaces.len(), 1);
+        match model.update(press(KeyCode::Enter)) {
+            Step::Done(QuickPickOutcome::Chosen { name, .. }) => assert_eq!(name, "none"),
+            _ => panic!("expected proxy-only selection"),
         }
     }
 
@@ -342,12 +362,12 @@ mod tests {
         assert_eq!(model.selected, 2);
         assert_eq!(model.selected_interface().name, "utun5");
 
-        // A vanished selection falls back to the top; an empty refresh is
-        // ignored entirely.
+        // A vanished selection falls back to the top; an empty refresh still
+        // offers the proxy-only entry.
         model.refresh(vec![interface("utun9", 0, &[], &[])], None);
         assert_eq!(model.selected, 0);
         model.refresh(Vec::new(), None);
-        assert_eq!(model.selected_interface().name, "utun9");
+        assert_eq!(model.selected_interface().name, "none");
     }
 
     #[test]
@@ -369,6 +389,7 @@ mod tests {
         assert!(rendered.contains("Select VPN interface"));
         assert!(rendered.contains("1. utun3 [down]"));
         assert!(rendered.contains("2. utun5 [up]"));
+        assert!(rendered.contains("3. none [proxy-only]"));
         assert!(rendered.contains("state:         DOWN"), "{rendered}");
         assert!(rendered.contains("save as default: off"));
 

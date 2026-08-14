@@ -72,6 +72,16 @@ By default it:
 - blocks LAN destinations and non-selected-interface egress for only the
   guarded agent tree.
 
+### Proxy-only mode (no VPN)
+
+The interface picker also offers `none` (equivalently `--vpn none` or
+`vpn_interface = "none"` in the config): no VPN at all. The firewall then
+blocks every direct destination — loopback is the only way out — and the
+launcher ensures the agent's environment carries a local proxy
+(`HTTPS_PROXY`/`ALL_PROXY` and friends), prompting for one
+(e.g. `http://127.0.0.1:7890`) when the config does not provide it. All
+outbound traffic flows through that local proxy or not at all.
+
 ## Background Sessions
 
 `lyh run` launches the agent in a background session on its own PTY, so

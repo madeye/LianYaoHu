@@ -954,6 +954,11 @@ fn supplementary_groups_for_uid(uid: u32, primary_gid: u32) -> Result<Vec<u32>> 
 fn validated_vpn_interface(
     interface_name: &str,
 ) -> Result<lianyaohu_core::interfaces::NetworkInterface> {
+    // Proxy-only mode has no interface; the rendered rules are strictly
+    // tighter (block everything but loopback), so no lookup is needed.
+    if interface_name == lianyaohu_core::interfaces::PROXY_ONLY_INTERFACE {
+        return Ok(lianyaohu_core::interfaces::NetworkInterface::proxy_only());
+    }
     let suffix = interface_name
         .strip_prefix("utun")
         .ok_or_else(|| err(format!("refusing non-utun interface: {interface_name}")))?;
@@ -974,6 +979,9 @@ fn validated_vpn_interface(
 fn validated_vpn_interface(
     interface_name: &str,
 ) -> Result<lianyaohu_core::interfaces::NetworkInterface> {
+    if interface_name == lianyaohu_core::interfaces::PROXY_ONLY_INTERFACE {
+        return Ok(lianyaohu_core::interfaces::NetworkInterface::proxy_only());
+    }
     let selected = vpn_interfaces()?
         .into_iter()
         .find(|interface| interface.name == interface_name)
@@ -1336,6 +1344,15 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn proxy_only_interface_is_accepted_without_lookup() {
+        let selected = validated_vpn_interface("none").unwrap();
+        assert!(selected.is_proxy_only());
+        // Everything else keeps the strict platform validation.
+        assert!(validated_vpn_interface("en0").is_err());
+        assert!(validated_vpn_interface("nonexistent").is_err());
     }
 
     #[test]

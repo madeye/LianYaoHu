@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lianyaohu_core::config::{self, ConfigFile, PROJECT_FILE_NAME, expand_tilde, trust};
+use lianyaohu_core::env_policy::{NO_PROXY_KEYS, NO_PROXY_VALUE, PROXY_ENV_KEYS};
 use lianyaohu_core::interfaces::{NetworkInterface, vpn_interfaces};
 use lianyaohu_core::policy::{DestRule, LAN4_BLOCKED, LAN6_BLOCKED, lexically_normalized_absolute};
 use lianyaohu_core::{Result, err};
@@ -77,20 +78,6 @@ enum InputTarget {
     DenyPath { edit: Option<usize> },
     Proxy,
 }
-
-/// Environment variables the proxy setting fans out to. Both cases are set:
-/// curl only honors lowercase `http_proxy`, while many tools read uppercase.
-const PROXY_ENV_KEYS: &[&str] = &[
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "ALL_PROXY",
-    "https_proxy",
-    "http_proxy",
-    "all_proxy",
-];
-const NO_PROXY_KEYS: &[&str] = &["NO_PROXY", "no_proxy"];
-const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
-const PROXY_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"];
 
 #[derive(Clone, Debug)]
 struct InputState {
@@ -371,19 +358,7 @@ impl Editor {
                 if trimmed.is_empty() {
                     return Ok(String::new());
                 }
-                let (scheme, rest) = trimmed
-                    .split_once("://")
-                    .ok_or_else(|| err("expected scheme://host:port (empty clears)"))?;
-                if !PROXY_SCHEMES.contains(&scheme) {
-                    return Err(err(format!(
-                        "scheme must be one of: {}",
-                        PROXY_SCHEMES.join(", ")
-                    )));
-                }
-                if rest.is_empty() || rest.chars().any(char::is_whitespace) {
-                    return Err(err("expected scheme://host:port"));
-                }
-                Ok(trimmed.to_string())
+                lianyaohu_core::env_policy::validate_proxy_url(trimmed)
             }
             InputTarget::Network { pane, .. } => {
                 let rule = DestRule::parse(trimmed)?;
@@ -1035,22 +1010,22 @@ impl Editor {
     }
 
     fn refresh_interfaces(&mut self) {
-        if let Ok(interfaces) = vpn_interfaces()
-            && !interfaces.is_empty()
-        {
-            let current = self
-                .interfaces
-                .get(self.iface_selected)
-                .map(|interface| interface.name.clone());
-            self.iface_selected = current
-                .and_then(|name| {
-                    interfaces
-                        .iter()
-                        .position(|interface| interface.name == name)
-                })
-                .unwrap_or(0);
-            self.interfaces = interfaces;
-        }
+        // The synthetic "none" (proxy-only) entry is always offered, so the
+        // screen works even with no VPN interface up at all.
+        let mut interfaces = vpn_interfaces().unwrap_or_default();
+        interfaces.push(NetworkInterface::proxy_only());
+        let current = self
+            .interfaces
+            .get(self.iface_selected)
+            .map(|interface| interface.name.clone());
+        self.iface_selected = current
+            .and_then(|name| {
+                interfaces
+                    .iter()
+                    .position(|interface| interface.name == name)
+            })
+            .unwrap_or(0);
+        self.interfaces = interfaces;
         self.default_route = lianyaohu_core::route::default_ipv4_interface().unwrap_or(None);
     }
 }
@@ -1282,11 +1257,12 @@ fn draw_interface(frame: &mut Frame, editor: &Editor, area: Rect) {
         .interfaces
         .iter()
         .map(|interface| {
-            let up = interface.is_up() && interface.is_running();
-            let mut line = Line::from(vec![
-                Span::raw(format!("{} ", interface.name)),
-                theme::state_span(up),
-            ]);
+            let state = if interface.is_proxy_only() {
+                Span::styled("[proxy-only]", theme::dim_style())
+            } else {
+                theme::state_span(interface.is_up() && interface.is_running())
+            };
+            let mut line = Line::from(vec![Span::raw(format!("{} ", interface.name)), state]);
             if saved == Some(interface.name.as_str()) {
                 line.push_span(Span::styled(" (default)", theme::success_style()));
             }

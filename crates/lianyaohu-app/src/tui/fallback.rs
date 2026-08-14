@@ -7,6 +7,12 @@ use lianyaohu_core::interfaces::{NetworkInterface, vpn_interface_description};
 use lianyaohu_core::{Result, err};
 
 pub fn interface_entry(offset: usize, interface: &NetworkInterface) -> String {
+    if interface.is_proxy_only() {
+        return format!(
+            "{}. none — proxy-only (block all direct egress; outbound via a local proxy)",
+            offset + 1
+        );
+    }
     let state = if interface.is_up() && interface.is_running() {
         "up"
     } else {

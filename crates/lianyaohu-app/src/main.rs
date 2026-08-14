@@ -277,7 +277,9 @@ fn prepare(options: &Options) -> Result<Prepare> {
             },
         },
     };
-    validate_vpn_interface(&selected_interface)?;
+    if !selected_interface.is_proxy_only() {
+        validate_vpn_interface(&selected_interface)?;
+    }
     if save_default {
         save_vpn_default(options, &home, &selected_interface.name);
     }
@@ -286,6 +288,20 @@ fn prepare(options: &Options) -> Result<Prepare> {
     // still go through the sanitize block/allow lists.
     let mut extra_environment = effective.env.clone();
     extra_environment.extend(options.extra_environment.clone());
+
+    // Proxy-only mode blocks every direct destination, so a working launch
+    // needs a local proxy in the environment — prompt for one if the config
+    // and CLI did not provide it. The print-and-exit diagnostics never
+    // launch anything, so they skip the requirement.
+    if selected_interface.is_proxy_only() && !options.print_pf && !options.print_profile {
+        ensure_proxy_configured(&mut extra_environment)?;
+        if !policy.network.allow.is_empty() || !policy.network.lan_allow.is_empty() {
+            eprintln!(
+                "warning: proxy-only mode ignores network.allow/lan_allow rules; only loopback \
+                 egress is possible"
+            );
+        }
+    }
 
     let env_input = env::vars().collect::<BTreeMap<_, _>>();
     let clean_env = env_policy::sanitize(
@@ -348,7 +364,9 @@ fn prepare(options: &Options) -> Result<Prepare> {
         return Ok(Prepare::Done(0));
     }
 
-    if require_default_route {
+    // Proxy-only mode has no VPN interface, so the default-route preflight
+    // is meaningless: the firewall blocks direct egress regardless of routes.
+    if require_default_route && !selected_interface.is_proxy_only() {
         let default_route = route::default_ipv4_interface()?;
         if default_route.as_deref() != Some(selected_interface.name.as_str()) {
             let default_route_name = default_route.as_deref().unwrap_or("<unknown>");
@@ -1228,6 +1246,10 @@ fn active_interfaces() -> Result<Vec<NetworkInterface>> {
 }
 
 fn select_by_name(name: &str) -> Result<NetworkInterface> {
+    // `--vpn none` / `vpn_interface = "none"`: proxy-only mode, no lookup.
+    if name == lianyaohu_core::interfaces::PROXY_ONLY_INTERFACE {
+        return Ok(NetworkInterface::proxy_only());
+    }
     active_interfaces()?
         .into_iter()
         .find(|interface| interface.name == name)
@@ -1236,12 +1258,16 @@ fn select_by_name(name: &str) -> Result<NetworkInterface> {
 
 /// Interactive selection: the ratatui quick-pick on a TTY (unless `--no-tui`),
 /// the classic numbered prompt otherwise. Returns the interface and whether
-/// the user asked to persist it as the config default.
+/// the user asked to persist it as the config default. Both pickers offer
+/// "none" (proxy-only), so an empty VPN list is still selectable.
 fn select_interactively(no_tui: bool) -> Result<(NetworkInterface, bool)> {
-    let interfaces = active_interfaces()?;
+    let interfaces = vpn_interfaces()?;
     if tui::stdin_is_tty() && !no_tui {
         match tui::quick_pick(&interfaces)? {
             tui::QuickPickOutcome::Chosen { name, save } => {
+                if name == lianyaohu_core::interfaces::PROXY_ONLY_INTERFACE {
+                    return Ok((NetworkInterface::proxy_only(), save));
+                }
                 // The picker refreshes its list live, so the chosen name may
                 // postdate our snapshot; re-resolve before trusting it.
                 let interface = interfaces
@@ -1259,8 +1285,60 @@ fn select_interactively(no_tui: bool) -> Result<(NetworkInterface, bool)> {
             tui::QuickPickOutcome::Cancelled => Err(err("VPN interface selection cancelled")),
         }
     } else {
-        let index = tui::fallback::select_numbered(&interfaces)?;
-        Ok((interfaces[index].clone(), false))
+        let mut listed = interfaces;
+        listed.push(NetworkInterface::proxy_only());
+        let index = tui::fallback::select_numbered(&listed)?;
+        Ok((listed[index].clone(), false))
+    }
+}
+
+/// Guarantees the environment carries a proxy for proxy-only mode: keeps a
+/// configured proxy as-is, otherwise prompts on a TTY and errors without one.
+fn ensure_proxy_configured(environment: &mut BTreeMap<String, String>) -> Result<()> {
+    let configured = env_policy::PROXY_ENV_KEYS
+        .iter()
+        .find_map(|key| environment.get(*key))
+        .cloned();
+    let url = match configured {
+        Some(url) => url,
+        None if stdin_is_tty() => prompt_proxy_url()?,
+        None => {
+            return Err(err(
+                "proxy-only mode needs a local proxy: set the proxy in `lyh config` (Network \
+                 rules → p), add [env] HTTPS_PROXY to the config, or pass --env \
+                 HTTPS_PROXY=http://127.0.0.1:PORT",
+            ));
+        }
+    };
+    if !env_policy::proxy_url_is_loopback(&url) {
+        eprintln!(
+            "warning: proxy {url} is not on loopback; proxy-only mode blocks every non-loopback \
+             destination, so this proxy will be unreachable from the agent"
+        );
+    }
+    env_policy::insert_proxy_env(environment, &url);
+    Ok(())
+}
+
+fn prompt_proxy_url() -> Result<String> {
+    eprintln!(
+        "Proxy-only mode: all direct egress is blocked; outbound traffic needs a local proxy."
+    );
+    loop {
+        eprint!("Local proxy URL (e.g. http://127.0.0.1:7890): ");
+        io::stderr().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Err(err("proxy-only mode requires a proxy URL"));
+        }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(err("proxy-only mode requires a proxy URL"));
+        }
+        match env_policy::validate_proxy_url(trimmed) {
+            Ok(url) => return Ok(url),
+            Err(error) => eprintln!("  invalid proxy URL: {error}"),
+        }
     }
 }
 
@@ -1483,7 +1561,10 @@ configuration:
 
 options:
   --vpn NAME                  Select a VPN interface without prompting
-                              (macOS: utun*, Linux: tun* or wg*).
+                              (macOS: utun*, Linux: tun* or wg*). `--vpn none` selects
+                              proxy-only mode: no VPN, all direct egress blocked (loopback
+                              only), outbound traffic through a local proxy — configured
+                              via [env] HTTPS_PROXY, --env, or an interactive prompt.
   --cwd PATH                  Working directory exposed to the agent. Defaults to current directory.
   --env NAME=VALUE            Add an environment variable unless it is privacy-blocked or a
                               code-injection vector (LD_*, DYLD_*, PYTHON*, NODE_OPTIONS, ...).
@@ -1525,6 +1606,35 @@ mod tests {
 
     fn parse_args(values: &[&str]) -> Result<Options> {
         parse(values.iter().map(|value| value.to_string()).collect())
+    }
+
+    #[test]
+    fn proxy_only_mode_requires_or_reuses_a_proxy() {
+        // Without a TTY (as in tests) and no configured proxy, launch must
+        // fail rather than start an agent with no possible egress.
+        let mut environment = BTreeMap::new();
+        assert!(ensure_proxy_configured(&mut environment).is_err());
+
+        // A configured proxy is kept and fanned out to all variables.
+        let mut environment = BTreeMap::from([(
+            "HTTPS_PROXY".to_string(),
+            "http://127.0.0.1:7890".to_string(),
+        )]);
+        ensure_proxy_configured(&mut environment).unwrap();
+        assert_eq!(
+            environment.get("http_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            environment.get("NO_PROXY").map(String::as_str),
+            Some(env_policy::NO_PROXY_VALUE)
+        );
+    }
+
+    #[test]
+    fn select_by_name_resolves_proxy_only_without_lookup() {
+        let selected = select_by_name("none").unwrap();
+        assert!(selected.is_proxy_only());
     }
 
     #[test]

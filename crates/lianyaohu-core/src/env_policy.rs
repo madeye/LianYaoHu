@@ -172,9 +172,102 @@ fn is_fixed_sandbox_env(key: &str) -> bool {
     FIXED_SANDBOX_ENV.contains(&key)
 }
 
+/// Environment variables a proxy setting fans out to. Both cases are set:
+/// curl only honors lowercase `http_proxy`, while many tools read uppercase.
+pub const PROXY_ENV_KEYS: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+];
+pub const NO_PROXY_KEYS: &[&str] = &["NO_PROXY", "no_proxy"];
+pub const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
+pub const PROXY_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"];
+
+/// Validates `scheme://host[:port]` for the proxy setting; returns the
+/// trimmed URL. Shared by the config TUI and proxy-only launch mode.
+pub fn validate_proxy_url(url: &str) -> crate::Result<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = trimmed
+        .split_once("://")
+        .ok_or_else(|| crate::err("expected scheme://host:port"))?;
+    if !PROXY_SCHEMES.contains(&scheme) {
+        return Err(crate::err(format!(
+            "scheme must be one of: {}",
+            PROXY_SCHEMES.join(", ")
+        )));
+    }
+    if rest.is_empty() || rest.chars().any(char::is_whitespace) {
+        return Err(crate::err("expected scheme://host:port"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Whether the proxy URL points at loopback. In proxy-only mode every
+/// non-loopback destination is firewalled, so anything else is unreachable.
+pub fn proxy_url_is_loopback(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let host = rest
+        .rsplit_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or(rest)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Inserts the standard proxy variables (and loopback NO_PROXY) for `url`
+/// into `env`, without overriding keys the caller already set.
+pub fn insert_proxy_env(env: &mut BTreeMap<String, String>, url: &str) {
+    for key in PROXY_ENV_KEYS {
+        env.entry((*key).to_string())
+            .or_insert_with(|| url.to_string());
+    }
+    for key in NO_PROXY_KEYS {
+        env.entry((*key).to_string())
+            .or_insert_with(|| NO_PROXY_VALUE.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_url_validation_and_loopback_detection() {
+        assert_eq!(
+            validate_proxy_url(" http://127.0.0.1:7890 ").unwrap(),
+            "http://127.0.0.1:7890"
+        );
+        assert!(validate_proxy_url("socks5://localhost:1080").is_ok());
+        assert!(validate_proxy_url("127.0.0.1:7890").is_err());
+        assert!(validate_proxy_url("ftp://x:1").is_err());
+        assert!(validate_proxy_url("http://has space:1").is_err());
+        assert!(validate_proxy_url("http://").is_err());
+
+        assert!(proxy_url_is_loopback("http://127.0.0.1:7890"));
+        assert!(proxy_url_is_loopback("socks5://localhost:1080"));
+        assert!(proxy_url_is_loopback("http://[::1]:8080"));
+        assert!(!proxy_url_is_loopback("http://10.0.0.2:7890"));
+        assert!(!proxy_url_is_loopback("http://proxy.corp:3128"));
+    }
+
+    #[test]
+    fn insert_proxy_env_fans_out_without_overriding() {
+        let mut env =
+            BTreeMap::from([("HTTPS_PROXY".to_string(), "http://127.0.0.1:1".to_string())]);
+        insert_proxy_env(&mut env, "http://127.0.0.1:7890");
+        // Pre-existing keys win; the rest are filled in.
+        assert_eq!(env.get("HTTPS_PROXY").unwrap(), "http://127.0.0.1:1");
+        assert_eq!(env.get("http_proxy").unwrap(), "http://127.0.0.1:7890");
+        assert_eq!(env.get("ALL_PROXY").unwrap(), "http://127.0.0.1:7890");
+        assert_eq!(env.get("NO_PROXY").unwrap(), NO_PROXY_VALUE);
+        assert_eq!(env.len(), PROXY_ENV_KEYS.len() + NO_PROXY_KEYS.len());
+    }
 
     #[test]
     fn drops_host_and_network_identity_environment() {

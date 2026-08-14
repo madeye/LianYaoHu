@@ -82,6 +82,12 @@ impl PFRuleSet {
         format!("com.apple/lianyaohu-{}", self.anchor_key)
     }
 
+    /// Proxy-only mode: no VPN interface at all; only loopback egress (the
+    /// local proxy) may pass.
+    pub fn is_proxy_only(&self) -> bool {
+        self.interface_name == crate::interfaces::PROXY_ONLY_INTERFACE
+    }
+
     pub fn render(&self) -> String {
         let owner = self.socket_owner.clause();
         let lan4 = LAN4_BLOCKED
@@ -124,7 +130,9 @@ block return out quick inet6 proto {{ tcp udp }} from any to $lianyaohu_lan6 {ow
     /// policy so the rendered rules stay byte-identical to the historical
     /// output.
     fn lan_allow_section(&self, owner: &str) -> String {
-        if self.network.lan_allow.is_empty() {
+        // Proxy-only mode is strict: nothing but loopback leaves, so LAN
+        // exceptions configured for VPN launches do not apply.
+        if self.network.lan_allow.is_empty() || self.is_proxy_only() {
             return String::new();
         }
         let mut out = String::from(
@@ -162,6 +170,13 @@ block return out quick inet6 proto {{ tcp udp }} from any to $lianyaohu_lan6 {ow
     /// allow-listed destinations may leave, and only on the selected
     /// interface.
     fn tail_section(&self, owner: &str) -> String {
+        if self.is_proxy_only() {
+            return format!(
+                "# Proxy-only mode: no VPN interface. Only the loopback pass above\n\
+                 # (the local proxy) lets traffic out; everything else is blocked.\n\
+                 block return out quick proto {{ tcp udp }} from any to any {owner}\n"
+            );
+        }
         match self.network.default_action {
             NetAction::Allow => {
                 let route_rule = self.route_ipv4_gateway.as_ref().map_or_else(
@@ -364,6 +379,32 @@ fn run_sudo_pf(args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_only_rules_allow_loopback_and_block_everything_else() {
+        use crate::policy::{DestRule, NetworkPolicy};
+        let rules = PFRuleSet::new_group("none", 501, 2_000_000, None)
+            .with_network(NetworkPolicy {
+                allow: vec![DestRule::parse("1.2.3.4").unwrap()],
+                lan_allow: vec![DestRule::parse("192.168.1.10:22").unwrap()],
+                ..NetworkPolicy::default()
+            })
+            .render();
+
+        assert!(rules.contains(
+            "pass out quick on lo0 proto { tcp udp } from any to any user 501 group 2000000 keep state"
+        ));
+        assert!(rules.contains(
+            "block return out quick proto { tcp udp } from any to any user 501 group 2000000"
+        ));
+        // No interface rules, no route-to, and no pass rules for allow or
+        // LAN-exception destinations: proxy-only is loopback or nothing.
+        assert!(!rules.contains("route-to"));
+        assert!(!rules.contains("on none"));
+        assert!(!rules.contains("1.2.3.4"));
+        assert!(!rules.contains("192.168.1.10"));
+        assert!(rules.contains("# Proxy-only mode"));
+    }
 
     #[test]
     fn generated_rules_block_lan_and_non_selected_interfaces() {
