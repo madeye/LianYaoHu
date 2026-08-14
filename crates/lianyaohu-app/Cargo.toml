@@ -25,3 +25,5 @@ path = "src/main.rs"
 lianyaohu-core = { workspace = true }
 libc.workspace = true
 ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true

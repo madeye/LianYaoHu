@@ -5,6 +5,7 @@
 //! configuration TUI (`lyh config`). See <https://lyh.maxlv.net/> for usage.
 
 mod helper_daemon;
+mod session;
 mod tui;
 
 use lianyaohu_core::config::{self, ConfigFile, MergedConfig, trust};
@@ -31,10 +32,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tri-state flags default to `None` (= "not given on the command line") so
@@ -116,6 +118,22 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Background session management. As with `config`, an agent literally
+    // named like a subcommand can still be launched with `lyh -- <name>`.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("run" | "ls" | "sessions" | "attach" | "kill")
+    ) {
+        let code = match run_session_cli(&args) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("{program}: {error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     // `lyh config ...` / `lyh setup`: configuration management. An agent
     // literally named "config" can still be launched with `lyh -- config`.
     if matches!(args.first().map(String::as_str), Some("config" | "setup")) {
@@ -161,14 +179,53 @@ fn run(args: Vec<String>) -> Result<i32> {
         return Ok(0);
     }
 
+    match prepare(&options)? {
+        Prepare::Done(code) => Ok(code),
+        Prepare::Ready(prepared) => launch_foreground(*prepared),
+    }
+}
+
+/// Everything resolved and ready to launch: the command, the sanitized
+/// environment, the sandbox profile, and the firewall rule set. Built by
+/// [`prepare`], consumed by the foreground launch or a background session.
+struct Prepared {
+    command: Vec<String>,
+    cwd: PathBuf,
+    cwd_string: String,
+    tmpdir: PathBuf,
+    clean_env: BTreeMap<String, String>,
+    policy: SandboxPolicy,
+    interface: NetworkInterface,
+    enforce_pf: bool,
+    helper_group_launch: bool,
+    #[cfg(target_os = "macos")]
+    profile: SandboxProfile,
+    #[cfg(target_os = "linux")]
+    linux_sandbox: LinuxSandbox,
+    #[cfg(target_os = "macos")]
+    rule_set: PFRuleSet,
+    #[cfg(target_os = "linux")]
+    rule_set: LinuxFirewallRuleSet,
+}
+
+enum Prepare {
+    Ready(Box<Prepared>),
+    /// A print-and-exit flag (`--print-profile`, `--print-firewall`) ran.
+    Done(i32),
+}
+
+/// The whole pre-launch pipeline: layered config, policy, interactive VPN
+/// selection, environment sanitizing, sandbox profile, and firewall rules.
+/// Interactive prompts happen here, so callers can still daemonize after.
+fn prepare(options: &Options) -> Result<Prepare> {
     let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
     let cwd = options.cwd.canonicalize().unwrap_or(options.cwd.clone());
     let cwd_string = cwd.to_string_lossy().to_string();
     let tmpdir = temporary_directory();
 
-    let merged = load_layered_config(&options, &home, &cwd)?;
+    let merged = load_layered_config(options, &home, &cwd)?;
     let mut effective = merged.file;
-    apply_cli_policy(&mut effective, &options);
+    apply_cli_policy(&mut effective, options);
 
     // Effective settings: CLI flags > project file > global file > defaults.
     let enforce_pf = options
@@ -222,7 +279,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     };
     validate_vpn_interface(&selected_interface)?;
     if save_default {
-        save_vpn_default(&options, &home, &selected_interface.name);
+        save_vpn_default(options, &home, &selected_interface.name);
     }
 
     // Config-file env merges under CLI --env extras (CLI wins per key); both
@@ -245,7 +302,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     #[cfg(target_os = "macos")]
     if options.print_profile {
         print!("{}", profile.render());
-        return Ok(0);
+        return Ok(Prepare::Done(0));
     }
     #[cfg(target_os = "linux")]
     let linux_sandbox =
@@ -253,7 +310,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     #[cfg(target_os = "linux")]
     if options.print_profile {
         print!("{}", linux_sandbox.render_summary());
-        return Ok(0);
+        return Ok(Prepare::Done(0));
     }
 
     let uid = unsafe { libc::getuid() };
@@ -275,7 +332,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     #[cfg(target_os = "macos")]
     if options.print_pf {
         print!("{}", rule_set.render());
-        return Ok(0);
+        return Ok(Prepare::Done(0));
     }
 
     #[cfg(target_os = "linux")]
@@ -288,7 +345,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     #[cfg(target_os = "linux")]
     if options.print_pf {
         print!("{}", rule_set.render());
-        return Ok(0);
+        return Ok(Prepare::Done(0));
     }
 
     if require_default_route {
@@ -319,23 +376,42 @@ fn run(args: Vec<String>) -> Result<i32> {
         }
     }
 
+    Ok(Prepare::Ready(Box::new(Prepared {
+        command,
+        cwd,
+        cwd_string,
+        tmpdir,
+        clean_env,
+        policy,
+        interface: selected_interface,
+        enforce_pf,
+        helper_group_launch,
+        #[cfg(target_os = "macos")]
+        profile,
+        #[cfg(target_os = "linux")]
+        linux_sandbox,
+        rule_set,
+    })))
+}
+
+fn launch_foreground(prepared: Prepared) -> Result<i32> {
     #[cfg(target_os = "macos")]
     {
-        if enforce_pf && helper_group_launch {
+        if prepared.enforce_pf && prepared.helper_group_launch {
             return launch_agent_with_session_group(
-                &selected_interface.name,
-                &command,
-                &cwd_string,
-                &tmpdir,
-                &profile,
-                &clean_env,
-                &policy,
+                &prepared.interface.name,
+                &prepared.command,
+                &prepared.cwd_string,
+                &prepared.tmpdir,
+                &prepared.profile,
+                &prepared.clean_env,
+                &prepared.policy,
             );
         }
 
         let mut pf_guard = None;
-        if enforce_pf {
-            let mut guard = PFGuard::new(rule_set);
+        if prepared.enforce_pf {
+            let mut guard = PFGuard::new(prepared.rule_set);
             guard.install()?;
             pf_guard = Some(guard);
         } else {
@@ -344,32 +420,38 @@ fn run(args: Vec<String>) -> Result<i32> {
             );
         }
 
-        let status = launch_agent(&command, &cwd, &tmpdir, &profile, &clean_env)?;
+        let status = launch_agent(
+            &prepared.command,
+            &prepared.cwd,
+            &prepared.tmpdir,
+            &prepared.profile,
+            &prepared.clean_env,
+        )?;
 
         if let Some(mut guard) = pf_guard {
             guard.uninstall();
         }
 
-        return Ok(status);
+        Ok(status)
     }
 
     #[cfg(target_os = "linux")]
     {
-        if enforce_pf && helper_group_launch {
+        if prepared.enforce_pf && prepared.helper_group_launch {
             return launch_agent_with_session_group(
-                &selected_interface.name,
-                &command,
-                &cwd_string,
-                &tmpdir,
-                &linux_sandbox,
-                &clean_env,
-                &policy,
+                &prepared.interface.name,
+                &prepared.command,
+                &prepared.cwd_string,
+                &prepared.tmpdir,
+                &prepared.linux_sandbox,
+                &prepared.clean_env,
+                &prepared.policy,
             );
         }
 
         let mut firewall_guard = None;
-        if enforce_pf {
-            let mut guard = LinuxFirewallGuard::new(rule_set);
+        if prepared.enforce_pf {
+            let mut guard = LinuxFirewallGuard::new(prepared.rule_set);
             guard.install()?;
             firewall_guard = Some(guard);
         } else {
@@ -378,17 +460,410 @@ fn run(args: Vec<String>) -> Result<i32> {
             );
         }
 
-        let status = launch_agent(&command, &cwd, &linux_sandbox, &clean_env)?;
+        let status = launch_agent(
+            &prepared.command,
+            &prepared.cwd,
+            &prepared.linux_sandbox,
+            &prepared.clean_env,
+        )?;
 
         if let Some(mut guard) = firewall_guard {
             guard.uninstall();
         }
 
-        return Ok(status);
+        Ok(status)
+    }
+}
+
+/// `lyh run | ls | attach | kill`: background sessions with attach/detach.
+fn run_session_cli(args: &[String]) -> Result<i32> {
+    let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
+    let dir = session::sessions_dir(&home);
+    match args[0].as_str() {
+        "ls" | "sessions" => sessions_ls(&dir),
+        "attach" => sessions_attach(&dir, args.get(1).map(String::as_str)),
+        "kill" => sessions_kill(&dir, args.get(1).map(String::as_str)),
+        "run" => sessions_run(&dir, &args[1..]),
+        other => Err(err(format!("unknown session command {other:?}"))),
+    }
+}
+
+/// `lyh run [--name NAME] [--detached] [launch options] [-- agent ...]`:
+/// prepares the sandbox exactly like a foreground launch, then forks a
+/// per-session daemon that runs the agent on its own PTY.
+fn sessions_run(dir: &Path, args: &[String]) -> Result<i32> {
+    let mut name = None;
+    let mut detached = false;
+    let mut rest = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--name" => {
+                index += 1;
+                name = Some(
+                    args.get(index)
+                        .ok_or_else(|| err("--name requires a session name"))?
+                        .clone(),
+                );
+            }
+            "--detached" | "-d" => detached = true,
+            // "--" or the first non-flag token starts the agent command;
+            // everything after belongs to the agent, not to `run`.
+            other if other == "--" || !other.starts_with('-') => {
+                rest.extend_from_slice(&args[index..]);
+                break;
+            }
+            _ => rest.push(args[index].clone()),
+        }
+        index += 1;
+    }
+    let options = parse(rest)?;
+    match prepare(&options)? {
+        Prepare::Done(code) => Ok(code),
+        Prepare::Ready(prepared) => launch_in_session(*prepared, dir, name, detached),
+    }
+}
+
+fn launch_in_session(
+    prepared: Prepared,
+    dir: &Path,
+    name: Option<String>,
+    detached: bool,
+) -> Result<i32> {
+    create_private_dir(&dir.to_path_buf())?;
+    let name = match name {
+        Some(name) => {
+            session::validate_name(&name)?;
+            if session::socket_path(dir, &name).exists() {
+                return Err(err(format!(
+                    "session {name} already exists; attach with `lyh attach {name}`"
+                )));
+            }
+            name
+        }
+        None => session::unique_name(dir, &session::default_name(&prepared.cwd)),
+    };
+    let socket_path = session::socket_path(dir, &name);
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|error| err(format!("{}: {error}", socket_path.display())))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    let (rows, cols) = if tui::stdin_is_tty() {
+        session::client::initial_winsize()
+    } else {
+        (24, 80)
+    };
+
+    // Helper-path spec (and its policy preflight) is built in the parent so
+    // errors still reach the user's terminal.
+    let spec = if prepared.enforce_pf && prepared.helper_group_launch {
+        #[cfg(target_os = "macos")]
+        let rendered = prepared.profile.render();
+        #[cfg(target_os = "linux")]
+        let rendered = prepared.linux_sandbox.render_summary();
+        let spec = lianyaohu_core::launch::LaunchSpec::new(
+            prepared.command.clone(),
+            prepared.cwd_string.clone(),
+            prepared.clean_env.clone(),
+            rendered,
+        );
+        Some(attach_policy(spec, &prepared.policy)?)
+    } else {
+        None
+    };
+
+    // Written by the parent so a concurrent `lyh ls` between fork and the
+    // daemon's own metadata write never mistakes the session for stale.
+    session::SessionMeta {
+        name: name.clone(),
+        pid: std::process::id(),
+        command: prepared.command.clone(),
+        cwd: prepared.cwd_string.clone(),
+        vpn_interface: prepared.interface.name.clone(),
+        started_at: unix_now(),
+    }
+    .save(dir)?;
+
+    let log = session::log_path(dir, &name);
+    if !session::daemon::daemonize(&log)? {
+        drop(listener);
+        if detached || !tui::stdin_is_tty() {
+            println!("session {name} started; attach with `lyh attach {name}`");
+            return Ok(0);
+        }
+        return attach_loop(dir, name);
     }
 
-    #[allow(unreachable_code)]
-    Err(err("unsupported platform"))
+    // Daemon from here on: stdio goes to the log file, errors included.
+    let code = match run_session_daemon(prepared, dir, &name, listener, spec, (rows, cols)) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("session {name} failed: {error}");
+            session::remove_session_files(dir, &name);
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// Everything the daemon process does: own the PTY, launch the agent onto
+/// its slave (root-helper session or direct sandbox spawn), then serve
+/// attach clients until the agent exits.
+fn run_session_daemon(
+    prepared: Prepared,
+    dir: &Path,
+    name: &str,
+    listener: UnixListener,
+    spec: Option<lianyaohu_core::launch::LaunchSpec>,
+    size: (u16, u16),
+) -> Result<i32> {
+    use std::os::fd::AsRawFd;
+
+    let (master, slave) = session::daemon::open_pty(size.0, size.1)?;
+    session::SessionMeta {
+        name: name.to_string(),
+        pid: std::process::id(),
+        command: prepared.command.clone(),
+        cwd: prepared.cwd_string.clone(),
+        vpn_interface: prepared.interface.name.clone(),
+        started_at: unix_now(),
+    }
+    .save(dir)?;
+    create_private_dir(&prepared.tmpdir)?;
+    let (exit_read, exit_write) = session::daemon::exit_pipe()?;
+
+    let agent = if let Some(spec) = spec {
+        // Root-helper launch: the helper receives the PTY slave as the
+        // agent's stdio triple and reports the exit status when done.
+        let spec_path = prepared.tmpdir.join("launch.json");
+        spec.write_json(&spec_path)?;
+        let interface = prepared.interface.name.clone();
+        session::daemon::spawn_exit_waiter(exit_write, move || {
+            let fd = slave.as_raw_fd();
+            let code = PFHelperClient::default()
+                .run_session_with_fds(&interface, &spec_path, [fd, fd, fd])
+                .unwrap_or_else(|error| {
+                    eprintln!("helper launch failed: {error}");
+                    1
+                });
+            let _ = fs::remove_file(&spec_path);
+            drop(slave);
+            code
+        });
+        session::daemon::AgentHandle {
+            exit_pipe: exit_read,
+            // No pid to signal: the helper owns the agent. Kill works by the
+            // daemon closing the PTY master (hangup).
+            kill: Box::new(|| {}),
+        }
+    } else {
+        // Direct launch, mirroring the foreground non-helper path but with
+        // the PTY slave as the agent's terminal.
+        #[cfg(target_os = "macos")]
+        let mut guard = prepared.enforce_pf.then(|| PFGuard::new(prepared.rule_set));
+        #[cfg(target_os = "linux")]
+        let mut guard = prepared
+            .enforce_pf
+            .then(|| LinuxFirewallGuard::new(prepared.rule_set));
+        if let Some(guard) = &mut guard {
+            guard.install()?;
+        }
+
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let profile_path = prepared.tmpdir.join("agent.sb");
+            fs::write(&profile_path, prepared.profile.render())?;
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command.arg("-f").arg(&profile_path).args(&prepared.command);
+            command
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let executable = prepared
+                .command
+                .first()
+                .ok_or_else(|| err("agent command is empty"))?;
+            let mut command = Command::new(executable);
+            command.args(&prepared.command[1..]);
+            apply_child_sandbox(&mut command, prepared.linux_sandbox.clone());
+            command
+        };
+        command
+            .current_dir(&prepared.cwd)
+            .env_clear()
+            .envs(&prepared.clean_env)
+            .stdin(Stdio::from(fs::File::from(slave.try_clone()?)))
+            .stdout(Stdio::from(fs::File::from(slave.try_clone()?)))
+            .stderr(Stdio::from(fs::File::from(slave.try_clone()?)));
+        // Give the agent the PTY as a proper controlling terminal so job
+        // control and SIGWINCH-driven redraws work as in a real terminal.
+        // The daemon ignores SIGHUP/SIGPIPE and ignored dispositions survive
+        // exec; reset them or the agent becomes unkillable via PTY hangup.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_DFL);
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        drop(slave);
+        let pid = child.id() as libc::pid_t;
+        session::daemon::spawn_exit_waiter(exit_write, move || {
+            use std::os::unix::process::ExitStatusExt;
+            let code = child
+                .wait()
+                .ok()
+                .and_then(|status| {
+                    status
+                        .code()
+                        .or_else(|| status.signal().map(|signal| 128 + signal))
+                })
+                .unwrap_or(1);
+            if let Some(mut guard) = guard {
+                guard.uninstall();
+            }
+            code
+        });
+        session::daemon::AgentHandle {
+            exit_pipe: exit_read,
+            kill: Box::new(move || unsafe {
+                libc::kill(-pid, libc::SIGHUP);
+                libc::kill(pid, libc::SIGHUP);
+                libc::kill(-pid, libc::SIGTERM);
+                libc::kill(pid, libc::SIGTERM);
+            }),
+        }
+    };
+
+    Ok(session::daemon::run_loop(
+        dir, name, listener, master, agent,
+    ))
+}
+
+/// Attach with client-side session switching: `Ctrl-\ n` / `Ctrl-\ p` hop
+/// between live sessions without dropping back to the shell.
+fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
+    loop {
+        let socket = session::socket_path(dir, &name);
+        match session::client::attach(&socket, &name)? {
+            session::client::AttachOutcome::Detached => {
+                println!("[lyh] detached from {name}; reattach with `lyh attach {name}`");
+                return Ok(0);
+            }
+            session::client::AttachOutcome::Exited(code) => {
+                println!("[lyh] session {name} exited with status {code}");
+                session::remove_session_files(dir, &name);
+                return Ok(code);
+            }
+            session::client::AttachOutcome::SessionClosed => {
+                println!("[lyh] session {name} ended");
+                session::remove_session_files(dir, &name);
+                return Ok(0);
+            }
+            outcome @ (session::client::AttachOutcome::SwitchNext
+            | session::client::AttachOutcome::SwitchPrev) => {
+                let sessions = session::list_sessions(dir)?;
+                let names: Vec<String> = sessions
+                    .iter()
+                    .map(|entry| entry.meta.name.clone())
+                    .collect();
+                if names.len() <= 1 {
+                    println!("[lyh] no other session to switch to");
+                    if names.is_empty() {
+                        return Ok(0);
+                    }
+                    continue;
+                }
+                let position = names.iter().position(|other| *other == name).unwrap_or(0);
+                let target = if outcome == session::client::AttachOutcome::SwitchNext {
+                    (position + 1) % names.len()
+                } else {
+                    position.checked_sub(1).unwrap_or(names.len() - 1)
+                };
+                name = names[target].clone();
+            }
+        }
+    }
+}
+
+fn sessions_attach(dir: &Path, name: Option<&str>) -> Result<i32> {
+    if !tui::stdin_is_tty() {
+        return Err(err("attach requires a terminal"));
+    }
+    let sessions = session::list_sessions(dir)?;
+    let name = match name {
+        Some(name) => {
+            if !sessions.iter().any(|entry| entry.meta.name == name) {
+                return Err(err(format!(
+                    "no running session named {name}; `lyh ls` lists sessions"
+                )));
+            }
+            name.to_string()
+        }
+        // No name: the most recently started session is almost always the
+        // one the user means; switching keys reach the rest.
+        None => sessions
+            .iter()
+            .max_by_key(|entry| entry.meta.started_at)
+            .map(|entry| entry.meta.name.clone())
+            .ok_or_else(|| err("no running sessions; start one with `lyh run`"))?,
+    };
+    attach_loop(dir, name)
+}
+
+fn sessions_ls(dir: &Path) -> Result<i32> {
+    let sessions = session::list_sessions(dir)?;
+    if sessions.is_empty() {
+        println!("no running sessions; start one with `lyh run`");
+        return Ok(0);
+    }
+    println!(
+        "{:<20} {:<8} {:<8} {:<8} COMMAND",
+        "NAME", "PID", "VPN", "UPTIME"
+    );
+    let now = unix_now();
+    for entry in sessions {
+        let uptime = format_uptime(now.saturating_sub(entry.meta.started_at));
+        println!(
+            "{:<20} {:<8} {:<8} {:<8} {} ({})",
+            entry.meta.name,
+            entry.meta.pid,
+            entry.meta.vpn_interface,
+            uptime,
+            entry.meta.command.join(" "),
+            entry.meta.cwd,
+        );
+    }
+    Ok(0)
+}
+
+fn format_uptime(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn sessions_kill(dir: &Path, name: Option<&str>) -> Result<i32> {
+    let name = name.ok_or_else(|| err("kill requires a session name; `lyh ls` lists them"))?;
+    let socket = session::socket_path(dir, name);
+    if !socket.exists() {
+        return Err(err(format!("no session named {name}")));
+    }
+    match session::client::kill(&socket, name) {
+        Ok(Some(code)) => println!("session {name} exited with status {code}"),
+        Ok(None) => println!("kill requested; session {name} had not exited yet — check `lyh ls`"),
+        Err(_) => {
+            session::remove_session_files(dir, name);
+            println!("session {name} was already gone; cleaned up its files");
+        }
+    }
+    Ok(0)
 }
 
 /// Appends CLI policy flags onto the merged config so one code path builds
@@ -978,10 +1453,21 @@ fn usage(program: &str) -> String {
     format!(
         r#"usage:
   {program} [options] [-- agent [args...]]
+  {program} run [--name NAME] [--detached] [options] [-- agent [args...]]
+  {program} attach [NAME]
+  {program} ls | sessions
+  {program} kill NAME
   {program} config [show|path|trust [DIR]|revoke [DIR]]
   {program} helper
 
 subcommands:
+  run                         Launch the agent in a background session on its own PTY, then
+                              attach. Detach with Ctrl-\ d; switch sessions with Ctrl-\ n/p;
+                              Ctrl-\ Ctrl-\ sends a literal Ctrl-\. Each session gets its own
+                              sandbox, so several agents can run side by side.
+  attach [NAME]               Reattach to a session (default: the most recently started).
+  ls                          List running sessions. Alias: sessions.
+  kill NAME                   Terminate a session's agent (hangs up its PTY).
   config show                 Print the effective merged configuration with per-key provenance.
   config path                 Print the config file paths (global, and project if found).
   config trust [DIR]          Approve the project .lianyaohu.toml (hash-pinned, direnv-style).

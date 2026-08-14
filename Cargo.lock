@@ -267,6 +267,8 @@ dependencies = [
  "lianyaohu-core",
  "libc",
  "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
