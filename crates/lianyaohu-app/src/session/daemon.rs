@@ -8,13 +8,13 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
 use lianyaohu_core::{Result, err};
 
 use super::protocol::{Decoder, Frame};
-use super::{SessionStatus, remove_session_files, unix_now};
+use super::remove_session_files;
 
 /// Replayed to a freshly attached client so the screen is not blank before
 /// the forced redraw kicks in.
@@ -23,56 +23,6 @@ const SCROLLBACK_LIMIT: usize = 128 * 1024;
 /// A client that stops draining (SIGSTOP, dead link) must not wedge the
 /// daemon; writes that block this long drop the client instead.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Agent output arrives in bursts; rewriting `<name>.status` more than once
-/// a second buys nothing for a five-second activity window.
-const STATUS_WRITE_THROTTLE: Duration = Duration::from_secs(1);
-
-/// Exports `<name>.status` so `lyh ls` and the session picker can read
-/// activity without a socket round-trip (attaching would replay scrollback
-/// and count as a client). Client-count changes write immediately; output
-/// merely refreshes a timestamp and is throttled.
-struct StatusWriter {
-    dir: PathBuf,
-    name: String,
-    status: SessionStatus,
-    last_write: Instant,
-}
-
-impl StatusWriter {
-    fn new(dir: &Path, name: &str) -> Self {
-        let mut writer = Self {
-            dir: dir.to_path_buf(),
-            name: name.to_string(),
-            status: SessionStatus {
-                last_output_at: unix_now(),
-                clients: 0,
-            },
-            last_write: Instant::now(),
-        };
-        writer.write();
-        writer
-    }
-
-    fn write(&mut self) {
-        let _ = self.status.save(&self.dir, &self.name);
-        self.last_write = Instant::now();
-    }
-
-    fn note_output(&mut self) {
-        self.status.last_output_at = unix_now();
-        if self.last_write.elapsed() >= STATUS_WRITE_THROTTLE {
-            self.write();
-        }
-    }
-
-    fn set_clients(&mut self, clients: u32) {
-        if self.status.clients != clients {
-            self.status.clients = clients;
-            self.write();
-        }
-    }
-}
 
 /// The running agent as the daemon loop sees it: a pipe that yields the exit
 /// code, and a best-effort terminate hook. How the agent was launched
@@ -222,7 +172,6 @@ pub fn run_loop(
     let mut scrollback: Vec<u8> = Vec::new();
     let mut current_size: Option<(u16, u16)> = None;
     let mut exit_code: Option<i32> = None;
-    let mut status = StatusWriter::new(dir, name);
 
     while exit_code.is_none() {
         let mut poll_fds: Vec<libc::pollfd> = Vec::with_capacity(3 + clients.len());
@@ -271,12 +220,9 @@ pub fn run_loop(
             && readable(&poll_fds[index])
             && let Some(fd) = &master
         {
-            let (state, drained) = drain_master(fd.as_raw_fd(), &mut scrollback, &mut clients);
-            if drained {
-                status.note_output();
-            }
-            if matches!(state, MasterState::Closed) {
-                master = None;
+            match drain_master(fd.as_raw_fd(), &mut scrollback, &mut clients) {
+                MasterState::Open => {}
+                MasterState::Closed => master = None,
             }
         }
 
@@ -298,8 +244,6 @@ pub fn run_loop(
                 clients.remove(offset);
             }
         }
-
-        status.set_clients(clients.len() as u32);
     }
 
     let code = exit_code.unwrap_or(1);
@@ -343,19 +287,11 @@ enum MasterState {
     Closed,
 }
 
-/// Returns the master's state plus whether any output bytes were drained,
-/// which is the daemon's activity signal.
-fn drain_master(
-    fd: RawFd,
-    scrollback: &mut Vec<u8>,
-    clients: &mut Vec<Client>,
-) -> (MasterState, bool) {
+fn drain_master(fd: RawFd, scrollback: &mut Vec<u8>, clients: &mut Vec<Client>) -> MasterState {
     let mut buffer = [0u8; 8192];
-    let mut drained = false;
     loop {
         let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if read > 0 {
-            drained = true;
             let chunk = &buffer[..read as usize];
             scrollback.extend_from_slice(chunk);
             if scrollback.len() > SCROLLBACK_LIMIT {
@@ -366,14 +302,14 @@ fn drain_master(
             continue;
         }
         if read == 0 {
-            return (MasterState::Closed, drained);
+            return MasterState::Closed;
         }
         let error = std::io::Error::last_os_error();
         return match error.kind() {
-            std::io::ErrorKind::WouldBlock => (MasterState::Open, drained),
+            std::io::ErrorKind::WouldBlock => MasterState::Open,
             std::io::ErrorKind::Interrupted => continue,
             // EIO: every slave fd is closed — the agent is gone.
-            _ => (MasterState::Closed, drained),
+            _ => MasterState::Closed,
         };
     }
 }
@@ -463,7 +399,7 @@ fn write_master(fd: RawFd, mut bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionMeta, meta_path, socket_path, status_path};
+    use crate::session::{SessionMeta, meta_path, socket_path};
     use std::fs;
     use std::process::{Command, Stdio};
 
@@ -558,11 +494,6 @@ mod tests {
             "echo did not round-trip: {seen:?}"
         );
 
-        // The daemon exports activity: one client attached, recent output.
-        let status = SessionStatus::load(&dir, name).expect("status file after attach");
-        assert_eq!(status.clients, 1);
-        assert!(status.last_output_at > 0);
-
         // A second client gets the scrollback replayed on attach.
         let mut second = UnixStream::connect(&socket).unwrap();
         second
@@ -602,7 +533,6 @@ mod tests {
         handle.join().unwrap();
         assert!(!socket.exists());
         assert!(!meta_path(&dir, name).exists());
-        assert!(!status_path(&dir, name).exists());
 
         fs::remove_dir_all(&dir).ok();
     }

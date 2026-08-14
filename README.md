@@ -92,25 +92,15 @@ closing the terminal:
 lyh run -- claude              # start a session (named after the directory) and attach
 lyh run --name api -- codex    # explicit name
 lyh run --detached -- claude   # start without attaching
-lyh sessions                   # interactive session manager (list, attach, kill, new)
-lyh ls                         # plain session table, for scripts
+lyh ls                         # list running sessions
 lyh attach api                 # reattach (no name: most recent session)
 lyh kill api                   # terminate a session's agent
 ```
 
-`lyh sessions` opens an inline manager showing every session with its
-activity — `[working]` while the agent produced output in the last five
-seconds, `[idle]` at a prompt, plus an `attached` marker — along with
-uptime, VPN interface, and command. `Enter` (or `1`-`9`) attaches, `x`
-kills after confirmation, and `n` starts a new session through the usual
-interactive launch.
-
-While attached, `Ctrl-g` enters a zellij-style command mode: `d` detaches,
-`w` opens the session manager, `n` / `p` switch between running sessions
-without dropping to the shell, `g` sends a literal `Ctrl-g` to the agent,
-and any other key (or `Ctrl-g` again) cancels back to passthrough. On
-attach the recent output is replayed and a resize nudge makes full-screen
-agents repaint. Session sockets live under
+While attached, `Ctrl-\ d` detaches, `Ctrl-\ n` / `Ctrl-\ p` switch between
+running sessions without dropping to the shell, and `Ctrl-\ Ctrl-\` sends a
+literal `Ctrl-\` to the agent. On attach the recent output is replayed and a
+resize nudge makes full-screen agents repaint. Session sockets live under
 `~/.local/state/lianyaohu/sessions` (owner-only), one small daemon per
 session; per-session logs sit next to the sockets.
 

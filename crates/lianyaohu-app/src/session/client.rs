@@ -1,8 +1,7 @@
 //! The attach side: raw-mode passthrough between the user's terminal and a
-//! session daemon's socket. `Ctrl-g` toggles command mode, where `d`
-//! detaches, `n`/`p` ask the caller to switch sessions, and `w` asks for
-//! the session picker; window resizes are forwarded so the agent always
-//! renders at the attached terminal's size.
+//! session daemon's socket. `Ctrl-\ d` detaches, `Ctrl-\ n` / `Ctrl-\ p`
+//! ask the caller to switch sessions, and window resizes are forwarded so
+//! the agent always renders at the attached terminal's size.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -13,7 +12,7 @@ use std::time::Duration;
 use lianyaohu_core::{Result, err};
 
 use super::protocol::{Decoder, Frame};
-use super::{KeyAction, ModeParser};
+use super::{KeyAction, PrefixParser};
 
 /// How the attachment ended; switching is resolved by the caller, which
 /// knows the full session list.
@@ -25,8 +24,6 @@ pub enum AttachOutcome {
     SessionClosed,
     SwitchNext,
     SwitchPrev,
-    /// Detached toward the interactive session picker.
-    OpenPicker,
 }
 
 /// Restores the caller's termios on drop — the terminal is handed back to
@@ -102,7 +99,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    println!("[lyh] attached to {name} — Ctrl-g then: d detach · w sessions · n/p switch");
+    println!("[lyh] attached to {name} — Ctrl-\\ d detach · Ctrl-\\ n/p switch session");
     let raw = RawTerminal::enable()?;
 
     let mut size = terminal_size();
@@ -114,7 +111,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
         .encode(),
     )?;
 
-    let mut parser = ModeParser::default();
+    let mut parser = PrefixParser::default();
     let mut decoder = Decoder::default();
     let outcome = loop {
         let mut fds = [pollfd(libc::STDIN_FILENO), pollfd(stream.as_raw_fd())];
@@ -153,7 +150,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
             for byte in &buffer[..read as usize] {
                 match parser.feed(*byte) {
                     KeyAction::Forward(mut bytes) => forward.append(&mut bytes),
-                    KeyAction::Consumed => {}
+                    KeyAction::Pending => {}
                     KeyAction::Detach => {
                         command = Some(AttachOutcome::Detached);
                         break;
@@ -164,10 +161,6 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
                     }
                     KeyAction::SwitchPrev => {
                         command = Some(AttachOutcome::SwitchPrev);
-                        break;
-                    }
-                    KeyAction::OpenPicker => {
-                        command = Some(AttachOutcome::OpenPicker);
                         break;
                     }
                 }
