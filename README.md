@@ -105,14 +105,14 @@ uptime, VPN interface, and command. `Enter` (or `1`-`9`) attaches, `x`
 kills after confirmation, and `n` starts a new session through the usual
 interactive launch.
 
-While attached, the tmux-style `Ctrl-b` prefix drives everything:
-`Ctrl-b d` detaches, `Ctrl-b w` opens the session manager, `Ctrl-b n` /
-`Ctrl-b p` switch between running sessions without dropping to the shell,
-and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b` to the agent. On attach the
-recent output is replayed and a resize nudge makes full-screen agents
-repaint. Session sockets live under `~/.local/state/lianyaohu/sessions`
-(owner-only), one small daemon per session; per-session logs sit next to
-the sockets.
+While attached, `Ctrl-g` enters a zellij-style command mode: `d` detaches,
+`w` opens the session manager, `n` / `p` switch between running sessions
+without dropping to the shell, `g` sends a literal `Ctrl-g` to the agent,
+and any other key (or `Ctrl-g` again) cancels back to passthrough. On
+attach the recent output is replayed and a resize nudge makes full-screen
+agents repaint. Session sockets live under
+`~/.local/state/lianyaohu/sessions` (owner-only), one small daemon per
+session; per-session logs sit next to the sockets.
 
 ## Configuration
 

@@ -1,9 +1,9 @@
 //! Background agent sessions: each `lyh run` forks a small per-session
 //! daemon that owns a PTY and a Unix socket, dtach-style. Clients attach to
-//! stream the terminal, detach with `Ctrl-b d`, switch between live sessions
-//! with `Ctrl-b n` / `Ctrl-b p`, and open the session picker with
-//! `Ctrl-b w`. One daemon per session keeps every agent in its own sandbox
-//! with no shared multiplexer state.
+//! stream the terminal; `Ctrl-g` toggles a zellij-style command mode where
+//! `d` detaches, `n`/`p` switch between live sessions, and `w` opens the
+//! session picker. One daemon per session keeps every agent in its own
+//! sandbox with no shared multiplexer state.
 
 pub mod client;
 pub mod daemon;
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use lianyaohu_core::{Result, err};
 use serde::{Deserialize, Serialize};
 
-/// The detach/switch prefix key: `Ctrl-b`, tmux-style.
-pub const PREFIX_KEY: u8 = 0x02;
+/// The command-mode toggle key: `Ctrl-g`, zellij-style.
+pub const MODE_KEY: u8 = 0x07;
 
 /// Directory holding one `<name>.sock` + `<name>.json` pair per session.
 /// Overridable for tests and unusual setups; sockets need short paths.
@@ -226,13 +226,13 @@ pub fn remove_session_files(dir: &Path, name: &str) {
     let _ = fs::remove_file(status_path(dir, name));
 }
 
-/// What a prefixed keystroke asks the client to do.
+/// What a keystroke asks the client to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyAction {
     /// Send these bytes to the agent.
     Forward(Vec<u8>),
-    /// Waiting for the byte after the prefix; send nothing yet.
-    Pending,
+    /// Consumed by the command-mode machinery; send nothing.
+    Consumed,
     Detach,
     SwitchNext,
     SwitchPrev,
@@ -240,33 +240,34 @@ pub enum KeyAction {
     OpenPicker,
 }
 
-/// Tracks the `Ctrl-b` prefix across reads: `Ctrl-b d` detaches, `n`/`p`
-/// switch sessions, `w` opens the session picker, a doubled `Ctrl-b` sends
-/// the literal byte, and any other follow-up key forwards both bytes
-/// unchanged.
+/// Zellij-style modal keys across reads: `Ctrl-g` enters command mode, where
+/// `d` detaches, `n`/`p` switch sessions, `w` opens the session picker, and
+/// `g` sends a literal `Ctrl-g` to the agent. `Esc`, `Ctrl-g`, or any other
+/// key leaves command mode — the client draws no mode indicator over the
+/// agent's screen, so a sticky mode would silently swallow typed text.
 #[derive(Default)]
-pub struct PrefixParser {
-    pending: bool,
+pub struct ModeParser {
+    command_mode: bool,
 }
 
-impl PrefixParser {
+impl ModeParser {
     pub fn feed(&mut self, byte: u8) -> KeyAction {
-        if self.pending {
-            self.pending = false;
-            return match byte {
-                b'd' => KeyAction::Detach,
-                b'n' => KeyAction::SwitchNext,
-                b'p' => KeyAction::SwitchPrev,
-                b'w' => KeyAction::OpenPicker,
-                PREFIX_KEY => KeyAction::Forward(vec![PREFIX_KEY]),
-                other => KeyAction::Forward(vec![PREFIX_KEY, other]),
-            };
+        if !self.command_mode {
+            if byte == MODE_KEY {
+                self.command_mode = true;
+                return KeyAction::Consumed;
+            }
+            return KeyAction::Forward(vec![byte]);
         }
-        if byte == PREFIX_KEY {
-            self.pending = true;
-            return KeyAction::Pending;
+        self.command_mode = false;
+        match byte {
+            b'd' => KeyAction::Detach,
+            b'n' => KeyAction::SwitchNext,
+            b'p' => KeyAction::SwitchPrev,
+            b'w' => KeyAction::OpenPicker,
+            b'g' => KeyAction::Forward(vec![MODE_KEY]),
+            _ => KeyAction::Consumed,
         }
-        KeyAction::Forward(vec![byte])
     }
 }
 
@@ -275,29 +276,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefix_parser_dispatches_commands_and_literals() {
-        let mut parser = PrefixParser::default();
+    fn mode_parser_dispatches_commands_and_literals() {
+        let mut parser = ModeParser::default();
         assert_eq!(parser.feed(b'a'), KeyAction::Forward(vec![b'a']));
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
         assert_eq!(parser.feed(b'd'), KeyAction::Detach);
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
         assert_eq!(parser.feed(b'n'), KeyAction::SwitchNext);
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
         assert_eq!(parser.feed(b'p'), KeyAction::SwitchPrev);
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
         assert_eq!(parser.feed(b'w'), KeyAction::OpenPicker);
-        // Doubled prefix sends one literal Ctrl-b.
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
-        assert_eq!(
-            parser.feed(PREFIX_KEY),
-            KeyAction::Forward(vec![PREFIX_KEY])
-        );
-        // Unknown follow-ups forward both bytes.
-        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
-        assert_eq!(
-            parser.feed(b'x'),
-            KeyAction::Forward(vec![PREFIX_KEY, b'x'])
-        );
+        // `g` in command mode sends one literal Ctrl-g.
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
+        assert_eq!(parser.feed(b'g'), KeyAction::Forward(vec![MODE_KEY]));
+        // A doubled Ctrl-g cancels command mode; keys forward again.
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
+        assert_eq!(parser.feed(b'd'), KeyAction::Forward(vec![b'd']));
+        // Unknown keys leave command mode without reaching the agent.
+        assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
+        assert_eq!(parser.feed(b'x'), KeyAction::Consumed);
+        assert_eq!(parser.feed(b'x'), KeyAction::Forward(vec![b'x']));
     }
 
     #[test]

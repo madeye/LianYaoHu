@@ -773,9 +773,9 @@ fn run_session_daemon(
     ))
 }
 
-/// Attach with client-side session switching: `Ctrl-b n` / `Ctrl-b p` hop
-/// between live sessions and `Ctrl-b w` opens the picker, all without
-/// dropping back to the shell.
+/// Attach with client-side session switching: in `Ctrl-g` command mode,
+/// `n` / `p` hop between live sessions and `w` opens the picker, all
+/// without dropping back to the shell.
 fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
     loop {
         let socket = session::socket_path(dir, &name);
@@ -828,7 +828,7 @@ fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
 }
 
 /// `lyh sessions` on a TTY: the interactive manager, then attach to whatever
-/// the user picked (which loops back here via `Ctrl-b w`).
+/// the user picked (which loops back here via `Ctrl-g w`).
 fn sessions_manager(dir: &Path) -> Result<i32> {
     match manager_round(dir)? {
         Some(name) => attach_loop(dir, name),
@@ -1605,10 +1605,10 @@ fn usage(program: &str) -> String {
 
 subcommands:
   run                         Launch the agent in a background session on its own PTY, then
-                              attach. Detach with Ctrl-b d; open the session picker with
-                              Ctrl-b w; switch sessions with Ctrl-b n/p; Ctrl-b Ctrl-b sends
-                              a literal Ctrl-b. Each session gets its own sandbox, so several
-                              agents can run side by side.
+                              attach. Ctrl-g enters command mode (zellij-style): d detaches,
+                              w opens the session picker, n/p switch sessions, g sends a
+                              literal Ctrl-g, any other key cancels. Each session gets its
+                              own sandbox, so several agents can run side by side.
   attach [NAME]               Reattach to a session (default: the most recently started).
   sessions                    Interactive session manager: list with working/idle status,
                               attach, kill, or start sessions. Falls back to `ls` without a TTY.

@@ -1,8 +1,8 @@
 //! The attach side: raw-mode passthrough between the user's terminal and a
-//! session daemon's socket. `Ctrl-b d` detaches, `Ctrl-b n` / `Ctrl-b p`
-//! ask the caller to switch sessions, `Ctrl-b w` asks for the session
-//! picker, and window resizes are forwarded so the agent always renders at
-//! the attached terminal's size.
+//! session daemon's socket. `Ctrl-g` toggles command mode, where `d`
+//! detaches, `n`/`p` ask the caller to switch sessions, and `w` asks for
+//! the session picker; window resizes are forwarded so the agent always
+//! renders at the attached terminal's size.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -13,7 +13,7 @@ use std::time::Duration;
 use lianyaohu_core::{Result, err};
 
 use super::protocol::{Decoder, Frame};
-use super::{KeyAction, PrefixParser};
+use super::{KeyAction, ModeParser};
 
 /// How the attachment ended; switching is resolved by the caller, which
 /// knows the full session list.
@@ -102,7 +102,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    println!("[lyh] attached to {name} — Ctrl-b d detach · Ctrl-b w sessions · Ctrl-b n/p switch");
+    println!("[lyh] attached to {name} — Ctrl-g then: d detach · w sessions · n/p switch");
     let raw = RawTerminal::enable()?;
 
     let mut size = terminal_size();
@@ -114,7 +114,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
         .encode(),
     )?;
 
-    let mut parser = PrefixParser::default();
+    let mut parser = ModeParser::default();
     let mut decoder = Decoder::default();
     let outcome = loop {
         let mut fds = [pollfd(libc::STDIN_FILENO), pollfd(stream.as_raw_fd())];
@@ -153,7 +153,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
             for byte in &buffer[..read as usize] {
                 match parser.feed(*byte) {
                     KeyAction::Forward(mut bytes) => forward.append(&mut bytes),
-                    KeyAction::Pending => {}
+                    KeyAction::Consumed => {}
                     KeyAction::Detach => {
                         command = Some(AttachOutcome::Detached);
                         break;
