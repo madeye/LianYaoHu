@@ -6,6 +6,7 @@
 mod editor;
 pub mod fallback;
 mod quick_pick;
+mod theme;
 
 use std::io::{self, Stdout};
 use std::sync::Once;
@@ -57,6 +58,14 @@ pub(crate) fn interface_detail_lines(
     interface: &NetworkInterface,
     default_route: Option<&str>,
 ) -> Vec<String> {
+    if interface.is_proxy_only() {
+        return vec![
+            "Proxy-only: no VPN interface.".to_string(),
+            "All direct egress is blocked (loopback only);".to_string(),
+            "outbound traffic must use a local proxy,".to_string(),
+            "e.g. http://127.0.0.1:7890 (prompted at launch).".to_string(),
+        ];
+    }
     let state = match (interface.is_up(), interface.is_running()) {
         (true, true) => "UP, RUNNING".to_string(),
         (true, false) => "UP, not running".to_string(),

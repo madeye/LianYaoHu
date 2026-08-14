@@ -72,6 +72,38 @@ By default it:
 - blocks LAN destinations and non-selected-interface egress for only the
   guarded agent tree.
 
+### Proxy-only mode (no VPN)
+
+The interface picker also offers `none` (equivalently `--vpn none` or
+`vpn_interface = "none"` in the config): no VPN at all. The firewall then
+blocks every direct destination — loopback is the only way out — and the
+launcher ensures the agent's environment carries a local proxy
+(`HTTPS_PROXY`/`ALL_PROXY` and friends), prompting for one
+(e.g. `http://127.0.0.1:7890`) when the config does not provide it. All
+outbound traffic flows through that local proxy or not at all.
+
+## Background Sessions
+
+`lyh run` launches the agent in a background session on its own PTY, so
+several agents can run side by side — each in its own sandbox — and survive
+closing the terminal:
+
+```sh
+lyh run -- claude              # start a session (named after the directory) and attach
+lyh run --name api -- codex    # explicit name
+lyh run --detached -- claude   # start without attaching
+lyh ls                         # list running sessions
+lyh attach api                 # reattach (no name: most recent session)
+lyh kill api                   # terminate a session's agent
+```
+
+While attached, `Ctrl-\ d` detaches, `Ctrl-\ n` / `Ctrl-\ p` switch between
+running sessions without dropping to the shell, and `Ctrl-\ Ctrl-\` sends a
+literal `Ctrl-\` to the agent. On attach the recent output is replayed and a
+resize nudge makes full-screen agents repaint. Session sockets live under
+`~/.local/state/lianyaohu/sessions` (owner-only), one small daemon per
+session; per-session logs sit next to the sockets.
+
 ## Configuration
 
 Everything persists, so a configured machine launches with plain

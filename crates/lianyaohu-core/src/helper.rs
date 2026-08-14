@@ -56,16 +56,30 @@ impl PFHelperClient {
     }
 
     pub fn run_session(&self, interface_name: &str, spec_path: &Path) -> Result<i32> {
+        self.run_session_with_fds(
+            interface_name,
+            spec_path,
+            [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO],
+        )
+    }
+
+    /// Like [`run_session`], but hands the helper an arbitrary stdio triple
+    /// instead of this process' own terminal — the background session daemon
+    /// passes its PTY slave three times so the agent runs on the session PTY.
+    pub fn run_session_with_fds(
+        &self,
+        interface_name: &str,
+        spec_path: &Path,
+        stdio: [RawFd; 3],
+    ) -> Result<i32> {
         let spec_path = spec_path
             .to_str()
             .ok_or_else(|| err("launch spec path is not valid UTF-8"))?;
         if spec_path.contains(char::is_whitespace) {
             return Err(err("launch spec path cannot contain whitespace"));
         }
-        let response = self.send_with_fds(
-            &format!("run {interface_name} {spec_path}\n"),
-            &[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO],
-        )?;
+        let response =
+            self.send_with_fds(&format!("run {interface_name} {spec_path}\n"), &stdio)?;
         if !response.ok {
             return Err(err(response.message));
         }

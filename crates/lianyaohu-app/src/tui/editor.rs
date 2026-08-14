@@ -17,17 +17,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lianyaohu_core::config::{self, ConfigFile, PROJECT_FILE_NAME, expand_tilde, trust};
+use lianyaohu_core::env_policy::{NO_PROXY_KEYS, NO_PROXY_VALUE, PROXY_ENV_KEYS};
 use lianyaohu_core::interfaces::{NetworkInterface, vpn_interfaces};
 use lianyaohu_core::policy::{DestRule, LAN4_BLOCKED, LAN6_BLOCKED, lexically_normalized_absolute};
 use lianyaohu_core::{Result, err};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::TerminalGuard;
+use super::{TerminalGuard, theme};
 
 const TICK: Duration = Duration::from_millis(500);
 
@@ -77,20 +78,6 @@ enum InputTarget {
     DenyPath { edit: Option<usize> },
     Proxy,
 }
-
-/// Environment variables the proxy setting fans out to. Both cases are set:
-/// curl only honors lowercase `http_proxy`, while many tools read uppercase.
-const PROXY_ENV_KEYS: &[&str] = &[
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "ALL_PROXY",
-    "https_proxy",
-    "http_proxy",
-    "all_proxy",
-];
-const NO_PROXY_KEYS: &[&str] = &["NO_PROXY", "no_proxy"];
-const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
-const PROXY_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"];
 
 #[derive(Clone, Debug)]
 struct InputState {
@@ -200,6 +187,16 @@ enum Step {
     Quit,
 }
 
+/// Colors the status line: routine feedback stays plain, saves turn green,
+/// warnings yellow, failures red.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
 struct Editor {
     home_dir: String,
     xdg: Option<String>,
@@ -222,7 +219,8 @@ struct Editor {
     path_selected: [usize; 2],
     preset_selected: usize,
     input: Option<InputState>,
-    status: Option<String>,
+    status: Option<(StatusKind, String)>,
+    review_scroll: u16,
     help: bool,
     confirm_quit: bool,
     undo: Option<Deleted>,
@@ -301,7 +299,25 @@ impl Editor {
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
-        self.status = Some(message.into());
+        self.status = Some((StatusKind::Info, message.into()));
+    }
+
+    fn set_success(&mut self, message: impl Into<String>) {
+        self.status = Some((StatusKind::Success, message.into()));
+    }
+
+    fn set_warn(&mut self, message: impl Into<String>) {
+        self.status = Some((StatusKind::Warn, message.into()));
+    }
+
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.status = Some((StatusKind::Error, message.into()));
+    }
+
+    /// Test-facing accessor: assertions care about the text, not the color.
+    #[cfg(test)]
+    fn status_text(&self) -> Option<&str> {
+        self.status.as_ref().map(|(_, text)| text.as_str())
     }
 
     /// The proxy URL currently configured in this scope's `[env]`, if any.
@@ -342,19 +358,7 @@ impl Editor {
                 if trimmed.is_empty() {
                     return Ok(String::new());
                 }
-                let (scheme, rest) = trimmed
-                    .split_once("://")
-                    .ok_or_else(|| err("expected scheme://host:port (empty clears)"))?;
-                if !PROXY_SCHEMES.contains(&scheme) {
-                    return Err(err(format!(
-                        "scheme must be one of: {}",
-                        PROXY_SCHEMES.join(", ")
-                    )));
-                }
-                if rest.is_empty() || rest.chars().any(char::is_whitespace) {
-                    return Err(err("expected scheme://host:port"));
-                }
-                Ok(trimmed.to_string())
+                lianyaohu_core::env_policy::validate_proxy_url(trimmed)
             }
             InputTarget::Network { pane, .. } => {
                 let rule = DestRule::parse(trimmed)?;
@@ -397,9 +401,9 @@ impl Editor {
                     self.set_proxy(url);
                     self.input = None;
                     if cleared {
-                        self.set_status("proxy cleared");
+                        self.set_success("proxy cleared");
                     } else {
-                        self.set_status(format!("proxy set to {entry}"));
+                        self.set_success(format!("proxy set to {entry}"));
                     }
                     return Step::Redraw;
                 }
@@ -480,6 +484,45 @@ impl Editor {
                 input.cursor = (input.cursor + 1).min(input.buffer.len());
                 Step::Redraw
             }
+            KeyCode::Home => {
+                input.cursor = 0;
+                Step::Redraw
+            }
+            KeyCode::End => {
+                input.cursor = input.buffer.len();
+                Step::Redraw
+            }
+            KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match character {
+                    'a' => input.cursor = 0,
+                    'e' => input.cursor = input.buffer.len(),
+                    // Kill to start of line.
+                    'u' => {
+                        input.buffer.drain(..input.cursor);
+                        input.cursor = 0;
+                        input.error = None;
+                        input.hint = None;
+                    }
+                    // Delete the previous word; '/' counts as a boundary so
+                    // path components can be trimmed one at a time.
+                    'w' => {
+                        let boundary = |byte: u8| byte == b' ' || byte == b'/';
+                        let mut start = input.cursor;
+                        while start > 0 && boundary(input.buffer.as_bytes()[start - 1]) {
+                            start -= 1;
+                        }
+                        while start > 0 && !boundary(input.buffer.as_bytes()[start - 1]) {
+                            start -= 1;
+                        }
+                        input.buffer.drain(start..input.cursor);
+                        input.cursor = start;
+                        input.error = None;
+                        input.hint = None;
+                    }
+                    _ => return Step::Continue,
+                }
+                Step::Redraw
+            }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) && character.is_ascii() =>
             {
@@ -511,6 +554,7 @@ impl Editor {
                 KeyCode::Char('c') => Step::Quit,
                 KeyCode::Char('s') => {
                     self.screen = Screen::Review;
+                    self.review_scroll = 0;
                     Step::Redraw
                 }
                 _ => Step::Continue,
@@ -544,7 +588,7 @@ impl Editor {
         if self.screen == Screen::Home {
             if self.dirty() && !self.confirm_quit {
                 self.confirm_quit = true;
-                self.set_status(
+                self.set_warn(
                     "unsaved changes — Esc again to discard, or open Review & save (Ctrl-S)",
                 );
                 return Step::Redraw;
@@ -571,6 +615,7 @@ impl Editor {
             KeyCode::Enter => {
                 self.screen = HOME_MENU[self.menu_selected].0;
                 self.confirm_quit = false;
+                self.review_scroll = 0;
                 Step::Redraw
             }
             KeyCode::Char(digit @ '1'..='5') => {
@@ -578,6 +623,7 @@ impl Editor {
                 self.menu_selected = index;
                 self.screen = HOME_MENU[index].0;
                 self.confirm_quit = false;
+                self.review_scroll = 0;
                 Step::Redraw
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
@@ -602,7 +648,7 @@ impl Editor {
                 let name = self.interfaces[self.iface_selected].name.clone();
                 // Machine-specific: always the global draft, never the project.
                 self.global.defaults.vpn_interface = Some(name.clone());
-                self.set_status(format!("default VPN interface set to {name} (global)"));
+                self.set_success(format!("default VPN interface set to {name} (global)"));
                 Step::Redraw
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
@@ -613,11 +659,11 @@ impl Editor {
     fn update_network(&mut self, key: KeyEvent) -> Step {
         let lengths: Vec<usize> = self.network_lists().iter().map(|list| list.len()).collect();
         match key.code {
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.net_pane = (self.net_pane + 1) % 3;
                 Step::Redraw
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 self.net_pane = self.net_pane.checked_sub(1).unwrap_or(2);
                 Step::Redraw
             }
@@ -706,7 +752,12 @@ impl Editor {
     fn update_paths(&mut self, key: KeyEvent) -> Step {
         let lengths: Vec<usize> = self.path_lists().iter().map(|list| list.len()).collect();
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => {
                 self.path_pane = 1 - self.path_pane;
                 Step::Redraw
             }
@@ -859,15 +910,30 @@ impl Editor {
         }
     }
 
+    fn max_review_scroll(&self) -> u16 {
+        (review_lines(self).len().saturating_sub(1)) as u16
+    }
+
+    fn scroll_review(&mut self, delta: i32) -> Step {
+        let scrolled = (i32::from(self.review_scroll) + delta)
+            .clamp(0, i32::from(self.max_review_scroll())) as u16;
+        self.review_scroll = scrolled;
+        Step::Redraw
+    }
+
     fn update_review(&mut self, key: KeyEvent) -> Step {
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_review(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_review(1),
+            KeyCode::PageUp => self.scroll_review(-10),
+            KeyCode::PageDown => self.scroll_review(10),
             KeyCode::Enter => {
                 let mut saved = Vec::new();
                 if self.global_dirty() {
                     match self.save_global() {
                         Ok(()) => saved.push("global"),
                         Err(error) => {
-                            self.set_status(format!("global save failed: {error}"));
+                            self.set_error(format!("global save failed: {error}"));
                             return Step::Redraw;
                         }
                     }
@@ -876,7 +942,7 @@ impl Editor {
                     match self.save_project() {
                         Ok(()) => saved.push("project"),
                         Err(error) => {
-                            self.set_status(format!("project save failed: {error}"));
+                            self.set_error(format!("project save failed: {error}"));
                             return Step::Redraw;
                         }
                     }
@@ -884,23 +950,23 @@ impl Editor {
                 if saved.is_empty() {
                     self.set_status("nothing to save");
                 } else {
-                    self.set_status(format!("saved: {}", saved.join(" + ")));
+                    self.set_success(format!("saved: {}", saved.join(" + ")));
                 }
                 Step::Redraw
             }
             KeyCode::Char('g') => {
                 let result = self.save_global();
                 match result {
-                    Ok(()) => self.set_status("saved global config"),
-                    Err(error) => self.set_status(format!("global save failed: {error}")),
+                    Ok(()) => self.set_success("saved global config"),
+                    Err(error) => self.set_error(format!("global save failed: {error}")),
                 }
                 Step::Redraw
             }
             KeyCode::Char('p') => {
                 let result = self.save_project();
                 match result {
-                    Ok(()) => self.set_status("saved project config"),
-                    Err(error) => self.set_status(format!("project save failed: {error}")),
+                    Ok(()) => self.set_success("saved project config"),
+                    Err(error) => self.set_error(format!("project save failed: {error}")),
                 }
                 Step::Redraw
             }
@@ -944,22 +1010,22 @@ impl Editor {
     }
 
     fn refresh_interfaces(&mut self) {
-        if let Ok(interfaces) = vpn_interfaces()
-            && !interfaces.is_empty()
-        {
-            let current = self
-                .interfaces
-                .get(self.iface_selected)
-                .map(|interface| interface.name.clone());
-            self.iface_selected = current
-                .and_then(|name| {
-                    interfaces
-                        .iter()
-                        .position(|interface| interface.name == name)
-                })
-                .unwrap_or(0);
-            self.interfaces = interfaces;
-        }
+        // The synthetic "none" (proxy-only) entry is always offered, so the
+        // screen works even with no VPN interface up at all.
+        let mut interfaces = vpn_interfaces().unwrap_or_default();
+        interfaces.push(NetworkInterface::proxy_only());
+        let current = self
+            .interfaces
+            .get(self.iface_selected)
+            .map(|interface| interface.name.clone());
+        self.iface_selected = current
+            .and_then(|name| {
+                interfaces
+                    .iter()
+                    .position(|interface| interface.name == name)
+            })
+            .unwrap_or(0);
+        self.interfaces = interfaces;
         self.default_route = lianyaohu_core::route::default_ipv4_interface().unwrap_or(None);
     }
 }
@@ -977,18 +1043,7 @@ fn draw(frame: &mut Frame, editor: &Editor) {
     ])
     .areas(frame.area());
 
-    let scope = match editor.scope {
-        Scope::Global => "global",
-        Scope::Project => "project",
-    };
-    let dirty = if editor.dirty() { " *" } else { "" };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "LianYaoHu Configuration{dirty}    [Scope: {scope}]  (s to switch)"
-        ))
-        .style(Style::new().add_modifier(Modifier::BOLD)),
-        title_area,
-    );
+    frame.render_widget(title_line(editor), title_area);
 
     match editor.screen {
         Screen::Home => draw_home(frame, editor, body_area),
@@ -999,9 +1054,16 @@ fn draw(frame: &mut Frame, editor: &Editor) {
         Screen::Review => draw_review(frame, editor, body_area),
     }
 
-    let status = editor.status.clone().unwrap_or_default();
-    frame.render_widget(Paragraph::new(status), status_area);
-    frame.render_widget(Paragraph::new(keybar_text(editor)), keybar_area);
+    if let Some((kind, text)) = &editor.status {
+        let style = match kind {
+            StatusKind::Info => Style::new(),
+            StatusKind::Success => theme::success_style(),
+            StatusKind::Warn => theme::warn_style(),
+            StatusKind::Error => theme::error_style(),
+        };
+        frame.render_widget(Paragraph::new(text.clone()).style(style), status_area);
+    }
+    frame.render_widget(Paragraph::new(keybar(editor)), keybar_area);
 
     if let Some(input) = &editor.input {
         draw_input_overlay(frame, input, body_area);
@@ -1011,30 +1073,110 @@ fn draw(frame: &mut Frame, editor: &Editor) {
     }
 }
 
-fn keybar_text(editor: &Editor) -> String {
+/// Shortens a path for display by folding the home prefix back to `~`.
+fn tilde_shorten(path: &Path, home: &str) -> String {
+    let display = path.display().to_string();
+    match display.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
+        _ => display,
+    }
+}
+
+/// Title bar: app name, colored scope badge, the file that scope edits, and
+/// an unsaved marker — everything needed to know where an edit will land.
+fn title_line(editor: &Editor) -> Line<'static> {
+    let (scope_label, scope_color, target) = match editor.scope {
+        Scope::Global => ("global", theme::SCOPE_GLOBAL, &editor.global_path),
+        Scope::Project => ("project", theme::SCOPE_PROJECT, &editor.project_path),
+    };
+    let mut spans = vec![
+        Span::styled(
+            "LianYaoHu Configuration",
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{scope_label}]"),
+            Style::new().fg(scope_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" editing {}", tilde_shorten(target, &editor.home_dir)),
+            theme::dim_style(),
+        ),
+    ];
+    if editor.dirty() {
+        spans.push(Span::styled("  ● unsaved", theme::warn_style()));
+    }
+    spans.push(Span::styled("  (s switches scope)", theme::dim_style()));
+    Line::from(spans)
+}
+
+fn keybar(editor: &Editor) -> Line<'static> {
     if let Some(input) = &editor.input {
         return match input.target {
-            InputTarget::Path { .. } | InputTarget::DenyPath { .. } => {
-                "Enter confirm · Tab complete · Esc cancel".to_string()
-            }
-            InputTarget::Network { .. } | InputTarget::Proxy => {
-                "Enter confirm · Esc cancel".to_string()
-            }
+            InputTarget::Path { .. } | InputTarget::DenyPath { .. } => theme::keybar_line(&[
+                ("Enter", "confirm"),
+                ("Tab", "complete path"),
+                ("Ctrl-U/W", "clear/word"),
+                ("Esc", "cancel"),
+            ]),
+            InputTarget::Network { .. } | InputTarget::Proxy => theme::keybar_line(&[
+                ("Enter", "confirm"),
+                ("Ctrl-U/W", "clear/word"),
+                ("Esc", "cancel"),
+            ]),
         };
     }
     match editor.screen {
-        Screen::Home => "↑↓/1-5 select · Enter open · s scope · Ctrl-S review · q quit · ? help",
-        Screen::Interface => "↑↓ select · Enter set default (global) · Esc back · ? help",
-        Screen::Network => {
-            "Tab pane · a add · e edit · d delete · u undo · m default · p proxy · Esc back"
-        }
-        Screen::Paths => {
-            "Tab pane · a add · e edit · d delete · u undo · Space narrow-home · Esc back"
-        }
-        Screen::Presets => "↑↓ select · Space toggle · a add custom · d delete · u undo · Esc back",
-        Screen::Review => "Enter save all · g global only · p project only · Esc back",
+        Screen::Home => theme::keybar_line(&[
+            ("↑↓ 1-5", "select"),
+            ("Enter", "open"),
+            ("s", "scope"),
+            ("Ctrl-S", "review & save"),
+            ("q", "quit"),
+            ("?", "help"),
+        ]),
+        Screen::Interface => theme::keybar_line(&[
+            ("↑↓", "select"),
+            ("Enter", "set default (global)"),
+            ("Esc", "back"),
+            ("?", "help"),
+        ]),
+        Screen::Network => theme::keybar_line(&[
+            ("Tab ←→", "pane"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("u", "undo"),
+            ("m", "default"),
+            ("p", "proxy"),
+            ("Esc", "back"),
+        ]),
+        Screen::Paths => theme::keybar_line(&[
+            ("Tab ←→", "pane"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("u", "undo"),
+            ("Space", "narrow-home"),
+            ("Esc", "back"),
+        ]),
+        Screen::Presets => theme::keybar_line(&[
+            ("↑↓", "select"),
+            ("Space", "toggle"),
+            ("a", "add custom"),
+            ("d", "delete"),
+            ("u", "undo"),
+            ("Esc", "back"),
+        ]),
+        Screen::Review => theme::keybar_line(&[
+            ("↑↓", "scroll"),
+            ("Enter", "save all"),
+            ("g", "global only"),
+            ("p", "project only"),
+            ("Esc", "back"),
+        ]),
     }
-    .to_string()
 }
 
 fn draw_home(frame: &mut Frame, editor: &Editor, area: Rect) {
@@ -1115,17 +1257,16 @@ fn draw_interface(frame: &mut Frame, editor: &Editor, area: Rect) {
         .interfaces
         .iter()
         .map(|interface| {
-            let state = if interface.is_up() && interface.is_running() {
-                "up"
+            let state = if interface.is_proxy_only() {
+                Span::styled("[proxy-only]", theme::dim_style())
             } else {
-                "down"
+                theme::state_span(interface.is_up() && interface.is_running())
             };
-            let marker = if saved == Some(interface.name.as_str()) {
-                " (default)"
-            } else {
-                ""
-            };
-            ListItem::new(format!("{} [{state}]{marker}", interface.name))
+            let mut line = Line::from(vec![Span::raw(format!("{} ", interface.name)), state]);
+            if saved == Some(interface.name.as_str()) {
+                line.push_span(Span::styled(" (default)", theme::success_style()));
+            }
+            ListItem::new(line)
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(editor.iface_selected));
@@ -1167,22 +1308,26 @@ fn draw_string_list(
     focused: bool,
 ) {
     let items: Vec<ListItem> = if entries.is_empty() {
-        vec![ListItem::new("(none)")]
+        vec![ListItem::new(Span::styled(
+            "(none — press a to add)",
+            theme::dim_style(),
+        ))]
     } else {
         entries
             .iter()
             .map(|entry| ListItem::new(entry.clone()))
             .collect()
     };
+    let title = format!("{title} ({})", entries.len());
     // The focused pane gets a colored border so Tab focus is visible at a
     // glance, not just a bold weight some terminals barely render.
     let block = if focused {
         Block::bordered()
-            .title(title.to_string())
-            .border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .title_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .title(title)
+            .border_style(Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+            .title_style(Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
     } else {
-        Block::bordered().title(title.to_string())
+        Block::bordered().title(title)
     };
     let mut state = ListState::default().with_selected(if entries.is_empty() {
         None
@@ -1327,6 +1472,22 @@ fn draw_presets(frame: &mut Frame, editor: &Editor, area: Rect) {
 }
 
 fn draw_review(frame: &mut Frame, editor: &Editor, area: Rect) {
+    let lines = review_lines(editor);
+    let title = if lines.len() > usize::from(area.height.saturating_sub(2)) {
+        "Review & save (↑↓ to scroll)"
+    } else {
+        "Review & save"
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: false })
+            .scroll((editor.review_scroll, 0)),
+        area,
+    );
+}
+
+fn review_lines(editor: &Editor) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let global_state = if editor.global_dirty() {
         "modified"
@@ -1362,14 +1523,20 @@ fn draw_review(frame: &mut Frame, editor: &Editor, area: Rect) {
     }
     match editor.global.to_toml() {
         Ok(toml) if editor.global_dirty() => {
-            lines.push(Line::from("--- global after save ---"));
+            lines.push(Line::styled(
+                "--- global after save ---",
+                theme::key_style(),
+            ));
             lines.extend(toml.lines().map(|line| Line::from(line.to_string())));
         }
         _ => {}
     }
     match editor.project.to_toml() {
         Ok(toml) if editor.project_dirty() => {
-            lines.push(Line::from("--- project after save ---"));
+            lines.push(Line::styled(
+                "--- project after save ---",
+                theme::key_style(),
+            ));
             lines.extend(toml.lines().map(|line| Line::from(line.to_string())));
         }
         _ => {}
@@ -1377,12 +1544,7 @@ fn draw_review(frame: &mut Frame, editor: &Editor, area: Rect) {
     if !editor.dirty() {
         lines.push(Line::from("no pending changes"));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title("Review & save"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
 }
 
 fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
@@ -1417,13 +1579,17 @@ fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
     };
     let mut lines = vec![Line::from(format!("> {}", input.buffer))];
     if let Some(error) = &input.error {
-        lines.push(Line::from(format!("✗ {error}")));
+        lines.push(Line::styled(format!("✗ {error}"), theme::error_style()));
     }
     if let Some(hint) = &input.hint {
-        lines.push(Line::from(hint.clone()));
+        lines.push(Line::styled(hint.clone(), theme::dim_style()));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title)),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(theme::ACCENT)),
+        ),
         area,
     );
     let cursor_x = area.x + 3 + input.cursor as u16;
@@ -1431,8 +1597,27 @@ fn draw_input_overlay(frame: &mut Frame, input: &InputState, body: Rect) {
 }
 
 fn draw_help_overlay(frame: &mut Frame, body: Rect) {
-    let width = body.width.saturating_sub(8).min(64);
-    let height = body.height.saturating_sub(2).min(14);
+    let entries = [
+        "s            switch scope (global config vs project .lianyaohu.toml)",
+        "Tab / ← →    switch pane on list screens (h/l work too)",
+        "a / e / d    add / edit / delete an entry",
+        "u            undo the last delete",
+        "Space        toggle checkbox (narrow-home, presets)",
+        "m            toggle network default allow/deny",
+        "p            set/clear the proxy (HTTP(S)_PROXY/ALL_PROXY env vars);",
+        "             combine with default DENY for proxy-or-nothing",
+        "Ctrl-S       jump to Review & save (↑↓ scrolls the preview)",
+        "Esc / q      back; on Home: quit (asks when unsaved)",
+        "",
+        "In inputs: Tab completes paths, Ctrl-A/E jump to start/end,",
+        "Ctrl-U clears to start, Ctrl-W deletes the previous word.",
+        "",
+        "Widening entries saved to a project file are trust-pinned",
+        "automatically; other users still get a prompt on first launch.",
+        "any key closes this help",
+    ];
+    let width = body.width.saturating_sub(8).min(70);
+    let height = body.height.min(entries.len() as u16 + 2);
     let area = Rect {
         x: body.x + (body.width - width) / 2,
         y: body.y + (body.height - height) / 2,
@@ -1440,25 +1625,7 @@ fn draw_help_overlay(frame: &mut Frame, body: Rect) {
         height,
     };
     frame.render_widget(Clear, area);
-    let lines: Vec<Line> = [
-        "s          switch scope (global config vs project .lianyaohu.toml)",
-        "Tab        switch pane on list screens; complete paths in inputs",
-        "a / e / d  add / edit / delete an entry",
-        "u          undo the last delete",
-        "Space      toggle checkbox (narrow-home, presets)",
-        "m          toggle network default allow/deny",
-        "p          set/clear the proxy (HTTP(S)_PROXY/ALL_PROXY env vars);",
-        "           combine with default DENY for proxy-or-nothing",
-        "Ctrl-S     jump to Review & save",
-        "Esc / q    back; on Home: quit (asks when unsaved)",
-        "",
-        "Widening entries saved to a project file are trust-pinned",
-        "automatically; other users still get a prompt on first launch.",
-        "any key closes this help",
-    ]
-    .into_iter()
-    .map(Line::from)
-    .collect();
+    let lines: Vec<Line> = entries.into_iter().map(Line::from).collect();
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title("Help")),
         area,
@@ -1508,6 +1675,7 @@ pub fn run_config_editor(home: &str, xdg: Option<&str>, cwd: &Path) -> Result<()
         preset_selected: 0,
         input: None,
         status: None,
+        review_scroll: 0,
         help: false,
         confirm_quit: false,
         undo: None,
@@ -1585,6 +1753,7 @@ mod tests {
             preset_selected: 0,
             input: None,
             status: None,
+            review_scroll: 0,
             help: false,
             confirm_quit: false,
             undo: None,
@@ -1635,7 +1804,8 @@ mod tests {
         let mut editor = test_editor();
         editor.global.paths.narrow_home = Some(true);
         assert!(matches!(editor.update(press(KeyCode::Esc)), Step::Redraw));
-        assert!(editor.status.as_deref().unwrap_or("").contains("unsaved"));
+        assert!(editor.status_text().unwrap_or("").contains("unsaved"));
+        assert_eq!(editor.status.as_ref().unwrap().0, StatusKind::Warn);
         assert!(matches!(editor.update(press(KeyCode::Esc)), Step::Quit));
 
         // A clean editor quits immediately.
@@ -1783,7 +1953,8 @@ mod tests {
 
         editor.screen = Screen::Review;
         editor.update(press(KeyCode::Enter));
-        assert_eq!(editor.status.as_deref(), Some("saved: global + project"));
+        assert_eq!(editor.status_text(), Some("saved: global + project"));
+        assert_eq!(editor.status.as_ref().unwrap().0, StatusKind::Success);
         assert!(!editor.dirty());
 
         let saved_global = ConfigFile::load(&editor.global_path).unwrap().unwrap();
@@ -1844,7 +2015,7 @@ mod tests {
         }
         editor.update(press(KeyCode::Enter));
         assert!(editor.global.env.is_empty());
-        assert_eq!(editor.status.as_deref(), Some("proxy cleared"));
+        assert_eq!(editor.status_text(), Some("proxy cleared"));
     }
 
     #[test]
@@ -1871,7 +2042,7 @@ mod tests {
         editor.update(press(KeyCode::Char('2'))); // Network screen
         editor.update(press(KeyCode::Char('d')));
         assert_eq!(editor.global.network.allow, ["9.9.9.9"]);
-        assert!(editor.status.as_deref().unwrap().contains("u to undo"));
+        assert!(editor.status_text().unwrap().contains("u to undo"));
 
         // Even after switching scope, undo restores into the ORIGINAL scope.
         editor.update(press(KeyCode::Char('s')));
@@ -1944,9 +2115,11 @@ mod tests {
         terminal.draw(|frame| draw(frame, &editor)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        let cyan_cells: Vec<(u16, u16)> = (0..buffer.area.height)
+        // Scan only the body rows: the title and keybar carry accent-colored
+        // spans of their own by design.
+        let cyan_cells: Vec<(u16, u16)> = (1..buffer.area.height - 2)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| buffer[(x, y)].style().fg == Some(Color::Cyan))
+            .filter(|&(x, y)| buffer[(x, y)].style().fg == Some(theme::ACCENT))
             .collect();
         assert!(
             !cyan_cells.is_empty(),
@@ -2020,5 +2193,112 @@ mod tests {
         let rendered = render(&editor);
         assert!(rendered.contains("Add allow rule"));
         assert!(rendered.contains("✗ invalid"));
+    }
+
+    #[test]
+    fn input_line_editing_shortcuts() {
+        let ctrl = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        let mut editor = test_editor();
+        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('a')));
+        type_text(&mut editor, "~/models/llama");
+
+        // Ctrl-W trims one path component at a time.
+        editor.update(ctrl('w'));
+        assert_eq!(editor.input.as_ref().unwrap().buffer, "~/models/");
+        editor.update(ctrl('w'));
+        assert_eq!(editor.input.as_ref().unwrap().buffer, "~/");
+
+        // Ctrl-A / Ctrl-E and Home / End move the cursor to the extremes.
+        type_text(&mut editor, "data");
+        editor.update(ctrl('a'));
+        assert_eq!(editor.input.as_ref().unwrap().cursor, 0);
+        editor.update(ctrl('e'));
+        assert_eq!(editor.input.as_ref().unwrap().cursor, "~/data".len());
+        editor.update(press(KeyCode::Home));
+        assert_eq!(editor.input.as_ref().unwrap().cursor, 0);
+        editor.update(press(KeyCode::End));
+        assert_eq!(editor.input.as_ref().unwrap().cursor, "~/data".len());
+
+        // Ctrl-U kills everything before the cursor.
+        editor.update(ctrl('u'));
+        assert_eq!(editor.input.as_ref().unwrap().buffer, "");
+        assert_eq!(editor.input.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn arrow_keys_and_hl_switch_panes() {
+        let mut editor = test_editor();
+        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Right));
+        assert_eq!(editor.net_pane, 1);
+        editor.update(press(KeyCode::Char('l')));
+        assert_eq!(editor.net_pane, 2);
+        editor.update(press(KeyCode::Char('h')));
+        assert_eq!(editor.net_pane, 1);
+        editor.update(press(KeyCode::Left));
+        assert_eq!(editor.net_pane, 0);
+
+        editor.update(press(KeyCode::Esc));
+        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Right));
+        assert_eq!(editor.path_pane, 1);
+        editor.update(press(KeyCode::Char('h')));
+        assert_eq!(editor.path_pane, 0);
+    }
+
+    #[test]
+    fn review_scrolls_and_clamps() {
+        let mut editor = test_editor();
+        // Enough entries that the preview has plenty of lines to scroll.
+        editor.global.network.allow = (0..30).map(|index| format!("10.0.0.{index}")).collect();
+        editor.update(press(KeyCode::Char('5'))); // Review screen
+        assert_eq!(editor.review_scroll, 0);
+
+        editor.update(press(KeyCode::Char('j')));
+        assert_eq!(editor.review_scroll, 1);
+        editor.update(press(KeyCode::PageDown));
+        assert_eq!(editor.review_scroll, 11);
+        editor.update(press(KeyCode::Char('k')));
+        assert_eq!(editor.review_scroll, 10);
+        editor.update(press(KeyCode::PageUp));
+        assert_eq!(editor.review_scroll, 0);
+        editor.update(press(KeyCode::Up));
+        assert_eq!(editor.review_scroll, 0);
+
+        // Scrolling never runs past the last preview line, and re-entering
+        // the screen resets it.
+        let max = editor.max_review_scroll();
+        for _ in 0..500 {
+            editor.update(press(KeyCode::PageDown));
+        }
+        assert_eq!(editor.review_scroll, max);
+        editor.update(press(KeyCode::Esc));
+        editor.update(press(KeyCode::Char('5')));
+        assert_eq!(editor.review_scroll, 0);
+    }
+
+    #[test]
+    fn empty_lists_hint_at_the_add_key() {
+        let mut editor = test_editor();
+        editor.screen = Screen::Paths;
+        let rendered = render(&editor);
+        assert!(rendered.contains("(none — press a to add)"));
+        assert!(rendered.contains("Extra writable (0)"));
+    }
+
+    #[test]
+    fn title_names_the_scope_target_file() {
+        let mut editor = test_editor();
+        let rendered = render(&editor);
+        assert!(rendered.contains("[global]"));
+        assert!(rendered.contains("editing ~/.config/lianyaohu/config.toml"));
+
+        editor.scope = Scope::Project;
+        editor.global.paths.narrow_home = Some(true);
+        let rendered = render(&editor);
+        assert!(rendered.contains("[project]"));
+        assert!(rendered.contains("editing ~/src/repo/.lianyaohu.toml"));
+        assert!(rendered.contains("● unsaved"));
     }
 }
