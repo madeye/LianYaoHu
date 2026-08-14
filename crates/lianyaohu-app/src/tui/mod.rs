@@ -6,6 +6,7 @@
 mod editor;
 pub mod fallback;
 mod quick_pick;
+mod theme;
 
 use std::io::{self, Stdout};
 use std::sync::Once;

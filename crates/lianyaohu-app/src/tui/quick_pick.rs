@@ -11,10 +11,10 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use super::TerminalGuard;
+use super::{TerminalGuard, theme};
 
 const TICK: Duration = Duration::from_millis(500);
 const VIEW_HEIGHT: u16 = 10;
@@ -117,13 +117,19 @@ impl Model {
         super::interface_detail_lines(self.selected_interface(), self.default_route.as_deref())
     }
 
-    fn keybar(&self) -> String {
-        let save = if self.save {
-            "[s] save as default: ON"
+    fn keybar(&self) -> Line<'static> {
+        let mut line = theme::keybar_line(&[("↑↓", "select"), ("Enter", "confirm")]);
+        line.push_span(Span::styled(" · ", theme::dim_style()));
+        line.push_span(Span::styled("s", theme::key_style()));
+        if self.save {
+            line.push_span(Span::styled(" save as default: ON", theme::success_style()));
         } else {
-            "[s] save as default: off"
-        };
-        format!("↑↓ select · Enter confirm · {save} · q cancel")
+            line.push_span(Span::styled(" save as default: off", theme::dim_style()));
+        }
+        line.push_span(Span::styled(" · ", theme::dim_style()));
+        line.push_span(Span::styled("q", theme::key_style()));
+        line.push_span(Span::styled(" cancel", theme::dim_style()));
+        line
     }
 }
 
@@ -139,7 +145,13 @@ fn draw(frame: &mut Frame, model: &Model) {
             .areas(body_area);
 
     frame.render_widget(
-        Paragraph::new("Select VPN interface").style(Style::new().add_modifier(Modifier::BOLD)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Select VPN interface",
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  (1-9 picks instantly)", theme::dim_style()),
+        ])),
         title_area,
     );
 
@@ -148,12 +160,11 @@ fn draw(frame: &mut Frame, model: &Model) {
         .iter()
         .enumerate()
         .map(|(offset, interface)| {
-            let state = if interface.is_up() && interface.is_running() {
-                "up"
-            } else {
-                "down"
-            };
-            ListItem::new(format!("{}. {} [{state}]", offset + 1, interface.name))
+            let up = interface.is_up() && interface.is_running();
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{}. {} ", offset + 1, interface.name)),
+                theme::state_span(up),
+            ]))
         })
         .collect();
     let mut list_state = ListState::default().with_selected(Some(model.selected));
