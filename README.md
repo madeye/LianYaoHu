@@ -108,7 +108,10 @@ interactive launch.
 While attached, `Ctrl-g` enters a zellij-style command mode: `d` detaches,
 `w` opens the session manager, `n` / `p` switch between running sessions
 without dropping to the shell, `g` sends a literal `Ctrl-g` to the agent,
-and any other key (or `Ctrl-g` again) cancels back to passthrough. On
+and any other key (or `Ctrl-g` again) cancels back to passthrough. Keys
+are recognized in both the legacy encoding and the kitty keyboard
+protocol's, so the shortcuts keep working in terminals like Ghostty or
+kitty while an agent has the enhanced keyboard protocol enabled. On
 attach the recent output is replayed and a resize nudge makes full-screen
 agents repaint. Session sockets live under
 `~/.local/state/lianyaohu/sessions` (owner-only), one small daemon per

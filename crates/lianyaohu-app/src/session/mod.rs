@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use lianyaohu_core::{Result, err};
 use serde::{Deserialize, Serialize};
 
-/// The command-mode toggle key: `Ctrl-g`, zellij-style.
+/// The command-mode toggle key: `Ctrl-g`, zellij-style. Also recognized in
+/// its kitty-keyboard-protocol encoding (`ESC [ 103 ; 5 u`), which is what
+/// terminals like Ghostty send once the agent enables that protocol.
 pub const MODE_KEY: u8 = 0x07;
 
 /// Directory holding one `<name>.sock` + `<name>.json` pair per session.
@@ -240,35 +242,200 @@ pub enum KeyAction {
     OpenPicker,
 }
 
+const ESC: u8 = 0x1b;
+
+/// Longest escape sequence the parser buffers before treating the bytes as
+/// ordinary input; real key events are far shorter.
+const MAX_SEQ: usize = 32;
+
+/// A decoded kitty-keyboard-protocol `CSI ... u` key event, the encoding
+/// terminals such as Ghostty and kitty switch to once the attached agent
+/// enables the enhanced keyboard protocol. In that mode `Ctrl-g` arrives as
+/// `ESC [ 103 ; 5 u`, never as the legacy `0x07` byte.
+enum CsiKey {
+    /// `Ctrl-g` (with at most lock modifiers on top).
+    ModeKey { press: bool },
+    /// An unmodified ASCII key press/repeat.
+    Letter(u8),
+    /// A key release event (event type 3).
+    Release,
+    /// A modifier key's own press event (Shift, Ctrl, ...).
+    Modifier,
+    /// Some other complete escape sequence, `CSI u` or not.
+    Other,
+}
+
 /// Zellij-style modal keys across reads: `Ctrl-g` enters command mode, where
 /// `d` detaches, `n`/`p` switch sessions, `w` opens the session picker, and
 /// `g` sends a literal `Ctrl-g` to the agent. `Esc`, `Ctrl-g`, or any other
 /// key leaves command mode — the client draws no mode indicator over the
 /// agent's screen, so a sticky mode would silently swallow typed text.
+///
+/// Keys are recognized in both encodings: legacy bytes, and the kitty
+/// keyboard protocol's `CSI u` sequences. Release events and modifier-key
+/// events (which the protocol reports separately) are swallowed inside
+/// command mode instead of cancelling it, so releasing `Ctrl` after
+/// `Ctrl-g` does not knock the user out of the mode.
 #[derive(Default)]
 pub struct ModeParser {
     command_mode: bool,
+    /// Partially received escape sequence, held until it can be classified.
+    seq: Vec<u8>,
+    /// The exact bytes that entered command mode; `g` replays them so the
+    /// literal `Ctrl-g` reaches the agent in the encoding it negotiated.
+    trigger: Vec<u8>,
 }
 
 impl ModeParser {
     pub fn feed(&mut self, byte: u8) -> KeyAction {
-        if !self.command_mode {
-            if byte == MODE_KEY {
-                self.command_mode = true;
-                return KeyAction::Consumed;
-            }
-            return KeyAction::Forward(vec![byte]);
+        if !self.seq.is_empty() {
+            return self.feed_seq(byte);
         }
+        if byte == ESC {
+            self.seq.push(byte);
+            return KeyAction::Consumed;
+        }
+        if self.command_mode {
+            return self.command_key(byte);
+        }
+        if byte == MODE_KEY {
+            self.command_mode = true;
+            self.trigger = vec![MODE_KEY];
+            return KeyAction::Consumed;
+        }
+        KeyAction::Forward(vec![byte])
+    }
+
+    /// Called at the end of each read burst: a still-incomplete escape
+    /// sequence is not going to complete promptly (a bare `Esc` keypress is
+    /// the common case), so stop holding it back.
+    pub fn flush(&mut self) -> KeyAction {
+        if self.seq.is_empty() {
+            return KeyAction::Consumed;
+        }
+        let seq = std::mem::take(&mut self.seq);
+        if self.command_mode {
+            self.command_mode = false;
+            return KeyAction::Consumed;
+        }
+        KeyAction::Forward(seq)
+    }
+
+    fn command_key(&mut self, byte: u8) -> KeyAction {
         self.command_mode = false;
         match byte {
             b'd' => KeyAction::Detach,
             b'n' => KeyAction::SwitchNext,
             b'p' => KeyAction::SwitchPrev,
             b'w' => KeyAction::OpenPicker,
-            b'g' => KeyAction::Forward(vec![MODE_KEY]),
+            b'g' => KeyAction::Forward(self.trigger.clone()),
             _ => KeyAction::Consumed,
         }
     }
+
+    fn feed_seq(&mut self, byte: u8) -> KeyAction {
+        self.seq.push(byte);
+        if self.seq.len() == 2 {
+            if byte == b'[' {
+                return KeyAction::Consumed;
+            }
+            // `Esc` followed by an ordinary key (alt-key chord, or a bare
+            // escape that a fast typist ran into): not a CSI sequence.
+            return self.finish_non_csi();
+        }
+        if (0x40..=0x7e).contains(&byte) {
+            return self.finish_csi();
+        }
+        if (0x20..=0x3f).contains(&byte) && self.seq.len() < MAX_SEQ {
+            return KeyAction::Consumed;
+        }
+        self.finish_non_csi()
+    }
+
+    fn finish_non_csi(&mut self) -> KeyAction {
+        let seq = std::mem::take(&mut self.seq);
+        if self.command_mode {
+            self.command_mode = false;
+            return KeyAction::Consumed;
+        }
+        KeyAction::Forward(seq)
+    }
+
+    fn finish_csi(&mut self) -> KeyAction {
+        let seq = std::mem::take(&mut self.seq);
+        let key = parse_csi_u(&seq);
+        if self.command_mode {
+            return match key {
+                // Releases and modifier presses are protocol noise while the
+                // mode is armed; anything else acts or cancels.
+                CsiKey::Release | CsiKey::Modifier => KeyAction::Consumed,
+                CsiKey::ModeKey { press: true } => {
+                    self.command_mode = false;
+                    KeyAction::Consumed
+                }
+                CsiKey::ModeKey { press: false } => KeyAction::Consumed,
+                CsiKey::Letter(byte) => self.command_key(byte),
+                CsiKey::Other => {
+                    self.command_mode = false;
+                    KeyAction::Consumed
+                }
+            };
+        }
+        match key {
+            CsiKey::ModeKey { press: true } => {
+                self.command_mode = true;
+                self.trigger = seq;
+                KeyAction::Consumed
+            }
+            // Held-key repeats of the toggle must not re-toggle.
+            CsiKey::ModeKey { press: false } => KeyAction::Consumed,
+            _ => KeyAction::Forward(seq),
+        }
+    }
+}
+
+/// Decodes a complete `ESC [ ... <final>` sequence as a kitty `CSI u` key
+/// event: `keycode[:alternates] [; modifiers[:event] [; text]] u`, with
+/// modifiers encoded as value − 1 (Ctrl = 4, Caps/Num Lock = 64/128) and
+/// event types press/repeat/release = 1/2/3.
+fn parse_csi_u(seq: &[u8]) -> CsiKey {
+    if seq.last() != Some(&b'u') || seq.len() < 4 {
+        return CsiKey::Other;
+    }
+    let body = &seq[2..seq.len() - 1];
+    let mut sections = body.split(|byte| *byte == b';');
+    let mut key_fields = sections.next().unwrap_or_default().split(|b| *b == b':');
+    let Some(code) = parse_number(key_fields.next().unwrap_or_default()) else {
+        return CsiKey::Other;
+    };
+    let mut mod_fields = sections.next().unwrap_or_default().split(|b| *b == b':');
+    let modifiers = parse_number(mod_fields.next().unwrap_or_default())
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let event = parse_number(mod_fields.next().unwrap_or_default()).unwrap_or(1);
+
+    if event == 3 {
+        return CsiKey::Release;
+    }
+    // Kitty functional codepoints for the modifier keys themselves.
+    if (57441..=57454).contains(&code) {
+        return CsiKey::Modifier;
+    }
+    let without_locks = modifiers & !(64 | 128);
+    if code == u32::from(b'g') && without_locks == 4 {
+        return CsiKey::ModeKey { press: event == 1 };
+    }
+    if code < 128 && without_locks == 0 {
+        return CsiKey::Letter(code as u8);
+    }
+    CsiKey::Other
+}
+
+fn parse_number(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -298,6 +465,79 @@ mod tests {
         assert_eq!(parser.feed(MODE_KEY), KeyAction::Consumed);
         assert_eq!(parser.feed(b'x'), KeyAction::Consumed);
         assert_eq!(parser.feed(b'x'), KeyAction::Forward(vec![b'x']));
+    }
+
+    /// Feeds bytes and returns the non-`Consumed` actions in order.
+    fn feed_all(parser: &mut ModeParser, bytes: &[u8]) -> Vec<KeyAction> {
+        bytes
+            .iter()
+            .map(|byte| parser.feed(*byte))
+            .filter(|action| *action != KeyAction::Consumed)
+            .collect()
+    }
+
+    #[test]
+    fn mode_parser_handles_kitty_protocol_encoding() {
+        // Ctrl-g as CSI u (what Ghostty sends under the kitty keyboard
+        // protocol) enters command mode; a legacy `d` then detaches.
+        let mut parser = ModeParser::default();
+        assert!(feed_all(&mut parser, b"\x1b[103;5u").is_empty());
+        assert_eq!(parser.feed(b'd'), KeyAction::Detach);
+
+        // With explicit event types: press enters; the key's own release and
+        // the Ctrl release are swallowed without cancelling; `w` then acts.
+        assert!(feed_all(&mut parser, b"\x1b[103;5:1u").is_empty());
+        assert!(feed_all(&mut parser, b"\x1b[103;1:3u").is_empty());
+        assert!(feed_all(&mut parser, b"\x1b[57442;1:3u").is_empty());
+        assert_eq!(parser.feed(b'w'), KeyAction::OpenPicker);
+
+        // Command keys may themselves arrive CSI-u encoded.
+        assert!(feed_all(&mut parser, b"\x1b[103;5u").is_empty());
+        assert_eq!(feed_all(&mut parser, b"\x1b[110u"), [KeyAction::SwitchNext]);
+
+        // `g` replays the exact bytes that entered command mode, so the
+        // agent receives the literal Ctrl-g in the encoding it negotiated.
+        assert!(feed_all(&mut parser, b"\x1b[103;5u").is_empty());
+        assert_eq!(
+            parser.feed(b'g'),
+            KeyAction::Forward(b"\x1b[103;5u".to_vec())
+        );
+
+        // An unknown CSI-u press inside command mode cancels it.
+        assert!(feed_all(&mut parser, b"\x1b[103;5u").is_empty());
+        assert!(feed_all(&mut parser, b"\x1b[97u").is_empty());
+        assert_eq!(parser.feed(b'd'), KeyAction::Forward(vec![b'd']));
+
+        // A held toggle repeats (event 2) without re-toggling the mode.
+        assert!(feed_all(&mut parser, b"\x1b[103;5:1u").is_empty());
+        assert!(feed_all(&mut parser, b"\x1b[103;5:2u").is_empty());
+        assert_eq!(parser.feed(b'p'), KeyAction::SwitchPrev);
+    }
+
+    #[test]
+    fn mode_parser_forwards_unrelated_sequences_untouched() {
+        let mut parser = ModeParser::default();
+        // Other CSI-u keys (Ctrl-a) and non-u sequences (arrow key, SGR
+        // mouse) pass through byte-for-byte.
+        for seq in [
+            b"\x1b[97;5u".as_slice(),
+            b"\x1b[A".as_slice(),
+            b"\x1b[<0;33;22M".as_slice(),
+        ] {
+            assert_eq!(
+                feed_all(&mut parser, seq),
+                [KeyAction::Forward(seq.to_vec())]
+            );
+        }
+        // Alt-chords come out as Esc plus the key.
+        assert_eq!(
+            feed_all(&mut parser, b"\x1bx"),
+            [KeyAction::Forward(b"\x1bx".to_vec())]
+        );
+        // A bare Esc is held until the burst ends, then flushed unchanged.
+        assert_eq!(parser.feed(0x1b), KeyAction::Consumed);
+        assert_eq!(parser.flush(), KeyAction::Forward(vec![0x1b]));
+        assert_eq!(parser.flush(), KeyAction::Consumed);
     }
 
     #[test]
