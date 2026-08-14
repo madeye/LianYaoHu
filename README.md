@@ -92,17 +92,27 @@ closing the terminal:
 lyh run -- claude              # start a session (named after the directory) and attach
 lyh run --name api -- codex    # explicit name
 lyh run --detached -- claude   # start without attaching
-lyh ls                         # list running sessions
+lyh sessions                   # interactive session manager (list, attach, kill, new)
+lyh ls                         # plain session table, for scripts
 lyh attach api                 # reattach (no name: most recent session)
 lyh kill api                   # terminate a session's agent
 ```
 
-While attached, `Ctrl-\ d` detaches, `Ctrl-\ n` / `Ctrl-\ p` switch between
-running sessions without dropping to the shell, and `Ctrl-\ Ctrl-\` sends a
-literal `Ctrl-\` to the agent. On attach the recent output is replayed and a
-resize nudge makes full-screen agents repaint. Session sockets live under
-`~/.local/state/lianyaohu/sessions` (owner-only), one small daemon per
-session; per-session logs sit next to the sockets.
+`lyh sessions` opens an inline manager showing every session with its
+activity — `[working]` while the agent produced output in the last five
+seconds, `[idle]` at a prompt, plus an `attached` marker — along with
+uptime, VPN interface, and command. `Enter` (or `1`-`9`) attaches, `x`
+kills after confirmation, and `n` starts a new session through the usual
+interactive launch.
+
+While attached, the tmux-style `Ctrl-b` prefix drives everything:
+`Ctrl-b d` detaches, `Ctrl-b w` opens the session manager, `Ctrl-b n` /
+`Ctrl-b p` switch between running sessions without dropping to the shell,
+and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b` to the agent. On attach the
+recent output is replayed and a resize nudge makes full-screen agents
+repaint. Session sockets live under `~/.local/state/lianyaohu/sessions`
+(owner-only), one small daemon per session; per-session logs sit next to
+the sockets.
 
 ## Configuration
 
