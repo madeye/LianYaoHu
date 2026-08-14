@@ -1,7 +1,8 @@
 //! The attach side: raw-mode passthrough between the user's terminal and a
-//! session daemon's socket. `Ctrl-\ d` detaches, `Ctrl-\ n` / `Ctrl-\ p`
-//! ask the caller to switch sessions, and window resizes are forwarded so
-//! the agent always renders at the attached terminal's size.
+//! session daemon's socket. `Ctrl-b d` detaches, `Ctrl-b n` / `Ctrl-b p`
+//! ask the caller to switch sessions, `Ctrl-b w` asks for the session
+//! picker, and window resizes are forwarded so the agent always renders at
+//! the attached terminal's size.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -24,6 +25,8 @@ pub enum AttachOutcome {
     SessionClosed,
     SwitchNext,
     SwitchPrev,
+    /// Detached toward the interactive session picker.
+    OpenPicker,
 }
 
 /// Restores the caller's termios on drop — the terminal is handed back to
@@ -99,7 +102,7 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    println!("[lyh] attached to {name} — Ctrl-\\ d detach · Ctrl-\\ n/p switch session");
+    println!("[lyh] attached to {name} — Ctrl-b d detach · Ctrl-b w sessions · Ctrl-b n/p switch");
     let raw = RawTerminal::enable()?;
 
     let mut size = terminal_size();
@@ -161,6 +164,10 @@ pub fn attach(socket: &Path, name: &str) -> Result<AttachOutcome> {
                     }
                     KeyAction::SwitchPrev => {
                         command = Some(AttachOutcome::SwitchPrev);
+                        break;
+                    }
+                    KeyAction::OpenPicker => {
+                        command = Some(AttachOutcome::OpenPicker);
                         break;
                     }
                 }

@@ -6,6 +6,7 @@
 mod editor;
 pub mod fallback;
 mod quick_pick;
+mod sessions;
 mod theme;
 
 use std::io::{self, Stdout};
@@ -23,6 +24,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 pub use editor::run_config_editor;
 pub use quick_pick::{QuickPickOutcome, quick_pick};
+pub use sessions::{SessionManagerOutcome, session_manager};
 
 pub fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 }

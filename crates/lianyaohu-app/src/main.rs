@@ -498,7 +498,11 @@ fn run_session_cli(args: &[String]) -> Result<i32> {
     let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
     let dir = session::sessions_dir(&home);
     match args[0].as_str() {
-        "ls" | "sessions" => sessions_ls(&dir),
+        "ls" => sessions_ls(&dir),
+        // `sessions` opens the interactive manager where a TTY allows it;
+        // `ls` stays the plain table for scripts either way.
+        "sessions" if tui::stdin_is_tty() => sessions_manager(&dir),
+        "sessions" => sessions_ls(&dir),
         "attach" => sessions_attach(&dir, args.get(1).map(String::as_str)),
         "kill" => sessions_kill(&dir, args.get(1).map(String::as_str)),
         "run" => sessions_run(&dir, &args[1..]),
@@ -548,6 +552,19 @@ fn launch_in_session(
     name: Option<String>,
     detached: bool,
 ) -> Result<i32> {
+    let name = start_session(prepared, dir, name)?;
+    if detached || !tui::stdin_is_tty() {
+        println!("session {name} started; attach with `lyh attach {name}`");
+        return Ok(0);
+    }
+    attach_loop(dir, name)
+}
+
+/// Forks the per-session daemon and returns the session name in the parent;
+/// the daemon branch never returns (it runs the agent and exits). Split from
+/// [`launch_in_session`] so the session picker can start sessions without
+/// immediately attaching.
+fn start_session(prepared: Prepared, dir: &Path, name: Option<String>) -> Result<String> {
     create_private_dir(&dir.to_path_buf())?;
     let name = match name {
         Some(name) => {
@@ -604,11 +621,7 @@ fn launch_in_session(
     let log = session::log_path(dir, &name);
     if !session::daemon::daemonize(&log)? {
         drop(listener);
-        if detached || !tui::stdin_is_tty() {
-            println!("session {name} started; attach with `lyh attach {name}`");
-            return Ok(0);
-        }
-        return attach_loop(dir, name);
+        return Ok(name);
     }
 
     // Daemon from here on: stdio goes to the log file, errors included.
@@ -760,8 +773,9 @@ fn run_session_daemon(
     ))
 }
 
-/// Attach with client-side session switching: `Ctrl-\ n` / `Ctrl-\ p` hop
-/// between live sessions without dropping back to the shell.
+/// Attach with client-side session switching: `Ctrl-b n` / `Ctrl-b p` hop
+/// between live sessions and `Ctrl-b w` opens the picker, all without
+/// dropping back to the shell.
 fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
     loop {
         let socket = session::socket_path(dir, &name);
@@ -780,6 +794,13 @@ fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
                 session::remove_session_files(dir, &name);
                 return Ok(0);
             }
+            session::client::AttachOutcome::OpenPicker => match manager_round(dir)? {
+                Some(next) => name = next,
+                None => {
+                    println!("[lyh] detached from {name}; reattach with `lyh attach {name}`");
+                    return Ok(0);
+                }
+            },
             outcome @ (session::client::AttachOutcome::SwitchNext
             | session::client::AttachOutcome::SwitchPrev) => {
                 let sessions = session::list_sessions(dir)?;
@@ -803,6 +824,45 @@ fn attach_loop(dir: &Path, mut name: String) -> Result<i32> {
                 name = names[target].clone();
             }
         }
+    }
+}
+
+/// `lyh sessions` on a TTY: the interactive manager, then attach to whatever
+/// the user picked (which loops back here via `Ctrl-b w`).
+fn sessions_manager(dir: &Path) -> Result<i32> {
+    match manager_round(dir)? {
+        Some(name) => attach_loop(dir, name),
+        None => Ok(0),
+    }
+}
+
+/// One manager round: runs the picker until it yields a session to attach
+/// (`Some`) or the user quits to the shell (`None`). New-session launches
+/// happen here so their interactive prompts run on the clean terminal, and
+/// launch failures reopen the picker with the error instead of aborting it.
+fn manager_round(dir: &Path) -> Result<Option<String>> {
+    let mut message = None;
+    loop {
+        match tui::session_manager(dir, message.take())? {
+            tui::SessionManagerOutcome::Attach(name) => return Ok(Some(name)),
+            tui::SessionManagerOutcome::NewSession => match new_session_interactive(dir) {
+                Ok(Some(name)) => return Ok(Some(name)),
+                Ok(None) => {}
+                Err(error) => message = Some(format!("launch failed: {error}")),
+            },
+            tui::SessionManagerOutcome::Quit => return Ok(None),
+        }
+    }
+}
+
+/// Starts a session from the picker exactly like a bare `lyh run`: default
+/// options, layered config, and the usual interactive prompts. Returns the
+/// new session's name, or `None` when the user cancelled a prompt.
+fn new_session_interactive(dir: &Path) -> Result<Option<String>> {
+    let options = parse(Vec::new())?;
+    match prepare(&options)? {
+        Prepare::Done(_) => Ok(None),
+        Prepare::Ready(prepared) => start_session(*prepared, dir, None).map(Some),
     }
 }
 
@@ -838,15 +898,20 @@ fn sessions_ls(dir: &Path) -> Result<i32> {
         return Ok(0);
     }
     println!(
-        "{:<20} {:<8} {:<8} {:<8} COMMAND",
-        "NAME", "PID", "VPN", "UPTIME"
+        "{:<20} {:<9} {:<8} {:<8} {:<8} COMMAND",
+        "NAME", "STATUS", "PID", "VPN", "UPTIME"
     );
     let now = unix_now();
     for entry in sessions {
         let uptime = format_uptime(now.saturating_sub(entry.meta.started_at));
+        let status = match session::classify_activity(now, entry.status.as_ref()) {
+            session::Activity::Working => "working",
+            session::Activity::Idle => "idle",
+        };
         println!(
-            "{:<20} {:<8} {:<8} {:<8} {} ({})",
+            "{:<20} {:<9} {:<8} {:<8} {:<8} {} ({})",
             entry.meta.name,
+            status,
             entry.meta.pid,
             entry.meta.vpn_interface,
             uptime,
@@ -1533,18 +1598,21 @@ fn usage(program: &str) -> String {
   {program} [options] [-- agent [args...]]
   {program} run [--name NAME] [--detached] [options] [-- agent [args...]]
   {program} attach [NAME]
-  {program} ls | sessions
+  {program} sessions | ls
   {program} kill NAME
   {program} config [show|path|trust [DIR]|revoke [DIR]]
   {program} helper
 
 subcommands:
   run                         Launch the agent in a background session on its own PTY, then
-                              attach. Detach with Ctrl-\ d; switch sessions with Ctrl-\ n/p;
-                              Ctrl-\ Ctrl-\ sends a literal Ctrl-\. Each session gets its own
-                              sandbox, so several agents can run side by side.
+                              attach. Detach with Ctrl-b d; open the session picker with
+                              Ctrl-b w; switch sessions with Ctrl-b n/p; Ctrl-b Ctrl-b sends
+                              a literal Ctrl-b. Each session gets its own sandbox, so several
+                              agents can run side by side.
   attach [NAME]               Reattach to a session (default: the most recently started).
-  ls                          List running sessions. Alias: sessions.
+  sessions                    Interactive session manager: list with working/idle status,
+                              attach, kill, or start sessions. Falls back to `ls` without a TTY.
+  ls                          List running sessions (plain table).
   kill NAME                   Terminate a session's agent (hangs up its PTY).
   config show                 Print the effective merged configuration with per-key provenance.
   config path                 Print the config file paths (global, and project if found).

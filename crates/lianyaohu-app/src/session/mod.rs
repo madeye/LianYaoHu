@@ -1,8 +1,9 @@
 //! Background agent sessions: each `lyh run` forks a small per-session
 //! daemon that owns a PTY and a Unix socket, dtach-style. Clients attach to
-//! stream the terminal, detach with `Ctrl-\ d`, and switch between live
-//! sessions with `Ctrl-\ n` / `Ctrl-\ p`. One daemon per session keeps every
-//! agent in its own sandbox with no shared multiplexer state.
+//! stream the terminal, detach with `Ctrl-b d`, switch between live sessions
+//! with `Ctrl-b n` / `Ctrl-b p`, and open the session picker with
+//! `Ctrl-b w`. One daemon per session keeps every agent in its own sandbox
+//! with no shared multiplexer state.
 
 pub mod client;
 pub mod daemon;
@@ -15,8 +16,8 @@ use std::path::{Path, PathBuf};
 use lianyaohu_core::{Result, err};
 use serde::{Deserialize, Serialize};
 
-/// The detach/switch prefix key: `Ctrl-\`.
-pub const PREFIX_KEY: u8 = 0x1c;
+/// The detach/switch prefix key: `Ctrl-b`, tmux-style.
+pub const PREFIX_KEY: u8 = 0x02;
 
 /// Directory holding one `<name>.sock` + `<name>.json` pair per session.
 /// Overridable for tests and unusual setups; sockets need short paths.
@@ -235,11 +236,14 @@ pub enum KeyAction {
     Detach,
     SwitchNext,
     SwitchPrev,
+    /// Detach into the interactive session picker.
+    OpenPicker,
 }
 
-/// Tracks the `Ctrl-\` prefix across reads: `Ctrl-\ d` detaches, `n`/`p`
-/// switch sessions, a doubled `Ctrl-\` sends the literal byte, and any other
-/// follow-up key forwards both bytes unchanged.
+/// Tracks the `Ctrl-b` prefix across reads: `Ctrl-b d` detaches, `n`/`p`
+/// switch sessions, `w` opens the session picker, a doubled `Ctrl-b` sends
+/// the literal byte, and any other follow-up key forwards both bytes
+/// unchanged.
 #[derive(Default)]
 pub struct PrefixParser {
     pending: bool,
@@ -253,6 +257,7 @@ impl PrefixParser {
                 b'd' => KeyAction::Detach,
                 b'n' => KeyAction::SwitchNext,
                 b'p' => KeyAction::SwitchPrev,
+                b'w' => KeyAction::OpenPicker,
                 PREFIX_KEY => KeyAction::Forward(vec![PREFIX_KEY]),
                 other => KeyAction::Forward(vec![PREFIX_KEY, other]),
             };
@@ -279,7 +284,9 @@ mod tests {
         assert_eq!(parser.feed(b'n'), KeyAction::SwitchNext);
         assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
         assert_eq!(parser.feed(b'p'), KeyAction::SwitchPrev);
-        // Doubled prefix sends one literal Ctrl-\.
+        assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
+        assert_eq!(parser.feed(b'w'), KeyAction::OpenPicker);
+        // Doubled prefix sends one literal Ctrl-b.
         assert_eq!(parser.feed(PREFIX_KEY), KeyAction::Pending);
         assert_eq!(
             parser.feed(PREFIX_KEY),
