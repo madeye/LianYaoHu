@@ -42,6 +42,10 @@ pub fn log_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.log"))
 }
 
+pub fn status_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.status"))
+}
+
 /// Session names become file names; keep them safe and predictable.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
@@ -119,9 +123,63 @@ impl SessionMeta {
     }
 }
 
+/// A session is shown as working while its last PTY output is at most this
+/// recent: agents stream continuously while running tools, and a few quiet
+/// seconds reliably means they are sitting at a prompt.
+pub const ACTIVITY_WINDOW_SECS: u64 = 5;
+
+/// Live activity exported by the daemon as `<name>.status`, separate from
+/// the launch-time `<name>.json` so it can be rewritten freely without
+/// racing `lyh ls` against the metadata. Absence just means an older daemon.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct SessionStatus {
+    /// Unix time of the last PTY output from the agent.
+    pub last_output_at: u64,
+    /// Currently attached clients.
+    pub clients: u32,
+}
+
+impl SessionStatus {
+    pub fn save(&self, dir: &Path, name: &str) -> Result<()> {
+        let json = serde_json::to_vec(self)?;
+        fs::write(status_path(dir, name), json)?;
+        Ok(())
+    }
+
+    pub fn load(dir: &Path, name: &str) -> Result<Self> {
+        let bytes = fs::read(status_path(dir, name))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Activity {
+    Working,
+    Idle,
+}
+
+/// A missing or unreadable status file classifies as idle rather than
+/// erroring, so listings keep working across daemon version skew.
+pub fn classify_activity(now: u64, status: Option<&SessionStatus>) -> Activity {
+    match status {
+        Some(status) if now.saturating_sub(status.last_output_at) <= ACTIVITY_WINDOW_SECS => {
+            Activity::Working
+        }
+        _ => Activity::Idle,
+    }
+}
+
 /// A live session; attach via `socket_path(dir, &meta.name)`.
 pub struct SessionEntry {
     pub meta: SessionMeta,
+    pub status: Option<SessionStatus>,
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -150,7 +208,10 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionEntry>> {
             continue;
         };
         match SessionMeta::load(dir, name) {
-            Ok(meta) if pid_alive(meta.pid) => entries.push(SessionEntry { meta }),
+            Ok(meta) if pid_alive(meta.pid) => {
+                let status = SessionStatus::load(dir, name).ok();
+                entries.push(SessionEntry { meta, status });
+            }
             _ => remove_session_files(dir, name),
         }
     }
@@ -161,6 +222,7 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionEntry>> {
 pub fn remove_session_files(dir: &Path, name: &str) {
     let _ = fs::remove_file(socket_path(dir, name));
     let _ = fs::remove_file(meta_path(dir, name));
+    let _ = fs::remove_file(status_path(dir, name));
 }
 
 /// What a prefixed keystroke asks the client to do.
@@ -252,6 +314,37 @@ mod tests {
         assert_eq!(unique_name(&dir, "demo"), "demo-2");
         fs::write(socket_path(&dir, "demo-2"), b"").unwrap();
         assert_eq!(unique_name(&dir, "demo"), "demo-3");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_round_trips_and_classifies_activity() {
+        let dir = std::env::temp_dir().join(format!("lyh-session-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let status = SessionStatus {
+            last_output_at: 1000,
+            clients: 2,
+        };
+        status.save(&dir, "demo").unwrap();
+        let loaded = SessionStatus::load(&dir, "demo").unwrap();
+        assert_eq!(loaded.last_output_at, 1000);
+        assert_eq!(loaded.clients, 2);
+
+        // Working within the window (inclusive), idle beyond it or unknown.
+        assert_eq!(classify_activity(1000, Some(&loaded)), Activity::Working);
+        assert_eq!(
+            classify_activity(1000 + ACTIVITY_WINDOW_SECS, Some(&loaded)),
+            Activity::Working
+        );
+        assert_eq!(
+            classify_activity(1000 + ACTIVITY_WINDOW_SECS + 1, Some(&loaded)),
+            Activity::Idle
+        );
+        assert_eq!(classify_activity(1000, None), Activity::Idle);
+        // A clock that ran backwards still reads as working, not a panic.
+        assert_eq!(classify_activity(999, Some(&loaded)), Activity::Working);
+
         fs::remove_dir_all(&dir).ok();
     }
 
