@@ -216,10 +216,14 @@ pub fn parse_request(line: &str) -> Result<HelperRequest> {
         let (interface_name, spec_path) = rest
             .split_once(' ')
             .ok_or_else(|| err("invalid helper run request"))?;
+        // A relative spec path would resolve against the root daemon's own
+        // working directory — never meaningful for a client, so refuse it at
+        // parse time.
         if interface_name.is_empty()
             || interface_name.contains(char::is_whitespace)
             || spec_path.is_empty()
             || spec_path.contains(char::is_whitespace)
+            || !spec_path.starts_with('/')
         {
             return Err(err("invalid helper run request"));
         }
@@ -415,6 +419,9 @@ mod tests {
         );
         assert!(parse_request("install en0").is_ok());
         assert!(parse_request("run utun5 /tmp/has space.json").is_err());
+        // Relative spec paths would resolve against the root daemon's cwd.
+        assert!(parse_request("run utun5 relative/spec.json").is_err());
+        assert!(parse_request("run utun5 spec.json").is_err());
     }
 
     // Regression test for silent policy widening: an `install` carrying a

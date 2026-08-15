@@ -124,9 +124,17 @@ drop.
 
 The helper treats the client-supplied launch spec as untrusted, since any
 local user can connect to its socket. The spec file named in the request is
-itself opened defensively: symlinks are refused, it must be a regular file
-owned by the authenticated peer, and the read is size- and deadline-bounded
-so a FIFO or hostile filesystem cannot pin a helper worker. It rebuilds the sandbox profile
+itself opened defensively: the path must be absolute, symlinks are refused,
+it must be a regular file owned by the authenticated peer, and the read is
+size-bounded. Both the open and the read run on a dedicated reader thread
+under a deadline, so a hostile filesystem (a FUSE or network mount that
+stalls in `open()` or `read()`) cannot pin a helper worker. A reader stalled
+past its deadline is abandoned holding only its thread and file descriptor;
+the helper caps how many abandoned readers may be outstanding and refuses new
+spec reads until they drain, so the leak is bounded rather than cumulative.
+Every spec-file rejection reaches the client as one generic message, so the
+root daemon cannot be used as an existence or ownership oracle for paths the
+caller cannot traverse. It rebuilds the sandbox profile
 server-side from inputs it validates itself — the home directory from the
 passwd database for the authenticated peer UID, and a working directory and
 temporary directory that must be real directories (the temporary directory
