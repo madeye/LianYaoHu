@@ -561,6 +561,85 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// First uid the OS assigns to regular user accounts. Passwd entries below it
+/// (other than root) are service accounts whose pw_dir points at shared
+/// system directories (`/var/empty`, `/var/www`, `/bin`), not private homes.
+#[cfg(target_os = "macos")]
+const FIRST_REGULAR_UID: u32 = 500;
+#[cfg(not(target_os = "macos"))]
+const FIRST_REGULAR_UID: u32 = 1000;
+
+/// Directories that are — or contain — user home directories: the standard
+/// platform home roots, root's home, plus every regular user's passwd home
+/// (NFS `/export/home/...`, systemd-homed, and other nonstandard layouts).
+/// Each root is listed both as written and canonicalized, so a symlinked
+/// `/home` or macOS's `/var/root` -> `/private/var/root` cannot dodge the
+/// prefix check; the APFS firmlink alias of `/Users` is covered explicitly
+/// because canonicalization does not resolve firmlinks.
+fn home_directory_roots() -> Vec<String> {
+    let statics = [
+        "/Users",
+        "/home",
+        "/root",
+        "/var/root",
+        "/System/Volumes/Data/Users",
+    ];
+    let mut roots = Vec::new();
+    for root in statics
+        .iter()
+        .map(ToString::to_string)
+        .chain(passwd_home_directories())
+    {
+        if let Ok(canonical) = Path::new(&root).canonicalize()
+            && let Some(canonical) = canonical.to_str()
+        {
+            push_home_root(&mut roots, canonical.to_string());
+        }
+        push_home_root(&mut roots, root);
+    }
+    roots
+}
+
+fn push_home_root(roots: &mut Vec<String>, root: String) {
+    if root.starts_with('/') && root != "/" && !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
+/// pw_dir of root and every regular user from the full passwd enumeration.
+/// getpwent walks shared static state, so enumeration is serialized.
+fn passwd_home_directories() -> Vec<String> {
+    static PASSWD_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PASSWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut homes = Vec::new();
+    unsafe {
+        libc::setpwent();
+        loop {
+            let entry = libc::getpwent();
+            if entry.is_null() {
+                break;
+            }
+            let uid = (*entry).pw_uid;
+            if (uid != 0 && uid < FIRST_REGULAR_UID) || (*entry).pw_dir.is_null() {
+                continue;
+            }
+            if let Ok(dir) = CStr::from_ptr((*entry).pw_dir).to_str() {
+                homes.push(dir.to_string());
+            }
+        }
+        libc::endpwent();
+    }
+    homes
+}
+
+/// True when `canonical` reaches into a home-directory tree that is not the
+/// caller's own.
+fn inside_foreign_home(canonical: &str, caller_home: &str, home_roots: &[String]) -> bool {
+    home_roots
+        .iter()
+        .any(|root| path_has_prefix(canonical, root) && !path_has_prefix(canonical, caller_home))
+}
+
 /// Re-validates a client-supplied sandbox policy. The network policy and path
 /// tightenings (deny entries, narrow-home state dirs) only need grammar and
 /// containment checks — worst case the client restricts itself. Widenings are
@@ -593,17 +672,16 @@ fn validate_policy(
         writable.push(canonical);
     }
 
+    let home_roots = home_directory_roots();
     let mut read_only = Vec::new();
     for entry in &policy.paths.read_only {
         let canonical = validated_directory("extra read-only path", Path::new(entry), None)?;
         // Reading other users' homes is exactly what the sandbox exists to
         // prevent; a read-only grant must not reopen it.
-        for home_root in ["/Users", "/home"] {
-            if path_has_prefix(&canonical, home_root) && !path_has_prefix(&canonical, caller_home) {
-                return Err(err(format!(
-                    "extra read-only path {canonical} is inside another user's home directory"
-                )));
-            }
+        if inside_foreign_home(&canonical, caller_home, &home_roots) {
+            return Err(err(format!(
+                "extra read-only path {canonical} is inside another user's home directory"
+            )));
         }
         read_only.push(canonical);
     }
@@ -1756,6 +1834,18 @@ mod tests {
         policy.paths.read_only = vec![other_home.to_string()];
         assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
 
+        // Homes outside /Users and /home are covered too: root's home lives
+        // at /var/root (macOS) or /root (Linux).
+        let root_home = if cfg!(target_os = "macos") {
+            "/var/root"
+        } else {
+            "/root"
+        };
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![root_home.to_string()];
+        let error = validate_policy(Some(&policy), uid, &caller_home).unwrap_err();
+        assert!(error.to_string().contains("another user's home"), "{error}");
+
         // Absolute agent_state_dirs entries never pass.
         let mut policy = SandboxPolicy::default();
         policy.paths.agent_state_dirs = vec!["/absolute".to_string()];
@@ -1767,6 +1857,63 @@ mod tests {
             .map(|i| format!("/deny/{i}"))
             .collect();
         assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+    }
+
+    #[test]
+    fn home_directory_roots_cover_platform_roots_and_passwd_homes() {
+        let roots = home_directory_roots();
+
+        // Never "/" (which would reject every path) and always absolute.
+        assert!(
+            roots
+                .iter()
+                .all(|root| root.starts_with('/') && root.as_str() != "/")
+        );
+        for expected in ["/Users", "/home", "/root", "/var/root"] {
+            assert!(roots.contains(&expected.to_string()), "{expected}");
+        }
+        #[cfg(target_os = "macos")]
+        assert!(roots.contains(&"/private/var/root".to_string()));
+
+        // Regular users' passwd homes are enumerated, wherever they live.
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 || uid >= FIRST_REGULAR_UID {
+            let home = home_directory_for_uid(uid).unwrap();
+            assert!(roots.contains(&home), "{home} missing from {roots:?}");
+        }
+    }
+
+    #[test]
+    fn foreign_home_check_covers_nonstandard_home_layouts() {
+        // Synthetic layout: passwd homes on an NFS export, caller is bob.
+        let roots = vec![
+            "/Users".to_string(),
+            "/home".to_string(),
+            "/export/home/alice".to_string(),
+            "/export/home/bob".to_string(),
+        ];
+        let caller_home = "/export/home/bob";
+
+        assert!(inside_foreign_home(
+            "/export/home/alice/docs",
+            caller_home,
+            &roots
+        ));
+        assert!(inside_foreign_home(
+            "/export/home/alice",
+            caller_home,
+            &roots
+        ));
+        assert!(inside_foreign_home("/home/alice", caller_home, &roots));
+        // The caller's own home (a passwd home itself) stays grantable.
+        assert!(!inside_foreign_home(
+            "/export/home/bob/docs",
+            caller_home,
+            &roots
+        ));
+        assert!(!inside_foreign_home("/opt/data", caller_home, &roots));
+        // A caller homed under a standard root keeps access to their subtree.
+        assert!(!inside_foreign_home("/home/bob/x", "/home/bob", &roots));
     }
 
     #[test]

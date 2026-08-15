@@ -58,7 +58,10 @@ The configuration layer can add to — or narrow — the default grants:
   filesystem, never `/`, and writable extras must be **owned by the caller**
   and outside a protected-prefix denylist (`/etc`, `/usr`, `/System`,
   `/Library`, `/var/db`, …). Read-only extras may not reach into another
-  user's home.
+  user's home: the helper checks the standard home roots (`/Users`, `/home`,
+  `/root`, `/var/root`) resolved through symlinks, plus every regular user's
+  home directory from the passwd database, so nonstandard layouts (NFS
+  exports, systemd-homed) are covered too.
 - **Denied paths** (`paths.deny`, e.g. `~/.ssh`) are rendered as the *final*
   seatbelt rules, so they override every allow — the entries become
   unreadable and unwritable even inside the writable `$HOME`. **Linux cannot
