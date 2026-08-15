@@ -398,7 +398,11 @@ impl HelperDaemon {
             ));
         }
 
-        let spec = LaunchSpec::read_json(spec_path)?;
+        // The spec path is client-supplied and this daemon runs as root, so
+        // read_json refuses symlinks and non-regular files, requires the file
+        // to be owned by the authenticated peer, and bounds the read with the
+        // same deadline as the socket I/O.
+        let spec = LaunchSpec::read_json(spec_path, peer.uid, IO_TIMEOUT)?;
         ensure_session_group()?;
         let selected = validated_vpn_interface(interface_name)?;
         let launch = validate_launch(&spec, peer.uid)?;

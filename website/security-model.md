@@ -109,7 +109,10 @@ inherited supplementary groups with the caller's normal groups before the
 drop.
 
 The helper treats the client-supplied launch spec as untrusted, since any
-local user can connect to its socket. It rebuilds the sandbox profile
+local user can connect to its socket. The spec file named in the request is
+itself opened defensively: symlinks are refused, it must be a regular file
+owned by the authenticated peer, and the read is size- and deadline-bounded
+so a FIFO or hostile filesystem cannot pin a helper worker. It rebuilds the sandbox profile
 server-side from inputs it validates itself — the home directory from the
 passwd database for the authenticated peer UID, and a working directory and
 temporary directory that must be real directories (the temporary directory
