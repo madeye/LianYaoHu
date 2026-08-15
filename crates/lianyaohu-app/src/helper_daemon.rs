@@ -553,13 +553,14 @@ fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
     }
     let home = home_directory_for_uid(uid)?;
     let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
-    let cwd = validated_directory("working directory", Path::new(&spec.cwd), None)?;
+    let home_roots = home_directory_roots();
+    let cwd = validated_cwd(Path::new(&spec.cwd), uid, &home, &home_roots)?;
     let tmpdir = spec
         .environment
         .get("TMPDIR")
         .ok_or_else(|| err("launch environment is missing TMPDIR"))?;
     let tmpdir = validated_directory("temporary directory", Path::new(tmpdir), Some(uid))?;
-    let policy = validate_policy(spec.policy.as_ref(), uid, &home)?;
+    let policy = validate_policy(spec.policy.as_ref(), uid, &home, &home_roots)?;
 
     // Treat the entire client environment as untrusted extras: privacy and
     // injection blocklists apply, and the sandbox roots are pinned to the
@@ -602,12 +603,26 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// First uid the OS assigns to regular (human) user accounts. Passwd entries
+/// below it are almost always service accounts, whose pw_dirs sit under
+/// system prefixes (`/Library/WebServer`, `/var/db/...`, `/var/spool/...` on
+/// macOS; `/var/www`, `/var/mail`, `/run/...` on Debian-family systems). The
+/// floor gates only the CONTAINS direction of the foreign-home check —
+/// without it those service homes would make `/Library`, `/var`, or `/run`
+/// ungrantable as read-only extras on a stock install. A grant at or below
+/// ANY non-stub passwd home is still rejected regardless of uid, so a
+/// uid-999 system user's real home keeps its descent protection.
+#[cfg(target_os = "macos")]
+const FIRST_REGULAR_UID: u32 = 500;
+#[cfg(not(target_os = "macos"))]
+const FIRST_REGULAR_UID: u32 = 1000;
+
 /// pw_dir values that are shared system stubs, not private homes: service
 /// accounts point at these (`/var/empty` on macOS, `/nonexistent`, `/bin`,
 /// and `/usr/sbin` on Debian-family systems). Treating them as home roots
-/// would make large system prefixes ungrantable, so they are skipped; every
-/// other passwd home counts regardless of uid — a uid-999 system user's real
-/// home deserves the same protection as anyone else's.
+/// would make large system prefixes ungrantable, so they are skipped
+/// entirely; every other passwd home counts for the descent direction
+/// regardless of uid.
 const SYSTEM_STUB_HOMES: &[&str] = &[
     "/",
     "/bin",
@@ -638,52 +653,78 @@ const SYSTEM_STUB_HOMES: &[&str] = &[
 /// cannot see directory-service accounts at all when enumeration is off
 /// (LDAP/AD/Open Directory), so such homes are only covered when they live
 /// under one of the static roots.
-fn home_directory_roots() -> Vec<String> {
-    static STATIC_ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+fn home_directory_roots() -> Vec<HomeRoot> {
+    static STATIC_ROOTS: OnceLock<Vec<HomeRoot>> = OnceLock::new();
     let mut roots = STATIC_ROOTS
         .get_or_init(|| {
+            // The human-home containers count for both check directions.
+            // Root's homes are real homes (a grant at or below them is
+            // refused) but are 0700 DAC-protected directories whose parents
+            // (`/var`, `/`) must stay grantable, so they do not count for
+            // the contains direction.
             let statics = [
-                "/Users",
-                "/home",
-                "/root",
-                "/var/root",
-                "/System/Volumes/Data/Users",
+                ("/Users", true),
+                ("/home", true),
+                ("/System/Volumes/Data/Users", true),
+                ("/root", false),
+                ("/var/root", false),
             ];
             let mut roots = Vec::new();
-            for root in statics {
-                push_home_root_with_canonical(&mut roots, root.to_string());
+            for (root, user_home) in statics {
+                push_home_root_with_canonical(&mut roots, root.to_string(), user_home);
             }
             roots
         })
         .clone();
-    for home in passwd_home_directories() {
-        push_home_root_with_canonical(&mut roots, home);
+    for (home, home_uid) in passwd_home_directories() {
+        push_home_root_with_canonical(&mut roots, home, home_uid >= FIRST_REGULAR_UID);
     }
     roots
 }
 
-fn push_home_root_with_canonical(roots: &mut Vec<String>, root: String) {
+/// A directory that is — or contains — user home directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomeRoot {
+    path: String,
+    /// Plausibly a real user's private home (or a container of them): the
+    /// standard human-home roots plus passwd homes of accounts at or above
+    /// `FIRST_REGULAR_UID`. Only these count for the CONTAINS direction of
+    /// `foreign_home_conflict`; the descent direction applies to every root.
+    user_home: bool,
+}
+
+fn push_home_root_with_canonical(roots: &mut Vec<HomeRoot>, root: String, user_home: bool) {
     if let Ok(canonical) = Path::new(&root).canonicalize()
         && let Some(canonical) = canonical.to_str()
     {
-        push_home_root(roots, canonical.to_string());
+        push_home_root(roots, canonical.to_string(), user_home);
     }
-    push_home_root(roots, root);
+    push_home_root(roots, root, user_home);
 }
 
-fn push_home_root(roots: &mut Vec<String>, root: String) {
-    if root.starts_with('/') && root != "/" && !roots.contains(&root) {
-        roots.push(root);
+fn push_home_root(roots: &mut Vec<HomeRoot>, root: String, user_home: bool) {
+    if !root.starts_with('/') || root == "/" {
+        return;
     }
+    if let Some(existing) = roots.iter_mut().find(|existing| existing.path == root) {
+        // The same path can arrive from both the static list and the passwd
+        // walk; the stronger classification wins.
+        existing.user_home |= user_home;
+        return;
+    }
+    roots.push(HomeRoot {
+        path: root,
+        user_home,
+    });
 }
 
 fn is_system_stub_home(dir: &str) -> bool {
     SYSTEM_STUB_HOMES.contains(&dir)
 }
 
-/// pw_dir of every passwd entry whose home is not a shared system stub.
-/// getpwent walks shared static state, so enumeration is serialized.
-fn passwd_home_directories() -> Vec<String> {
+/// pw_dir and uid of every passwd entry whose home is not a shared system
+/// stub. getpwent walks shared static state, so enumeration is serialized.
+fn passwd_home_directories() -> Vec<(String, u32)> {
     static PASSWD_LOCK: Mutex<()> = Mutex::new(());
     let _guard = PASSWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let mut homes = Vec::new();
@@ -700,7 +741,7 @@ fn passwd_home_directories() -> Vec<String> {
             if let Ok(dir) = CStr::from_ptr((*entry).pw_dir).to_str()
                 && !is_system_stub_home(dir)
             {
-                homes.push(dir.to_string());
+                homes.push((dir.to_string(), (*entry).pw_uid));
             }
         }
         libc::endpwent();
@@ -708,22 +749,57 @@ fn passwd_home_directories() -> Vec<String> {
     homes
 }
 
-/// True when `canonical` reaches into — or wholly contains — a home-directory
+/// How a candidate grant collides with a home-directory tree that is not the
+/// caller's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignHomeConflict {
+    /// The grant is at or below a foreign home root, so it reads part (or
+    /// all) of that home.
+    Inside,
+    /// The grant is a parent of a foreign home root, so the recursive grant
+    /// contains that home.
+    Contains,
+}
+
+impl ForeignHomeConflict {
+    /// Verb phrase for rejection messages: `<path> {} another user's home
+    /// directory`.
+    fn description(self) -> &'static str {
+        match self {
+            ForeignHomeConflict::Inside => "is inside",
+            ForeignHomeConflict::Contains => "contains",
+        }
+    }
+}
+
+/// Detects a grant that reaches into — or wholly contains — a home-directory
 /// tree that is not the caller's own. Both directions matter: a grant at or
 /// below a foreign home reads part of it, and a grant ABOVE a home root
 /// (`/export/home`, macOS `/System/Volumes/Data`) reads every home below it
 /// just the same, because read-only extras render as recursive subpath
-/// allows with no counter-deny.
-fn inside_foreign_home(canonical: &str, caller_home: &str, home_roots: &[String]) -> bool {
-    home_roots.iter().any(|root| {
+/// allows with no counter-deny. The contains direction only counts roots
+/// that are plausibly real user homes (`user_home`), so a system service
+/// account homed under `/Library` or `/var` does not make those system
+/// prefixes ungrantable; the descent direction applies to every root.
+fn foreign_home_conflict(
+    canonical: &str,
+    caller_home: &str,
+    home_roots: &[HomeRoot],
+) -> Option<ForeignHomeConflict> {
+    for root in home_roots {
         // A root at or below the caller's own home is the caller's, never
         // foreign — the caller's home itself must stay grantable.
-        if path_has_prefix(root, caller_home) {
-            return false;
+        if path_has_prefix(&root.path, caller_home) {
+            continue;
         }
-        (path_has_prefix(canonical, root) && !path_has_prefix(canonical, caller_home))
-            || path_has_prefix(root, canonical)
-    })
+        if path_has_prefix(canonical, &root.path) && !path_has_prefix(canonical, caller_home) {
+            return Some(ForeignHomeConflict::Inside);
+        }
+        if root.user_home && path_has_prefix(&root.path, canonical) {
+            return Some(ForeignHomeConflict::Contains);
+        }
+    }
+    None
 }
 
 /// Re-validates a client-supplied sandbox policy. The network policy and path
@@ -736,6 +812,7 @@ fn validate_policy(
     spec_policy: Option<&SandboxPolicy>,
     uid: u32,
     caller_home: &str,
+    home_roots: &[HomeRoot],
 ) -> Result<SandboxPolicy> {
     let Some(policy) = spec_policy else {
         return Ok(SandboxPolicy::default());
@@ -758,15 +835,15 @@ fn validate_policy(
         writable.push(canonical);
     }
 
-    let home_roots = home_directory_roots();
     let mut read_only = Vec::new();
     for entry in &policy.paths.read_only {
         let canonical = validated_directory("extra read-only path", Path::new(entry), None)?;
         // Reading other users' homes is exactly what the sandbox exists to
         // prevent; a read-only grant must not reopen it.
-        if inside_foreign_home(&canonical, caller_home, &home_roots) {
+        if let Some(conflict) = foreign_home_conflict(&canonical, caller_home, home_roots) {
             return Err(err(format!(
-                "extra read-only path {canonical} is inside another user's home directory"
+                "extra read-only path {canonical} {} another user's home directory",
+                conflict.description()
             )));
         }
         read_only.push(canonical);
@@ -841,6 +918,32 @@ fn validated_state_dir(entry: &str, uid: u32, caller_home: &str) -> Result<Strin
         )));
     }
     Ok(entry.to_string())
+}
+
+/// Validates the client-supplied working directory. The cwd is rendered as a
+/// read+write grant on both platforms, so it is held to the same standard as
+/// the other widenings: it must be owned by the caller — otherwise
+/// `cwd = /Users/<other>` would hand the sandbox another user's home tree,
+/// sidestepping every check on the policy path fields — and it may not reach
+/// into or contain another user's home. The ownership requirement means a
+/// launch from a shared workdir owned by a different account is refused;
+/// launch from a directory you own instead (the sandbox never grants more
+/// than the caller's own DAC access anyway, but the helper does not hand out
+/// grants over trees the caller does not own).
+fn validated_cwd(
+    path: &Path,
+    uid: u32,
+    caller_home: &str,
+    home_roots: &[HomeRoot],
+) -> Result<String> {
+    let cwd = validated_directory("working directory", path, Some(uid))?;
+    if let Some(conflict) = foreign_home_conflict(&cwd, caller_home, home_roots) {
+        return Err(err(format!(
+            "working directory {cwd} {} another user's home directory",
+            conflict.description()
+        )));
+    }
+    Ok(cwd)
 }
 
 fn validated_directory(what: &str, path: &Path, required_owner: Option<u32>) -> Result<String> {
@@ -2074,7 +2177,8 @@ mod tests {
         policy.paths.deny = vec!["/tmp//x/y".to_string()];
         policy.paths.narrow_home = true;
 
-        let validated = validate_policy(Some(&policy), uid, &caller_home).unwrap();
+        let validated =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap();
         // The writable extra comes back canonicalized (macOS temp dirs live
         // behind /var -> /private/var).
         let canonical = extra.canonicalize().unwrap();
@@ -2096,14 +2200,18 @@ mod tests {
         // Not caller-owned.
         let mut policy = SandboxPolicy::default();
         policy.paths.writable = vec!["/usr".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Caller-owned checks cannot save a protected prefix: simulate by
         // pointing at /etc (fails ownership on the canonical path first, but
         // the denylist also covers it for a root caller).
         let mut policy = SandboxPolicy::default();
         policy.paths.writable = vec!["/etc".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Another user's home is off-limits even read-only.
         let other_home = if cfg!(target_os = "macos") {
@@ -2113,7 +2221,9 @@ mod tests {
         };
         let mut policy = SandboxPolicy::default();
         policy.paths.read_only = vec![other_home.to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Homes outside /Users and /home are covered too: root's home lives
         // at /var/root (macOS) or /root (Linux).
@@ -2124,43 +2234,79 @@ mod tests {
         };
         let mut policy = SandboxPolicy::default();
         policy.paths.read_only = vec![root_home.to_string()];
-        let error = validate_policy(Some(&policy), uid, &caller_home).unwrap_err();
+        let error =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap_err();
         assert!(error.to_string().contains("another user's home"), "{error}");
 
         // Absolute agent_state_dirs entries never pass.
         let mut policy = SandboxPolicy::default();
         policy.paths.agent_state_dirs = vec!["/absolute".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Oversized lists are rejected before any filesystem work.
         let mut policy = SandboxPolicy::default();
         policy.paths.deny = (0..=lianyaohu_core::policy::MAX_RULES_PER_LIST)
             .map(|i| format!("/deny/{i}"))
             .collect();
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
+    }
+
+    fn user_home_roots(paths: &[&str]) -> Vec<HomeRoot> {
+        paths
+            .iter()
+            .map(|path| HomeRoot {
+                path: (*path).to_string(),
+                user_home: true,
+            })
+            .collect()
     }
 
     #[test]
     fn home_directory_roots_cover_platform_roots_and_passwd_homes() {
         let roots = home_directory_roots();
+        let has = |path: &str| roots.iter().any(|root| root.path == path);
 
         // Never "/" (which would reject every path) and always absolute.
         assert!(
             roots
                 .iter()
-                .all(|root| root.starts_with('/') && root.as_str() != "/")
+                .all(|root| root.path.starts_with('/') && root.path != "/")
         );
         for expected in ["/Users", "/home", "/root", "/var/root"] {
-            assert!(roots.contains(&expected.to_string()), "{expected}");
+            assert!(has(expected), "{expected}");
         }
         #[cfg(target_os = "macos")]
-        assert!(roots.contains(&"/private/var/root".to_string()));
+        assert!(has("/private/var/root"));
 
-        // Passwd homes are enumerated with no uid floor, wherever they live.
+        // Root's homes keep descent protection but never count for the
+        // contains direction: /var and / must stay grantable even though
+        // they contain them.
+        for root_home in ["/root", "/var/root"] {
+            assert!(
+                roots
+                    .iter()
+                    .filter(|root| root.path == root_home)
+                    .all(|root| !root.user_home),
+                "{root_home}"
+            );
+        }
+
+        // Passwd homes are enumerated with no uid floor, wherever they live
+        // (the floor only gates the contains direction via `user_home`).
         let uid = unsafe { libc::getuid() };
         let home = home_directory_for_uid(uid).unwrap();
         if !is_system_stub_home(&home) {
-            assert!(roots.contains(&home), "{home} missing from {roots:?}");
+            let entry = roots
+                .iter()
+                .find(|root| root.path == home)
+                .unwrap_or_else(|| panic!("{home} missing from {roots:?}"));
+            if uid >= FIRST_REGULAR_UID {
+                assert!(entry.user_home, "{home} should count as a user home");
+            }
         }
 
         // Service-account stubs never become home roots: treating /var/empty
@@ -2171,42 +2317,47 @@ mod tests {
             "/nonexistent",
             "/usr/sbin",
         ] {
-            assert!(!roots.contains(&stub.to_string()), "{stub}");
+            assert!(!has(stub), "{stub}");
         }
     }
 
     #[test]
     fn foreign_home_check_covers_nonstandard_home_layouts() {
         // Synthetic layout: passwd homes on an NFS export, caller is bob.
-        let roots = vec![
-            "/Users".to_string(),
-            "/home".to_string(),
-            "/System/Volumes/Data/Users".to_string(),
-            "/export/home/alice".to_string(),
-            "/export/home/bob".to_string(),
-        ];
+        let roots = user_home_roots(&[
+            "/Users",
+            "/home",
+            "/System/Volumes/Data/Users",
+            "/export/home/alice",
+            "/export/home/bob",
+        ]);
         let caller_home = "/export/home/bob";
 
-        assert!(inside_foreign_home(
+        for grant in [
             "/export/home/alice/docs",
-            caller_home,
-            &roots
-        ));
-        assert!(inside_foreign_home(
             "/export/home/alice",
-            caller_home,
-            &roots
-        ));
-        assert!(inside_foreign_home("/home/alice", caller_home, &roots));
+            "/home/alice",
+        ] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
         // The caller's own home (a passwd home itself) stays grantable.
-        assert!(!inside_foreign_home(
-            "/export/home/bob/docs",
-            caller_home,
-            &roots
-        ));
-        assert!(!inside_foreign_home("/opt/data", caller_home, &roots));
+        assert_eq!(
+            foreign_home_conflict("/export/home/bob/docs", caller_home, &roots),
+            None
+        );
+        assert_eq!(
+            foreign_home_conflict("/opt/data", caller_home, &roots),
+            None
+        );
         // A caller homed under a standard root keeps access to their subtree.
-        assert!(!inside_foreign_home("/home/bob/x", "/home/bob", &roots));
+        assert_eq!(
+            foreign_home_conflict("/home/bob/x", "/home/bob", &roots),
+            None
+        );
     }
 
     // A grant CONTAINING a foreign home grants that home's contents just the
@@ -2214,38 +2365,153 @@ mod tests {
     // counter-deny — so parents of home roots are foreign too.
     #[test]
     fn foreign_home_check_rejects_parents_of_home_roots() {
-        let roots = vec![
-            "/Users".to_string(),
-            "/home".to_string(),
-            "/System/Volumes/Data/Users".to_string(),
-            "/export/home/alice".to_string(),
-            "/export/home/bob".to_string(),
-        ];
+        let roots = user_home_roots(&[
+            "/Users",
+            "/home",
+            "/System/Volumes/Data/Users",
+            "/export/home/alice",
+            "/export/home/bob",
+        ]);
         let caller_home = "/export/home/bob";
 
         // The issue's NFS example: rejecting /export/home/alice but allowing
         // /export/home would grant alice's home anyway.
-        assert!(inside_foreign_home("/export/home", caller_home, &roots));
-        assert!(inside_foreign_home("/export", caller_home, &roots));
-        // macOS: the firmlinked data volume contains /Users.
-        assert!(inside_foreign_home(
-            "/System/Volumes/Data",
-            caller_home,
-            &roots
-        ));
-        assert!(inside_foreign_home("/Users", caller_home, &roots));
-        assert!(inside_foreign_home("/home", caller_home, &roots));
+        for grant in ["/export/home", "/export", "/System/Volumes/Data"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Contains),
+                "{grant}"
+            );
+        }
+        for grant in ["/Users", "/home"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
 
         // The caller's own home and unrelated directories stay grantable,
         // even when the caller's home is itself an enumerated root.
-        assert!(!inside_foreign_home(
-            "/export/home/bob",
-            caller_home,
-            &roots
-        ));
-        assert!(!inside_foreign_home("/opt/data", caller_home, &roots));
-        assert!(!inside_foreign_home("/Users/bob", "/Users/bob", &roots));
-        assert!(!inside_foreign_home("/Users/bob/src", "/Users/bob", &roots));
+        for (grant, caller) in [
+            ("/export/home/bob", caller_home),
+            ("/opt/data", caller_home),
+            ("/Users/bob", "/Users/bob"),
+            ("/Users/bob/src", "/Users/bob"),
+        ] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller, &roots),
+                None,
+                "{grant}"
+            );
+        }
+    }
+
+    // Service accounts homed under system prefixes (macOS: /Library/WebServer,
+    // /var/db/timed, /var/spool/uucp; Debian: /var/www, /var/mail, /run/ircd)
+    // must not make those prefixes ungrantable as read-only extras: only
+    // plausibly-human homes count for the contains direction, while a grant
+    // at or below a service home itself is still refused.
+    #[test]
+    fn service_account_homes_do_not_block_system_prefix_grants() {
+        let mut roots = user_home_roots(&["/Users"]);
+        for service_home in [
+            "/Library/WebServer",
+            "/var/db/timed",
+            "/var/spool/uucp",
+            "/var/www",
+            "/run/ircd",
+        ] {
+            roots.push(HomeRoot {
+                path: service_home.to_string(),
+                user_home: false,
+            });
+        }
+        let caller_home = "/Users/bob";
+
+        for grant in ["/Library", "/var", "/var/db", "/var/spool", "/run"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                None,
+                "{grant}"
+            );
+        }
+        for grant in ["/Library/WebServer", "/var/db/timed/x", "/var/www"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
+    }
+
+    // The rejection message must name the actual direction: a grant BELOW a
+    // foreign home "is inside" it, a grant ABOVE one "contains" it.
+    #[test]
+    fn read_only_rejection_message_names_the_direction() {
+        let uid = unsafe { libc::getuid() };
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home = base.join("me");
+        fs::create_dir_all(&caller_home).unwrap();
+        let alice = base.join("homes/alice");
+        fs::create_dir_all(&alice).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![alice.to_string_lossy().into_owned()];
+        let error =
+            validate_policy(Some(&policy), uid, caller_home.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is inside another user's home directory"),
+            "{error}"
+        );
+
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![base.join("homes").to_string_lossy().into_owned()];
+        let error =
+            validate_policy(Some(&policy), uid, caller_home.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contains another user's home directory"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The client-supplied cwd becomes a read+write grant, so it gets the same
+    // treatment as the policy widenings: caller ownership plus the
+    // foreign-home check — `cwd = /Users/<other>` must not hand the sandbox
+    // another user's home.
+    #[test]
+    fn cwd_must_be_caller_owned_and_outside_foreign_homes() {
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            return;
+        }
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home_dir = base.join("me");
+        fs::create_dir_all(&caller_home_dir).unwrap();
+        let caller_home = caller_home_dir.to_str().unwrap();
+        let alice = base.join("homes/alice");
+        fs::create_dir_all(alice.join("project")).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        // A caller-owned directory outside anyone's home is accepted.
+        assert!(validated_cwd(&caller_home_dir, uid, caller_home, &roots).is_ok());
+        // Inside another user's home: rejected even when caller-owned.
+        let error = validated_cwd(&alice.join("project"), uid, caller_home, &roots).unwrap_err();
+        assert!(error.to_string().contains("another user's home"), "{error}");
+        // Containing another user's home: rejected.
+        assert!(validated_cwd(&base.join("homes"), uid, caller_home, &roots).is_err());
+        // Not owned by the caller: rejected (root-owned /usr).
+        let error = validated_cwd(Path::new("/usr"), uid, caller_home, &roots).unwrap_err();
+        assert!(error.to_string().contains("not owned by uid"), "{error}");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2285,7 +2551,7 @@ mod tests {
         let mut policy = SandboxPolicy::default();
         policy.paths.narrow_home = true;
         policy.paths.agent_state_dirs = vec!["escape".into()];
-        assert!(validate_policy(Some(&policy), uid, caller_home).is_err());
+        assert!(validate_policy(Some(&policy), uid, caller_home, &home_directory_roots()).is_err());
 
         let _ = fs::remove_dir_all(&home);
     }
@@ -2302,7 +2568,8 @@ mod tests {
             ..SandboxPolicy::default()
         };
 
-        let error = validate_policy(Some(&policy), uid, &caller_home).unwrap_err();
+        let error =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap_err();
         assert!(error.to_string().contains("blocked LAN ranges"), "{error}");
     }
 
