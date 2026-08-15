@@ -1,5 +1,7 @@
 use lianyaohu_core::env_policy;
-use lianyaohu_core::helper::{HelperRequest, SOCKET_PATH, parse_request, receive_message_with_fds};
+use lianyaohu_core::helper::{
+    HelperRequest, MAX_REQUEST_BYTES, SOCKET_PATH, parse_request, receive_message_with_fds,
+};
 #[cfg(target_os = "macos")]
 use lianyaohu_core::interfaces::{utun_interfaces, validate_utun};
 #[cfg(target_os = "linux")]
@@ -31,17 +33,24 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use std::{mem, ptr, thread};
 
-/// A request is a single short line; refuse anything larger so a client
-/// cannot exhaust memory by streaming bytes without a newline.
-const MAX_REQUEST_BYTES: usize = 4096;
-
-/// Cap how long a single peer may take to send its request / receive its
-/// reply, so one stalled client cannot pin a worker forever.
+/// Cap how long a single blocking socket syscall (one recvmsg / one write)
+/// may take. This alone does NOT bound a whole request: the segment loop in
+/// [`receive_message_with_fds`] restarts the per-syscall timer on every
+/// segment, so the whole-receive bound is [`REQUEST_RECEIVE_TIMEOUT`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for receiving one complete request, enforced inside
+/// [`receive_message_with_fds`]. Without it a peer trickling one byte per
+/// almost-`IO_TIMEOUT` resets the per-syscall timer indefinitely and pins a
+/// worker (and its UID slot) essentially forever. Twice `IO_TIMEOUT` is
+/// generous headroom: even the maximal 64 KiB request arrives over a local
+/// Unix socket in well under a second on a loaded machine, while a peer that
+/// stalls mid-request is cut off within ~10 s.
+const REQUEST_RECEIVE_TIMEOUT: Duration = IO_TIMEOUT.saturating_mul(2);
 
 /// Upper bound on concurrent worker threads. Run sessions hold a worker for
 /// the lifetime of the agent, so the cap must comfortably cover legitimate
@@ -151,8 +160,14 @@ impl HelperDaemon {
         ensure_session_group()?;
         // The session map is in-memory, so firewall state installed by a
         // previous helper instance that exited uncleanly (SIGKILL, crash,
-        // supervisor restart) would never be reaped. No session is live yet,
-        // so anything found now is stale by definition.
+        // supervisor restart) would never be reaped. This instance has no
+        // live session yet, but the rules found now are not necessarily
+        // orphans: an agent guarded by rules the previous instance installed
+        // (e.g. a shared-user install session) may still be running, and
+        // flushing its anchor/chain strips its guard — fail-OPEN for that
+        // agent — while leaving the rules would keep over-blocking users
+        // whose sessions really are gone. The reap accepts the former to
+        // avoid the latter; see security-model.md.
         reap_stale_sessions();
 
         let socket_path = Path::new(SOCKET_PATH);
@@ -215,10 +230,14 @@ impl HelperDaemon {
     }
 
     fn handle_inner(&self, stream: &mut UnixStream, peer: PeerCredentials) -> Result<String> {
-        let received = receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3)?;
+        let received =
+            receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3, REQUEST_RECEIVE_TIMEOUT)?;
         match parse_request(&received.message)? {
-            HelperRequest::Install { interface_name } => {
-                self.install(peer.uid, &interface_name)?;
+            HelperRequest::Install {
+                interface_name,
+                network,
+            } => {
+                self.install(peer.uid, &interface_name, network)?;
                 Ok(format!(
                     "installed firewall guard for uid {} on {interface_name}",
                     peer.uid
@@ -229,7 +248,7 @@ impl HelperDaemon {
                 spec_path,
             } => self.run_session(peer, &interface_name, Path::new(&spec_path), received.fds),
             HelperRequest::Uninstall => {
-                self.release_session(peer.uid);
+                self.release_install_session(peer.uid)?;
                 Ok(format!("uninstalled firewall guard for uid {}", peer.uid))
             }
             HelperRequest::Status => {
@@ -243,9 +262,9 @@ impl HelperDaemon {
             // non-default sandbox policy require a helper that understands
             // versioned specs, and an old helper answers this verb with an
             // error line — which is exactly the negative signal they need.
-            HelperRequest::Capabilities => {
-                Ok(format!("policy=1 spec_version={LAUNCH_SPEC_VERSION}"))
-            }
+            HelperRequest::Capabilities => Ok(format!(
+                "policy=1 install_policy=1 spec_version={LAUNCH_SPEC_VERSION}"
+            )),
         }
     }
 
@@ -253,22 +272,14 @@ impl HelperDaemon {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn install(&self, uid: u32, interface_name: &str) -> Result<()> {
+    fn install(
+        &self,
+        uid: u32,
+        interface_name: &str,
+        network: lianyaohu_core::policy::NetworkPolicy,
+    ) -> Result<()> {
         let selected = validated_vpn_interface(interface_name)?;
-
-        #[cfg(target_os = "macos")]
-        {
-            self.acquire_session(PFRuleSet::new_user(
-                selected.name,
-                uid,
-                selected.ipv4_peer_addresses.first().cloned(),
-            ))
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            self.acquire_session(LinuxFirewallRuleSet::new_user(selected.name, uid))
-        }
+        self.acquire_session(install_rule_set(uid, &selected, network))
     }
 
     /// Install firewall rules for this rule set, or join the session that
@@ -376,6 +387,33 @@ impl HelperDaemon {
         }
     }
 
+    /// Release one reference to the UID's user-scoped `install` session.
+    /// `uninstall` carries no session token — any same-UID process can write
+    /// it to the socket — so it must never touch state owned by a live `run`
+    /// session: the run path releases its own reference when the agent
+    /// exits, and letting an unrelated client decrement that refcount would
+    /// strip the group-scoped firewall out from under a still-running agent.
+    fn release_install_session(&self, uid: u32) -> Result<()> {
+        let mut sessions = self.lock_sessions();
+        let Some(state) = sessions.get_mut(&uid) else {
+            return Ok(());
+        };
+        if !state.rule_set.is_user_scoped() {
+            return Err(err(format!(
+                "uid {uid} has a live helper run session; its firewall rules come down when that \
+                 session exits, not via uninstall"
+            )));
+        }
+        state.refcount -= 1;
+        if state.refcount > 0 {
+            return Ok(());
+        }
+        if let Some(state) = sessions.remove(&uid) {
+            teardown_session(&state);
+        }
+        Ok(())
+    }
+
     /// Uninstall every remaining session's firewall state. Used on shutdown
     /// so a stopped helper does not leave rules behind.
     fn teardown_all_sessions(&self) {
@@ -398,7 +436,14 @@ impl HelperDaemon {
             ));
         }
 
-        let spec = LaunchSpec::read_json(spec_path)?;
+        // The spec path is client-supplied and this daemon runs as root, so
+        // read_json refuses symlinks and non-regular files, requires the file
+        // to be owned by the authenticated peer, and runs the open and read
+        // on an abandonable reader thread bounded by the same deadline as the
+        // socket I/O, so a hostile filesystem cannot pin this worker. The
+        // peer uid also keys the abandoned-reader cap, so one uid's stalled
+        // readers cannot block other users' launches.
+        let spec = LaunchSpec::read_json(spec_path, peer.uid, IO_TIMEOUT)?;
         ensure_session_group()?;
         let selected = validated_vpn_interface(interface_name)?;
         let launch = validate_launch(&spec, peer.uid)?;
@@ -493,15 +538,29 @@ struct ValidatedLaunch {
 
 fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
     spec.validate()?;
+    // The command is exec'd through option-parsing wrappers (sandbox-exec on
+    // macOS). The `--` separator in run_launch_spec is the primary guard;
+    // refusing option-shaped executables here keeps a crafted spec from even
+    // reaching a wrapper's argv parser.
+    let executable = spec
+        .command
+        .first()
+        .ok_or_else(|| err("launch spec command is empty"))?;
+    if executable.is_empty() || executable.starts_with('-') {
+        return Err(err(format!(
+            "launch spec executable {executable:?} must not be empty or start with '-'"
+        )));
+    }
     let home = home_directory_for_uid(uid)?;
     let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
-    let cwd = validated_directory("working directory", Path::new(&spec.cwd), None)?;
+    let home_roots = home_directory_roots();
+    let cwd = validated_cwd(Path::new(&spec.cwd), uid, &home, &home_roots)?;
     let tmpdir = spec
         .environment
         .get("TMPDIR")
         .ok_or_else(|| err("launch environment is missing TMPDIR"))?;
     let tmpdir = validated_directory("temporary directory", Path::new(tmpdir), Some(uid))?;
-    let policy = validate_policy(spec.policy.as_ref(), uid, &home)?;
+    let policy = validate_policy(spec.policy.as_ref(), uid, &home, &home_roots)?;
 
     // Treat the entire client environment as untrusted extras: privacy and
     // injection blocklists apply, and the sandbox roots are pinned to the
@@ -544,6 +603,205 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// First uid the OS assigns to regular (human) user accounts. Passwd entries
+/// below it are almost always service accounts, whose pw_dirs sit under
+/// system prefixes (`/Library/WebServer`, `/var/db/...`, `/var/spool/...` on
+/// macOS; `/var/www`, `/var/mail`, `/run/...` on Debian-family systems). The
+/// floor gates only the CONTAINS direction of the foreign-home check —
+/// without it those service homes would make `/Library`, `/var`, or `/run`
+/// ungrantable as read-only extras on a stock install. A grant at or below
+/// ANY non-stub passwd home is still rejected regardless of uid, so a
+/// uid-999 system user's real home keeps its descent protection.
+#[cfg(target_os = "macos")]
+const FIRST_REGULAR_UID: u32 = 500;
+#[cfg(not(target_os = "macos"))]
+const FIRST_REGULAR_UID: u32 = 1000;
+
+/// pw_dir values that are shared system stubs, not private homes: service
+/// accounts point at these (`/var/empty` on macOS, `/nonexistent`, `/bin`,
+/// and `/usr/sbin` on Debian-family systems). Treating them as home roots
+/// would make large system prefixes ungrantable, so they are skipped
+/// entirely; every other passwd home counts for the descent direction
+/// regardless of uid.
+const SYSTEM_STUB_HOMES: &[&str] = &[
+    "/",
+    "/bin",
+    "/dev",
+    "/dev/null",
+    "/nonexistent",
+    "/private/var/empty",
+    "/sbin",
+    "/usr/bin",
+    "/usr/games",
+    "/usr/sbin",
+    "/var/empty",
+];
+
+/// Directories that are — or contain — user home directories: the standard
+/// platform home roots, root's home, plus every user's passwd home (NFS
+/// `/export/home/...`, systemd-homed, and other nonstandard layouts).
+/// Each root is listed both as written and canonicalized, so a symlinked
+/// `/home` or macOS's `/var/root` -> `/private/var/root` cannot dodge the
+/// prefix check; the APFS firmlink alias of `/Users` is covered explicitly
+/// because canonicalization does not resolve firmlinks.
+///
+/// The static platform roots are computed once; the passwd walk stays
+/// per-request so accounts created while the helper runs are still covered.
+/// The tradeoff: each run/policy request re-enumerates passwd behind the
+/// process-wide PASSWD_LOCK, so on hosts whose passwd resolves through a
+/// slow directory service this serializes concurrent requests. Note getpwent
+/// cannot see directory-service accounts at all when enumeration is off
+/// (LDAP/AD/Open Directory), so such homes are only covered when they live
+/// under one of the static roots.
+fn home_directory_roots() -> Vec<HomeRoot> {
+    static STATIC_ROOTS: OnceLock<Vec<HomeRoot>> = OnceLock::new();
+    let mut roots = STATIC_ROOTS
+        .get_or_init(|| {
+            // The human-home containers count for both check directions.
+            // Root's homes are real homes (a grant at or below them is
+            // refused) but are 0700 DAC-protected directories whose parents
+            // (`/var`, `/`) must stay grantable, so they do not count for
+            // the contains direction.
+            let statics = [
+                ("/Users", true),
+                ("/home", true),
+                ("/System/Volumes/Data/Users", true),
+                ("/root", false),
+                ("/var/root", false),
+            ];
+            let mut roots = Vec::new();
+            for (root, user_home) in statics {
+                push_home_root_with_canonical(&mut roots, root.to_string(), user_home);
+            }
+            roots
+        })
+        .clone();
+    for (home, home_uid) in passwd_home_directories() {
+        push_home_root_with_canonical(&mut roots, home, home_uid >= FIRST_REGULAR_UID);
+    }
+    roots
+}
+
+/// A directory that is — or contains — user home directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomeRoot {
+    path: String,
+    /// Plausibly a real user's private home (or a container of them): the
+    /// standard human-home roots plus passwd homes of accounts at or above
+    /// `FIRST_REGULAR_UID`. Only these count for the CONTAINS direction of
+    /// `foreign_home_conflict`; the descent direction applies to every root.
+    user_home: bool,
+}
+
+fn push_home_root_with_canonical(roots: &mut Vec<HomeRoot>, root: String, user_home: bool) {
+    if let Ok(canonical) = Path::new(&root).canonicalize()
+        && let Some(canonical) = canonical.to_str()
+    {
+        push_home_root(roots, canonical.to_string(), user_home);
+    }
+    push_home_root(roots, root, user_home);
+}
+
+fn push_home_root(roots: &mut Vec<HomeRoot>, root: String, user_home: bool) {
+    if !root.starts_with('/') || root == "/" {
+        return;
+    }
+    if let Some(existing) = roots.iter_mut().find(|existing| existing.path == root) {
+        // The same path can arrive from both the static list and the passwd
+        // walk; the stronger classification wins.
+        existing.user_home |= user_home;
+        return;
+    }
+    roots.push(HomeRoot {
+        path: root,
+        user_home,
+    });
+}
+
+fn is_system_stub_home(dir: &str) -> bool {
+    SYSTEM_STUB_HOMES.contains(&dir)
+}
+
+/// pw_dir and uid of every passwd entry whose home is not a shared system
+/// stub. getpwent walks shared static state, so enumeration is serialized.
+fn passwd_home_directories() -> Vec<(String, u32)> {
+    static PASSWD_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PASSWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut homes = Vec::new();
+    unsafe {
+        libc::setpwent();
+        loop {
+            let entry = libc::getpwent();
+            if entry.is_null() {
+                break;
+            }
+            if (*entry).pw_dir.is_null() {
+                continue;
+            }
+            if let Ok(dir) = CStr::from_ptr((*entry).pw_dir).to_str()
+                && !is_system_stub_home(dir)
+            {
+                homes.push((dir.to_string(), (*entry).pw_uid));
+            }
+        }
+        libc::endpwent();
+    }
+    homes
+}
+
+/// How a candidate grant collides with a home-directory tree that is not the
+/// caller's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignHomeConflict {
+    /// The grant is at or below a foreign home root, so it reads part (or
+    /// all) of that home.
+    Inside,
+    /// The grant is a parent of a foreign home root, so the recursive grant
+    /// contains that home.
+    Contains,
+}
+
+impl ForeignHomeConflict {
+    /// Verb phrase for rejection messages: `<path> {} another user's home
+    /// directory`.
+    fn description(self) -> &'static str {
+        match self {
+            ForeignHomeConflict::Inside => "is inside",
+            ForeignHomeConflict::Contains => "contains",
+        }
+    }
+}
+
+/// Detects a grant that reaches into — or wholly contains — a home-directory
+/// tree that is not the caller's own. Both directions matter: a grant at or
+/// below a foreign home reads part of it, and a grant ABOVE a home root
+/// (`/export/home`, macOS `/System/Volumes/Data`) reads every home below it
+/// just the same, because read-only extras render as recursive subpath
+/// allows with no counter-deny. The contains direction only counts roots
+/// that are plausibly real user homes (`user_home`), so a system service
+/// account homed under `/Library` or `/var` does not make those system
+/// prefixes ungrantable; the descent direction applies to every root.
+fn foreign_home_conflict(
+    canonical: &str,
+    caller_home: &str,
+    home_roots: &[HomeRoot],
+) -> Option<ForeignHomeConflict> {
+    for root in home_roots {
+        // A root at or below the caller's own home is the caller's, never
+        // foreign — the caller's home itself must stay grantable.
+        if path_has_prefix(&root.path, caller_home) {
+            continue;
+        }
+        if path_has_prefix(canonical, &root.path) && !path_has_prefix(canonical, caller_home) {
+            return Some(ForeignHomeConflict::Inside);
+        }
+        if root.user_home && path_has_prefix(&root.path, canonical) {
+            return Some(ForeignHomeConflict::Contains);
+        }
+    }
+    None
+}
+
 /// Re-validates a client-supplied sandbox policy. The network policy and path
 /// tightenings (deny entries, narrow-home state dirs) only need grammar and
 /// containment checks — worst case the client restricts itself. Widenings are
@@ -554,6 +812,7 @@ fn validate_policy(
     spec_policy: Option<&SandboxPolicy>,
     uid: u32,
     caller_home: &str,
+    home_roots: &[HomeRoot],
 ) -> Result<SandboxPolicy> {
     let Some(policy) = spec_policy else {
         return Ok(SandboxPolicy::default());
@@ -581,12 +840,11 @@ fn validate_policy(
         let canonical = validated_directory("extra read-only path", Path::new(entry), None)?;
         // Reading other users' homes is exactly what the sandbox exists to
         // prevent; a read-only grant must not reopen it.
-        for home_root in ["/Users", "/home"] {
-            if path_has_prefix(&canonical, home_root) && !path_has_prefix(&canonical, caller_home) {
-                return Err(err(format!(
-                    "extra read-only path {canonical} is inside another user's home directory"
-                )));
-            }
+        if let Some(conflict) = foreign_home_conflict(&canonical, caller_home, home_roots) {
+            return Err(err(format!(
+                "extra read-only path {canonical} {} another user's home directory",
+                conflict.description()
+            )));
         }
         read_only.push(canonical);
     }
@@ -601,6 +859,17 @@ fn validate_policy(
         .map(|entry| lexically_normalized_absolute(entry))
         .collect::<Result<Vec<_>>>()?;
 
+    // Narrow-home state dirs become writable grants, so they are checked
+    // against the real filesystem: any entry that resolves through a symlink
+    // is refused outright — wherever it points — so ~/.cache can widen
+    // narrow-home neither into / nor onto an in-home target like ~/.ssh.
+    let agent_state_dirs = policy
+        .paths
+        .agent_state_dirs
+        .iter()
+        .map(|entry| validated_state_dir(entry, uid, caller_home))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(SandboxPolicy {
         network: policy.network.clone(),
         paths: PathPolicy {
@@ -608,12 +877,73 @@ fn validate_policy(
             read_only,
             deny,
             narrow_home: policy.paths.narrow_home,
-            // Relative, `..`-free entries (checked by policy.validate above);
-            // joined against the passwd-derived home at render time, so a
-            // client can never smuggle an absolute path through narrow-home.
-            agent_state_dirs: policy.paths.agent_state_dirs.clone(),
+            agent_state_dirs,
         },
     })
+}
+
+/// Validates a narrow-home state dir entry (relative and `..`-free per
+/// `policy.validate`) against the caller's home. The caller's home is already
+/// canonical, so the canonical form of `home/entry` can differ from the
+/// lexical join only by resolving a symlink — and any symlink involvement is
+/// refused outright, never rewritten to its target: under narrow-home a
+/// rewrite would convert a state-dir grant into a write grant on the target
+/// (e.g. `~/.cache -> ~/.ssh`), and on macOS it would hand seatbelt the
+/// redirected target where the symlinked entry was previously inert. This
+/// subsumes the escape (`~/.cache -> /`) and home-itself cases, which both
+/// involve a symlink. A not-yet-created entry passes through unchanged — it
+/// grants nothing until it exists, and on Linux rule installation refuses
+/// symlinks again at apply time.
+fn validated_state_dir(entry: &str, uid: u32, caller_home: &str) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let joined = Path::new(caller_home).join(entry);
+    let canonical = match joined.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(entry.to_string()),
+        Err(error) => {
+            return Err(err(format!("agent state dir {entry:?}: {error}")));
+        }
+    };
+    if canonical != joined {
+        return Err(err(format!(
+            "agent state dir {entry:?} resolves through a symlink to {}; symlinked state dirs are refused",
+            canonical.display()
+        )));
+    }
+    let metadata = fs::metadata(&canonical)?;
+    if metadata.uid() != uid {
+        return Err(err(format!(
+            "agent state dir {entry:?} is not owned by uid {uid}"
+        )));
+    }
+    Ok(entry.to_string())
+}
+
+/// Validates the client-supplied working directory. The cwd is rendered as a
+/// read+write grant on both platforms, so it is held to the same standard as
+/// the other widenings: it must be owned by the caller — otherwise
+/// `cwd = /Users/<other>` would hand the sandbox another user's home tree,
+/// sidestepping every check on the policy path fields — and it may not reach
+/// into or contain another user's home. The ownership requirement means a
+/// launch from a shared workdir owned by a different account is refused;
+/// launch from a directory you own instead (the sandbox never grants more
+/// than the caller's own DAC access anyway, but the helper does not hand out
+/// grants over trees the caller does not own).
+fn validated_cwd(
+    path: &Path,
+    uid: u32,
+    caller_home: &str,
+    home_roots: &[HomeRoot],
+) -> Result<String> {
+    let cwd = validated_directory("working directory", path, Some(uid))?;
+    if let Some(conflict) = foreign_home_conflict(&cwd, caller_home, home_roots) {
+        return Err(err(format!(
+            "working directory {cwd} {} another user's home directory",
+            conflict.description()
+        )));
+    }
+    Ok(cwd)
 }
 
 fn validated_directory(what: &str, path: &Path, required_owner: Option<u32>) -> Result<String> {
@@ -736,20 +1066,15 @@ fn run_launch_spec(
         .collect::<Vec<_>>()
         .join(",");
 
-    let mut command = Command::new("/bin/launchctl");
+    let mut command = sandbox_exec_command(
+        &helper_exe,
+        uid,
+        session_gid,
+        &groups_csv,
+        &profile_arg,
+        &launch.command,
+    );
     command
-        .arg("asuser")
-        .arg(uid.to_string())
-        .arg(&helper_exe)
-        .arg("drop-exec")
-        .arg(uid.to_string())
-        .arg(session_gid.to_string())
-        .arg(&groups_csv)
-        .arg("--")
-        .arg("/usr/bin/sandbox-exec")
-        .arg("-f")
-        .arg(profile_arg)
-        .args(&launch.command)
         .current_dir(&launch.cwd)
         .env_clear()
         .envs(&launch.environment)
@@ -764,6 +1089,42 @@ fn run_launch_spec(
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(1))
+}
+
+/// Builds the `launchctl asuser <uid> <helper> drop-exec ... --
+/// /usr/bin/sandbox-exec -f <profile> -- <client command...>` argv. Factored
+/// out of [`run_launch_spec`] so a unit test can pin the `--` separator
+/// between the helper-built profile arguments and the client command: without
+/// it a spec command starting with `-p`/`-f` would reach sandbox-exec's
+/// option parser and could replace the helper-built profile.
+#[cfg(any(target_os = "macos", test))]
+fn sandbox_exec_command(
+    helper_exe: &Path,
+    uid: u32,
+    session_gid: u32,
+    groups_csv: &str,
+    profile_arg: &str,
+    client_command: &[String],
+) -> Command {
+    let mut command = Command::new("/bin/launchctl");
+    command
+        .arg("asuser")
+        .arg(uid.to_string())
+        .arg(helper_exe)
+        .arg("drop-exec")
+        .arg(uid.to_string())
+        .arg(session_gid.to_string())
+        .arg(groups_csv)
+        .arg("--")
+        .arg("/usr/bin/sandbox-exec")
+        .arg("-f")
+        .arg(profile_arg)
+        // Terminate sandbox-exec's own option parsing: without this a spec
+        // command starting with `-p`/`-f` would be consumed as a sandbox-exec
+        // option and could replace the helper-built profile.
+        .arg("--")
+        .args(client_command);
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -950,6 +1311,37 @@ fn supplementary_groups_for_uid(uid: u32, primary_gid: u32) -> Result<Vec<u32>> 
     Ok(groups)
 }
 
+/// Builds the exact rule set an `install` request stores and enforces. The
+/// client-supplied policy (already re-validated by `parse_request`) is applied
+/// the same way `run_session` applies the launch spec's policy: dropping the
+/// `.with_network(network)` here would silently install weaker rules than the
+/// client rendered and showed with `--print-firewall` — pinned by
+/// `install_stores_the_client_network_policy_in_the_rule_set`.
+#[cfg(target_os = "macos")]
+fn install_rule_set(
+    uid: u32,
+    selected: &lianyaohu_core::interfaces::NetworkInterface,
+    network: lianyaohu_core::policy::NetworkPolicy,
+) -> PFRuleSet {
+    PFRuleSet::new_user(
+        selected.name.clone(),
+        uid,
+        selected.ipv4_peer_addresses.first().cloned(),
+    )
+    .with_network(network)
+}
+
+/// See the macOS variant above: this is the stored rule set for `install`,
+/// and the client policy must survive into it.
+#[cfg(target_os = "linux")]
+fn install_rule_set(
+    uid: u32,
+    selected: &lianyaohu_core::interfaces::NetworkInterface,
+    network: lianyaohu_core::policy::NetworkPolicy,
+) -> LinuxFirewallRuleSet {
+    LinuxFirewallRuleSet::new_user(selected.name.clone(), uid).with_network(network)
+}
+
 #[cfg(target_os = "macos")]
 fn validated_vpn_interface(
     interface_name: &str,
@@ -990,11 +1382,14 @@ fn validated_vpn_interface(
     Ok(selected)
 }
 
-/// Flush firewall state orphaned by a previous helper instance. The PF
-/// enable-reference tokens from `pfctl -E` died with the old process and
-/// cannot be released, so PF may stay enabled; that is benign (an enabled PF
-/// with empty anchors filters nothing extra), unlike stale rules, which keep
-/// blocking a user whose session is long gone.
+/// Flush firewall state left behind by a previous helper instance. Not
+/// purely fail-closed: a still-running agent guarded by rules the old
+/// instance installed loses that guard when its anchor is flushed here
+/// (fail-open for that agent), accepted so stale rules cannot keep blocking
+/// users whose sessions are long gone. The PF enable-reference tokens from
+/// `pfctl -E` died with the old process and cannot be released, so PF may
+/// stay enabled; that is benign (an enabled PF with empty anchors filters
+/// nothing extra).
 #[cfg(target_os = "macos")]
 fn reap_stale_sessions() {
     match run_pf(&["-a", "com.apple", "-s", "Anchors"]) {
@@ -1355,6 +1750,50 @@ mod tests {
         assert!(validated_vpn_interface("nonexistent").is_err());
     }
 
+    // Regression test for the silent policy drop at the daemon install site:
+    // `HelperDaemon::install` stores exactly `install_rule_set(...)`'s
+    // output, so a custom default-deny / lan_allow policy must survive into
+    // the stored rule set and its rendered rules. This fails if the
+    // `.with_network(network)` in install_rule_set is dropped — the stored
+    // set would fall back to the default policy and none of the substrings
+    // below would render.
+    #[test]
+    fn install_stores_the_client_network_policy_in_the_rule_set() {
+        use lianyaohu_core::interfaces::NetworkInterface;
+        use lianyaohu_core::policy::{DestRule, NetAction, NetworkPolicy};
+
+        let network = NetworkPolicy {
+            default_action: NetAction::Deny,
+            allow: vec![DestRule::parse("140.82.112.0/20:443").unwrap()],
+            deny: vec![DestRule::parse("169.254.169.254").unwrap()],
+            lan_allow: vec![DestRule::parse("192.168.1.10:22").unwrap()],
+        };
+        let selected = NetworkInterface {
+            name: "utun5".to_string(),
+            flags: 0,
+            ipv4_addresses: vec!["10.7.0.2".to_string()],
+            ipv4_peer_addresses: vec!["10.7.0.1".to_string()],
+            ipv6_addresses: Vec::new(),
+        };
+
+        let rule_set = install_rule_set(501, &selected, network.clone());
+
+        // The full policy is stored, not a default that ignores the client's
+        // deny/lan_allow lists.
+        assert_eq!(rule_set.network, network);
+        // `install` sessions must stay user-scoped: `uninstall` may release
+        // only user-scoped state.
+        assert!(rule_set.is_user_scoped());
+        // And the policy's rules actually reach the rendered firewall text.
+        let rendered = rule_set.render();
+        for needle in ["140.82.112.0/20", "169.254.169.254", "192.168.1.10"] {
+            assert!(
+                rendered.contains(needle),
+                "stored rule set does not render policy rule {needle}:\n{rendered}"
+            );
+        }
+    }
+
     #[test]
     fn parse_drop_exec_args_accepts_full_form() {
         let (uid, gid, groups, command) =
@@ -1389,6 +1828,65 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn test_session(rule_set: PFRuleSet, refcount: usize) -> SessionState {
+        SessionState {
+            rule_set,
+            refcount,
+            enable_token: None,
+            rules_path: std::path::PathBuf::from("/nonexistent-lianyaohu-test-rules"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_session(rule_set: LinuxFirewallRuleSet, refcount: usize) -> SessionState {
+        SessionState { rule_set, refcount }
+    }
+
+    // Regression test for #56: `uninstall` is authorized only as "same UID",
+    // so it must not decrement the refcount of a live group-scoped `run`
+    // session — that would strip the firewall while run_launch_spec is still
+    // blocked on the agent.
+    #[test]
+    fn uninstall_cannot_release_a_live_run_session() {
+        let daemon = HelperDaemon::default();
+        #[cfg(target_os = "macos")]
+        let rule_set = PFRuleSet::new_group("utun9", 501, LIANYAOHU_GROUP_GID, None);
+        #[cfg(target_os = "linux")]
+        let rule_set = LinuxFirewallRuleSet::new_group("tun9", 501, LIANYAOHU_GROUP_GID);
+        daemon
+            .lock_sessions()
+            .insert(501, test_session(rule_set, 1));
+
+        let error = daemon.release_install_session(501).unwrap_err();
+
+        assert!(
+            error.to_string().contains("live helper run session"),
+            "{error}"
+        );
+        // The run session and its refcount are untouched.
+        assert_eq!(daemon.lock_sessions().get(&501).unwrap().refcount, 1);
+    }
+
+    #[test]
+    fn uninstall_releases_install_sessions_by_refcount() {
+        let daemon = HelperDaemon::default();
+        #[cfg(target_os = "macos")]
+        let rule_set = PFRuleSet::new_user("utun9", 501, None);
+        #[cfg(target_os = "linux")]
+        let rule_set = LinuxFirewallRuleSet::new_user("tun9", 501);
+        daemon
+            .lock_sessions()
+            .insert(501, test_session(rule_set, 2));
+
+        // A second concurrent install still holds a reference: no teardown.
+        daemon.release_install_session(501).unwrap();
+        assert_eq!(daemon.lock_sessions().get(&501).unwrap().refcount, 1);
+
+        // Unknown UIDs are a no-op rather than an error.
+        daemon.release_install_session(4_000_000).unwrap();
+    }
+
     #[test]
     fn uid_slots_cap_per_uid_and_release_on_drop() {
         let connections = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1419,15 +1917,16 @@ mod tests {
         let listing = "\
   com.apple/250.ApplicationFirewall
   com.apple/lianyaohu-501
-  com.apple/lianyaohu-502
+  com.apple/lianyaohu-user-502
   org.example/other
 ";
 
+        // Group-scoped and sudo user-scoped anchors are both reaped.
         assert_eq!(
             parse_stale_anchor_listing(listing),
             vec![
                 "com.apple/lianyaohu-501".to_string(),
-                "com.apple/lianyaohu-502".to_string(),
+                "com.apple/lianyaohu-user-502".to_string(),
             ]
         );
     }
@@ -1550,6 +2049,98 @@ mod tests {
     }
 
     #[test]
+    fn validate_launch_rejects_option_shaped_executable() {
+        let uid = unsafe { libc::getuid() };
+        let tmpdir = owned_tmpdir();
+
+        // A command whose argv[0] parses as a sandbox-exec option must be
+        // refused: `-p '(allow default)'` would replace the helper profile.
+        for command in [
+            vec![
+                "-p".to_string(),
+                "(allow default)".to_string(),
+                "/bin/echo".to_string(),
+            ],
+            vec!["-f".to_string(), "/tmp/evil.sb".to_string()],
+            vec![String::new()],
+        ] {
+            let mut spec = base_spec(&tmpdir);
+            spec.command = command.clone();
+            assert!(validate_launch(&spec, uid).is_err(), "{command:?}");
+        }
+
+        let _ = fs::remove_dir_all(&tmpdir);
+    }
+
+    // sandbox-exec must treat everything after `--` as the command, so an
+    // injected `-p '(allow default)'` cannot reach its option parser: with the
+    // separator in place the `-p` is exec'd as a (nonexistent) program and the
+    // launch fails instead of running under the injected profile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_exec_separator_stops_option_parsing() {
+        if std::env::var_os("CI").is_some() {
+            eprintln!("skipping sandbox-exec runtime test in CI");
+            return;
+        }
+        let tmpdir = owned_tmpdir();
+        let profile_path = tmpdir.join("permissive.sb");
+        fs::write(&profile_path, "(version 1)\n(allow default)\n").unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        // The separator itself is accepted and the command still runs.
+        let plain = run(&["--", "/bin/echo", "ok"]);
+        assert!(plain.status.success(), "{plain:?}");
+
+        // The injection attempt fails: `-p` is not a runnable command.
+        let injected = run(&["--", "-p", "(allow default)", "/bin/echo"]);
+        assert!(!injected.status.success());
+
+        let _ = fs::remove_dir_all(&tmpdir);
+    }
+
+    // The built argv itself must carry the separator: the runtime test above
+    // self-skips in CI and exercises sandbox-exec directly, so this pins that
+    // run_launch_spec's Command keeps `--` between the helper-built `-f
+    // <profile>` and the client command — a refactor dropping it would fail
+    // here, not only against a live sandbox-exec.
+    #[test]
+    fn sandbox_exec_argv_terminates_option_parsing_before_client_command() {
+        let command = sandbox_exec_command(
+            Path::new("/usr/local/bin/lianyaohu"),
+            501,
+            2_000_000,
+            "20,12",
+            "/var/run/lianyaohu/profile-501.sb",
+            &["-p".to_string(), "(allow default)".to_string()],
+        );
+
+        assert_eq!(command.get_program(), "/bin/launchctl");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let expected_tail = [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/var/run/lianyaohu/profile-501.sb",
+            "--",
+            "-p",
+            "(allow default)",
+        ]
+        .map(ToString::to_string);
+        assert!(args.ends_with(&expected_tail), "{args:?}");
+    }
+
+    #[test]
     fn legacy_spec_validates_to_default_policy() {
         let uid = unsafe { libc::getuid() };
         let tmpdir = owned_tmpdir();
@@ -1586,7 +2177,8 @@ mod tests {
         policy.paths.deny = vec!["/tmp//x/y".to_string()];
         policy.paths.narrow_home = true;
 
-        let validated = validate_policy(Some(&policy), uid, &caller_home).unwrap();
+        let validated =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap();
         // The writable extra comes back canonicalized (macOS temp dirs live
         // behind /var -> /private/var).
         let canonical = extra.canonicalize().unwrap();
@@ -1608,14 +2200,18 @@ mod tests {
         // Not caller-owned.
         let mut policy = SandboxPolicy::default();
         policy.paths.writable = vec!["/usr".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Caller-owned checks cannot save a protected prefix: simulate by
         // pointing at /etc (fails ownership on the canonical path first, but
         // the denylist also covers it for a root caller).
         let mut policy = SandboxPolicy::default();
         policy.paths.writable = vec!["/etc".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Another user's home is off-limits even read-only.
         let other_home = if cfg!(target_os = "macos") {
@@ -1625,19 +2221,339 @@ mod tests {
         };
         let mut policy = SandboxPolicy::default();
         policy.paths.read_only = vec![other_home.to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
+
+        // Homes outside /Users and /home are covered too: root's home lives
+        // at /var/root (macOS) or /root (Linux).
+        let root_home = if cfg!(target_os = "macos") {
+            "/var/root"
+        } else {
+            "/root"
+        };
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![root_home.to_string()];
+        let error =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap_err();
+        assert!(error.to_string().contains("another user's home"), "{error}");
 
         // Absolute agent_state_dirs entries never pass.
         let mut policy = SandboxPolicy::default();
         policy.paths.agent_state_dirs = vec!["/absolute".to_string()];
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
 
         // Oversized lists are rejected before any filesystem work.
         let mut policy = SandboxPolicy::default();
         policy.paths.deny = (0..=lianyaohu_core::policy::MAX_RULES_PER_LIST)
             .map(|i| format!("/deny/{i}"))
             .collect();
-        assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+        assert!(
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).is_err()
+        );
+    }
+
+    fn user_home_roots(paths: &[&str]) -> Vec<HomeRoot> {
+        paths
+            .iter()
+            .map(|path| HomeRoot {
+                path: (*path).to_string(),
+                user_home: true,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn home_directory_roots_cover_platform_roots_and_passwd_homes() {
+        let roots = home_directory_roots();
+        let has = |path: &str| roots.iter().any(|root| root.path == path);
+
+        // Never "/" (which would reject every path) and always absolute.
+        assert!(
+            roots
+                .iter()
+                .all(|root| root.path.starts_with('/') && root.path != "/")
+        );
+        for expected in ["/Users", "/home", "/root", "/var/root"] {
+            assert!(has(expected), "{expected}");
+        }
+        #[cfg(target_os = "macos")]
+        assert!(has("/private/var/root"));
+
+        // Root's homes keep descent protection but never count for the
+        // contains direction: /var and / must stay grantable even though
+        // they contain them.
+        for root_home in ["/root", "/var/root"] {
+            assert!(
+                roots
+                    .iter()
+                    .filter(|root| root.path == root_home)
+                    .all(|root| !root.user_home),
+                "{root_home}"
+            );
+        }
+
+        // Passwd homes are enumerated with no uid floor, wherever they live
+        // (the floor only gates the contains direction via `user_home`).
+        let uid = unsafe { libc::getuid() };
+        let home = home_directory_for_uid(uid).unwrap();
+        if !is_system_stub_home(&home) {
+            let entry = roots
+                .iter()
+                .find(|root| root.path == home)
+                .unwrap_or_else(|| panic!("{home} missing from {roots:?}"));
+            if uid >= FIRST_REGULAR_UID {
+                assert!(entry.user_home, "{home} should count as a user home");
+            }
+        }
+
+        // Service-account stubs never become home roots: treating /var/empty
+        // as a home would make most of /var ungrantable on macOS.
+        for stub in [
+            "/var/empty",
+            "/private/var/empty",
+            "/nonexistent",
+            "/usr/sbin",
+        ] {
+            assert!(!has(stub), "{stub}");
+        }
+    }
+
+    #[test]
+    fn foreign_home_check_covers_nonstandard_home_layouts() {
+        // Synthetic layout: passwd homes on an NFS export, caller is bob.
+        let roots = user_home_roots(&[
+            "/Users",
+            "/home",
+            "/System/Volumes/Data/Users",
+            "/export/home/alice",
+            "/export/home/bob",
+        ]);
+        let caller_home = "/export/home/bob";
+
+        for grant in [
+            "/export/home/alice/docs",
+            "/export/home/alice",
+            "/home/alice",
+        ] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
+        // The caller's own home (a passwd home itself) stays grantable.
+        assert_eq!(
+            foreign_home_conflict("/export/home/bob/docs", caller_home, &roots),
+            None
+        );
+        assert_eq!(
+            foreign_home_conflict("/opt/data", caller_home, &roots),
+            None
+        );
+        // A caller homed under a standard root keeps access to their subtree.
+        assert_eq!(
+            foreign_home_conflict("/home/bob/x", "/home/bob", &roots),
+            None
+        );
+    }
+
+    // A grant CONTAINING a foreign home grants that home's contents just the
+    // same as a grant below it — the read-only rules are recursive with no
+    // counter-deny — so parents of home roots are foreign too.
+    #[test]
+    fn foreign_home_check_rejects_parents_of_home_roots() {
+        let roots = user_home_roots(&[
+            "/Users",
+            "/home",
+            "/System/Volumes/Data/Users",
+            "/export/home/alice",
+            "/export/home/bob",
+        ]);
+        let caller_home = "/export/home/bob";
+
+        // The issue's NFS example: rejecting /export/home/alice but allowing
+        // /export/home would grant alice's home anyway.
+        for grant in ["/export/home", "/export", "/System/Volumes/Data"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Contains),
+                "{grant}"
+            );
+        }
+        for grant in ["/Users", "/home"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
+
+        // The caller's own home and unrelated directories stay grantable,
+        // even when the caller's home is itself an enumerated root.
+        for (grant, caller) in [
+            ("/export/home/bob", caller_home),
+            ("/opt/data", caller_home),
+            ("/Users/bob", "/Users/bob"),
+            ("/Users/bob/src", "/Users/bob"),
+        ] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller, &roots),
+                None,
+                "{grant}"
+            );
+        }
+    }
+
+    // Service accounts homed under system prefixes (macOS: /Library/WebServer,
+    // /var/db/timed, /var/spool/uucp; Debian: /var/www, /var/mail, /run/ircd)
+    // must not make those prefixes ungrantable as read-only extras: only
+    // plausibly-human homes count for the contains direction, while a grant
+    // at or below a service home itself is still refused.
+    #[test]
+    fn service_account_homes_do_not_block_system_prefix_grants() {
+        let mut roots = user_home_roots(&["/Users"]);
+        for service_home in [
+            "/Library/WebServer",
+            "/var/db/timed",
+            "/var/spool/uucp",
+            "/var/www",
+            "/run/ircd",
+        ] {
+            roots.push(HomeRoot {
+                path: service_home.to_string(),
+                user_home: false,
+            });
+        }
+        let caller_home = "/Users/bob";
+
+        for grant in ["/Library", "/var", "/var/db", "/var/spool", "/run"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                None,
+                "{grant}"
+            );
+        }
+        for grant in ["/Library/WebServer", "/var/db/timed/x", "/var/www"] {
+            assert_eq!(
+                foreign_home_conflict(grant, caller_home, &roots),
+                Some(ForeignHomeConflict::Inside),
+                "{grant}"
+            );
+        }
+    }
+
+    // The rejection message must name the actual direction: a grant BELOW a
+    // foreign home "is inside" it, a grant ABOVE one "contains" it.
+    #[test]
+    fn read_only_rejection_message_names_the_direction() {
+        let uid = unsafe { libc::getuid() };
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home = base.join("me");
+        fs::create_dir_all(&caller_home).unwrap();
+        let alice = base.join("homes/alice");
+        fs::create_dir_all(&alice).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![alice.to_string_lossy().into_owned()];
+        let error =
+            validate_policy(Some(&policy), uid, caller_home.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is inside another user's home directory"),
+            "{error}"
+        );
+
+        let mut policy = SandboxPolicy::default();
+        policy.paths.read_only = vec![base.join("homes").to_string_lossy().into_owned()];
+        let error =
+            validate_policy(Some(&policy), uid, caller_home.to_str().unwrap(), &roots).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contains another user's home directory"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // The client-supplied cwd becomes a read+write grant, so it gets the same
+    // treatment as the policy widenings: caller ownership plus the
+    // foreign-home check — `cwd = /Users/<other>` must not hand the sandbox
+    // another user's home.
+    #[test]
+    fn cwd_must_be_caller_owned_and_outside_foreign_homes() {
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 {
+            return;
+        }
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home_dir = base.join("me");
+        fs::create_dir_all(&caller_home_dir).unwrap();
+        let caller_home = caller_home_dir.to_str().unwrap();
+        let alice = base.join("homes/alice");
+        fs::create_dir_all(alice.join("project")).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        // A caller-owned directory outside anyone's home is accepted.
+        assert!(validated_cwd(&caller_home_dir, uid, caller_home, &roots).is_ok());
+        // Inside another user's home: rejected even when caller-owned.
+        let error = validated_cwd(&alice.join("project"), uid, caller_home, &roots).unwrap_err();
+        assert!(error.to_string().contains("another user's home"), "{error}");
+        // Containing another user's home: rejected.
+        assert!(validated_cwd(&base.join("homes"), uid, caller_home, &roots).is_err());
+        // Not owned by the caller: rejected (root-owned /usr).
+        let error = validated_cwd(Path::new("/usr"), uid, caller_home, &roots).unwrap_err();
+        assert!(error.to_string().contains("not owned by uid"), "{error}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn state_dirs_refuse_any_symlinked_entry() {
+        let uid = unsafe { libc::getuid() };
+        let home = owned_tmpdir().canonicalize().unwrap();
+        let caller_home = home.to_str().unwrap();
+
+        fs::create_dir_all(home.join("state")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        std::os::unix::fs::symlink(home.join("real"), home.join("inner")).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), home.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&home, home.join("self")).unwrap();
+
+        // A real dir keeps its name; a missing one passes through untouched.
+        assert_eq!(
+            validated_state_dir("state", uid, caller_home).unwrap(),
+            "state"
+        );
+        assert_eq!(
+            validated_state_dir("absent", uid, caller_home).unwrap(),
+            "absent"
+        );
+        // A symlink staying inside the home is refused, never rewritten to
+        // its target: under narrow-home a rewrite would convert the state
+        // grant into a write grant on the target (e.g. ~/.ssh).
+        let error = validated_state_dir("inner", uid, caller_home).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        // A symlink out of the home (the `~/.cache -> /` escape) is refused...
+        let error = validated_state_dir("escape", uid, caller_home).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        // ...and so is one resolving to the home itself, which would undo
+        // narrow-home entirely.
+        assert!(validated_state_dir("self", uid, caller_home).is_err());
+
+        // The same refusal holds end-to-end through policy validation.
+        let mut policy = SandboxPolicy::default();
+        policy.paths.narrow_home = true;
+        policy.paths.agent_state_dirs = vec!["escape".into()];
+        assert!(validate_policy(Some(&policy), uid, caller_home, &home_directory_roots()).is_err());
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1652,7 +2568,8 @@ mod tests {
             ..SandboxPolicy::default()
         };
 
-        let error = validate_policy(Some(&policy), uid, &caller_home).unwrap_err();
+        let error =
+            validate_policy(Some(&policy), uid, &caller_home, &home_directory_roots()).unwrap_err();
         assert!(error.to_string().contains("blocked LAN ranges"), "{error}");
     }
 

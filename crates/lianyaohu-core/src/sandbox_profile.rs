@@ -25,24 +25,11 @@ impl SandboxProfile {
     pub fn render(&self) -> String {
         let home_write_section = self.home_write_section();
         let user_sections = self.user_sections();
-        let home_global_preferences = scheme_string(&format!(
-            "{}/Library/Preferences/.GlobalPreferences.plist",
-            self.home
-        ));
-        let home_by_host_preferences =
-            scheme_string(&format!("{}/Library/Preferences/ByHost", self.home));
 
         format!(
             r#"(version 1)
 
 (deny default)
-
-(deny file-read*
-    (literal "/etc/localtime")
-    (literal "/private/etc/localtime")
-    (literal "/Library/Preferences/.GlobalPreferences.plist")
-    (literal "{home_global_preferences}")
-    (subpath "{home_by_host_preferences}"))
 
 (deny system-socket)
 (deny socket-ioctl)
@@ -149,17 +136,10 @@ impl SandboxProfile {
     (subpath "/private/tmp")
     (subpath "/tmp"))
 
-; Bun/JavaScriptCore initializes ICU timezone data during startup. With TZ=UTC,
-; it still reads the versioned UTC zoneinfo and ICU timezone bundle; allow only
-; those UTC data files while keeping localtime and preference-based timezone
-; identity blocked above.
-(allow file-read*
-    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
-    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
-    (regex #"^/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$"))
+; The timezone-database deny and its UTC-only carve-out are emitted in the
+; user sections at the end of the profile, AFTER any user read-only allows —
+; seatbelt is last-match-wins, so emitting them here would let a
+; `paths.read_only` extra covering the tree re-open it.
 
 ; TUI agents (codex, fish, claude) put the terminal into raw mode with
 ; tcsetattr and open /dev/tty; both need ioctl access to the pty devices.
@@ -238,8 +218,9 @@ impl SandboxProfile {
         } else {
             format!(
                 r#"; $HOME is writable so agents can maintain their own state (~/.claude,
-; ~/.codex, credential and cache files). The identity-surface denials above
-; still win over this allow. /opt/homebrew is writable so agents can
+; ~/.codex, credential and cache files). Seatbelt is last-match-wins, so the
+; identity-surface denials emitted after this allow carve the timezone
+; preference files back out of it. /opt/homebrew is writable so agents can
 ; brew install the tools they need.
 (allow file-read* file-write* file-map-executable
     (subpath "{home}")
@@ -250,12 +231,21 @@ impl SandboxProfile {
         }
     }
 
-    /// User-policy blocks appended after everything else. Seatbelt is
-    /// last-match-wins, so the deny block being the final rules in the profile
-    /// is what lets it override every allow above, including the writable
-    /// roots. Empty when the policy is default, keeping the rendered profile
-    /// byte-identical to the historical output.
+    /// User-policy blocks plus the identity/timezone denials, appended after
+    /// everything else. Seatbelt is last-match-wins, so the ordering here is
+    /// load-bearing: the user's read-only allows render first, then the
+    /// timezone-database deny with its UTC-only carve-out and the identity
+    /// deny block (so a `paths.read_only` entry covering the timezone tree or
+    /// the identity paths cannot re-allow them), and the user `paths.deny`
+    /// block stays the very last rules in the profile so it overrides every
+    /// allow above, including the writable roots.
     fn user_sections(&self) -> String {
+        let home_global_preferences = scheme_string(&format!(
+            "{}/Library/Preferences/.GlobalPreferences.plist",
+            self.home
+        ));
+        let home_by_host_preferences =
+            scheme_string(&format!("{}/Library/Preferences/ByHost", self.home));
         let mut out = String::new();
         if !self.paths.read_only.is_empty() {
             out.push_str("\n; Extra read-only paths from the user policy.\n(allow file-read*");
@@ -264,6 +254,43 @@ impl SandboxProfile {
             }
             out.push_str(")\n");
         }
+        out.push_str(
+            "\n; The timezone database is denied wholesale, AFTER any user read-only\n\
+             ; allows above (so a read-only extra covering the tree cannot re-open\n\
+             ; it) and BEFORE the UTC-only allow below. Seatbelt is last-match-wins,\n\
+             ; so the later allow carves the UTC data files back out while every\n\
+             ; other zone file — including the real zone file that the\n\
+             ; /etc/localtime symlink resolves to before rule matching — is denied\n\
+             ; by an explicit rule instead of being blocked only incidentally by\n\
+             ; not matching any allow.\n\
+             (deny file-read*\n    \
+             (subpath \"/var/db/timezone\")\n    \
+             (subpath \"/private/var/db/timezone\"))\n\
+             \n\
+             ; Bun/JavaScriptCore initializes ICU timezone data during startup. With\n\
+             ; TZ=UTC, it still reads the versioned UTC zoneinfo and ICU timezone\n\
+             ; bundle; allow only those UTC data files. Preference-based timezone\n\
+             ; identity stays blocked by the identity deny block just below.\n\
+             (allow file-read*\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/zoneinfo/UTC$\")\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$\")\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/icutz/[^/]+\\.dat$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/icutz/[^/]+\\.dat$\"))\n",
+        );
+        out.push_str(&format!(
+            "\n; Timezone/identity denials. Seatbelt is last-match-wins, so these must\n\
+             ; come AFTER the $HOME writable allow, the /private/etc read allow, and\n\
+             ; any user read-only allows above, or those allows override them. Only\n\
+             ; the user paths.deny block may follow.\n\
+             (deny file-read* file-write*\n    \
+             (literal \"/etc/localtime\")\n    \
+             (literal \"/private/etc/localtime\")\n    \
+             (literal \"/Library/Preferences/.GlobalPreferences.plist\")\n    \
+             (literal \"{home_global_preferences}\")\n    \
+             (subpath \"{home_by_host_preferences}\"))\n"
+        ));
         if !self.paths.deny.is_empty() {
             out.push_str(
                 "\n; Denied paths from the user policy. Seatbelt is last-match-wins, so\n\
@@ -345,7 +372,12 @@ mod tests {
         assert!(profile.contains(r#"(global-name "com.apple.system.opendirectoryd.libinfo")"#));
         assert!(profile.contains("/private/etc/localtime"));
         assert!(profile.contains("zoneinfo/UTC"));
-        assert!(!profile.contains(r#"(subpath "/private/var/db/timezone")"#));
+        // The timezone database must be explicitly denied, never allowed
+        // wholesale; only the UTC data files are carved back out.
+        assert!(profile.contains(
+            "(deny file-read*\n    (subpath \"/var/db/timezone\")\n    (subpath \"/private/var/db/timezone\"))"
+        ));
+        assert!(!profile.contains("(allow file-read*\n    (subpath \"/var/db/timezone\")"));
         assert!(profile.contains(r#"(remote tcp "*:*")"#));
         assert!(profile.contains(r#"(remote udp "*:*")"#));
     }
@@ -365,9 +397,156 @@ mod tests {
         // render to the historical profile.
         assert!(!profile.contains("user policy"));
         assert!(!profile.contains("Narrow-home"));
-        assert!(profile.ends_with(
-            "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n"
-        ));
+        assert!(profile.ends_with("(subpath \"/Users/example/Library/Preferences/ByHost\"))\n"));
+    }
+
+    #[test]
+    fn identity_denials_come_after_home_and_etc_allows() {
+        let profile =
+            SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
+
+        // Seatbelt is last-match-wins: if the timezone/identity denials sit
+        // before the blanket $HOME write allow or the /private/etc read allow,
+        // those allows silently override them and the denials are dead rules.
+        let deny_block = r#"(deny file-read* file-write*
+    (literal "/etc/localtime")
+    (literal "/private/etc/localtime")
+    (literal "/Library/Preferences/.GlobalPreferences.plist")
+    (literal "/Users/example/Library/Preferences/.GlobalPreferences.plist")
+    (subpath "/Users/example/Library/Preferences/ByHost"))"#;
+        let deny_at = profile.find(deny_block).expect("identity deny block");
+        let home_allow_at = profile
+            .find("(subpath \"/Users/example\")")
+            .expect("home allow");
+        let etc_allow_at = profile
+            .find("(subpath \"/private/etc\")")
+            .expect("/private/etc allow");
+        assert!(
+            deny_at > home_allow_at,
+            "identity denials before home allow"
+        );
+        assert!(deny_at > etc_allow_at, "identity denials before /etc allow");
+    }
+
+    #[test]
+    fn zoneinfo_deny_comes_before_utc_allow() {
+        let profile =
+            SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
+
+        // Seatbelt is last-match-wins: the wholesale timezone-database deny
+        // must precede the UTC-only allow so the allow carves the UTC data
+        // files back out while everything else in the tree stays explicitly
+        // denied (including the resolved target of the /etc/localtime
+        // symlink, which would otherwise be blocked only incidentally).
+        let deny_at = profile
+            .find("(deny file-read*\n    (subpath \"/var/db/timezone\")")
+            .expect("zoneinfo tree deny");
+        let utc_allow_at = profile
+            .find(r##"(regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")"##)
+            .expect("UTC allow");
+        assert!(
+            deny_at < utc_allow_at,
+            "zoneinfo deny must precede the UTC allow or it kills the UTC carve-out"
+        );
+    }
+
+    #[test]
+    fn identity_denials_render_between_user_read_only_allow_and_user_deny() {
+        let paths = PathPolicy {
+            read_only: vec!["/Users/example/Library/Preferences".into()],
+            deny: vec!["/Users/example/.ssh".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        // Seatbelt is last-match-wins: a paths.read_only allow covering the
+        // identity paths must render BEFORE the identity deny block or it
+        // re-allows the identity plists; the user paths.deny block must stay
+        // the very last rules in the profile.
+        let read_only_allow_at = profile
+            .find("(subpath \"/Users/example/Library/Preferences\")")
+            .expect("user read_only allow");
+        let identity_deny_at = profile
+            .find("(literal \"/Users/example/Library/Preferences/.GlobalPreferences.plist\")")
+            .expect("identity deny");
+        let user_deny_at = profile
+            .find("(literal \"/Users/example/.ssh\")")
+            .expect("user deny");
+        assert!(
+            read_only_allow_at < identity_deny_at,
+            "identity denials must come after the user read_only allow"
+        );
+        assert!(
+            identity_deny_at < user_deny_at,
+            "user paths.deny must remain the very last rules"
+        );
+    }
+
+    #[test]
+    fn zoneinfo_deny_renders_after_user_read_only_allow_and_before_user_deny() {
+        let paths = PathPolicy {
+            read_only: vec!["/private/var/db/timezone".into()],
+            deny: vec!["/Users/example/.ssh".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        // Seatbelt is last-match-wins: a paths.read_only extra covering the
+        // timezone database must render BEFORE the zoneinfo deny or it
+        // re-opens the whole tree (and with it the resolved target of the
+        // /etc/localtime symlink). The UTC carve-out must immediately follow
+        // the deny so UTC data stays readable, and the user paths.deny block
+        // must stay the very last rules.
+        let read_only_allow_at = profile
+            .find("(allow file-read*\n    (subpath \"/private/var/db/timezone\"))")
+            .expect("user read_only allow");
+        let zoneinfo_deny_at = profile
+            .find("(deny file-read*\n    (subpath \"/var/db/timezone\")")
+            .expect("zoneinfo tree deny");
+        let utc_allow_at = profile
+            .find(r##"(regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")"##)
+            .expect("UTC allow");
+        let user_deny_at = profile
+            .find("(literal \"/Users/example/.ssh\")")
+            .expect("user deny");
+        assert!(
+            read_only_allow_at < zoneinfo_deny_at,
+            "zoneinfo deny must come after the user read_only allow"
+        );
+        assert!(
+            zoneinfo_deny_at < utc_allow_at,
+            "UTC carve-out must follow the zoneinfo deny or the deny kills it"
+        );
+        assert!(
+            utc_allow_at < user_deny_at,
+            "user paths.deny must remain the very last rules"
+        );
+    }
+
+    #[test]
+    fn user_deny_paths_stay_last_after_identity_denials() {
+        let paths = PathPolicy {
+            deny: vec!["/Users/example/.ssh".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        let identity_deny_at = profile
+            .find("(literal \"/Users/example/Library/Preferences/.GlobalPreferences.plist\")")
+            .expect("identity deny");
+        let user_deny_at = profile
+            .find("(literal \"/Users/example/.ssh\")")
+            .expect("user deny");
+        assert!(
+            user_deny_at > identity_deny_at,
+            "user paths.deny must remain the very last rules"
+        );
     }
 
     #[test]
@@ -681,6 +860,242 @@ mod tests {
         let result = run_in_sandbox(&["/bin/cat", "/private/etc/localtime"]);
 
         assert_ne!(result.status, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_blocks_home_timezone_preferences() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // The $HOME copies of the timezone/identity preferences sit inside the
+        // blanket-writable home. Seatbelt is last-match-wins, so the identity
+        // denials must be emitted after the home allow or the allow silently
+        // wins; this pins the runtime behavior with a scratch home.
+        let (root, home, tmpdir) = scratch_home_layout();
+        let prefs = home.join("Library/Preferences");
+        fs::create_dir_all(prefs.join("ByHost")).unwrap();
+        fs::write(prefs.join(".GlobalPreferences.plist"), "identity").unwrap();
+        fs::write(prefs.join("ByHost/com.apple.example.plist"), "identity").unwrap();
+        fs::write(home.join("readable"), "fine").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        );
+
+        let global_prefs = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join(".GlobalPreferences.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let by_host = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join("ByHost/com.apple.example.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let write_attempt = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/touch".into(),
+                prefs.join("ByHost/planted.plist").to_string_lossy().into(),
+            ],
+        );
+        let control = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                home.join("readable").to_string_lossy().into(),
+            ],
+        );
+
+        let planted = prefs.join("ByHost/planted.plist").exists();
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(
+            global_prefs.status, 0,
+            "$HOME .GlobalPreferences.plist was readable despite the deny"
+        );
+        assert_ne!(
+            by_host.status, 0,
+            "$HOME Library/Preferences/ByHost was readable despite the deny"
+        );
+        assert_ne!(
+            write_attempt.status, 0,
+            "$HOME Library/Preferences/ByHost was writable despite the deny"
+        );
+        assert!(!planted);
+        assert_eq!(control.status, 0, "control read failed: {}", control.output);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_extra_cannot_reallow_identity_preferences() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // A user paths.read_only grant covering ~/Library/Preferences renders
+        // as an (allow file-read* ...) in the user sections. Seatbelt is
+        // last-match-wins, so if the identity deny block rendered before that
+        // allow, the allow would silently re-open the identity plists. This
+        // pins the runtime behavior: the identity files stay denied while the
+        // rest of the granted subtree reads fine.
+        let (root, home, tmpdir) = scratch_home_layout();
+        let prefs = home.join("Library/Preferences");
+        fs::create_dir_all(prefs.join("ByHost")).unwrap();
+        fs::write(prefs.join(".GlobalPreferences.plist"), "identity").unwrap();
+        fs::write(prefs.join("ByHost/com.apple.example.plist"), "identity").unwrap();
+        fs::write(prefs.join("com.example.app.plist"), "fine").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let paths = PathPolicy {
+            read_only: vec![prefs.to_string_lossy().into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        )
+        .with_paths(paths);
+
+        let global_prefs = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join(".GlobalPreferences.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let by_host = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join("ByHost/com.apple.example.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let control = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs.join("com.example.app.plist").to_string_lossy().into(),
+            ],
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(
+            global_prefs.status, 0,
+            "paths.read_only re-allowed $HOME .GlobalPreferences.plist"
+        );
+        assert_ne!(
+            by_host.status, 0,
+            "paths.read_only re-allowed $HOME Library/Preferences/ByHost"
+        );
+        assert_eq!(
+            control.status, 0,
+            "control read under the read_only grant failed: {}",
+            control.output
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_extra_cannot_reallow_timezone_database() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // A user paths.read_only grant covering /private/var/db/timezone
+        // renders as an (allow file-read* ...) in the user sections. Seatbelt
+        // is last-match-wins, so if the zoneinfo deny rendered before that
+        // allow, the allow would silently re-open the timezone database — and
+        // with it /etc/localtime, whose symlink target resolves into the tree
+        // before rule matching. This pins the runtime behavior: the tree and
+        // /etc/localtime stay denied while the UTC carve-out keeps working.
+        let (root, home, tmpdir) = scratch_home_layout();
+        let cwd = std::env::current_dir().unwrap();
+        let paths = PathPolicy {
+            read_only: vec!["/private/var/db/timezone".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        )
+        .with_paths(paths);
+
+        // The host's configured zone target. Skip the localtime probes on the
+        // (unusual) host whose local zone IS one of the carved-out UTC data
+        // files, where a successful read is the intended behavior.
+        let zone_target = fs::read_link("/etc/localtime")
+            .map(|target| target.to_string_lossy().to_string())
+            .ok()
+            .filter(|target| !target.ends_with("/UTC") && !target.ends_with("/posixrules"));
+        let localtime = zone_target.as_ref().map(|_| {
+            run_profile(
+                &profile,
+                &tmpdir,
+                vec!["/bin/cat".into(), "/etc/localtime".into()],
+            )
+        });
+        let resolved_zone = zone_target
+            .as_ref()
+            .map(|target| run_profile(&profile, &tmpdir, vec!["/bin/cat".into(), target.clone()]));
+        let utc = find_utc_timezone_file().map(|path| {
+            run_profile(
+                &profile,
+                &tmpdir,
+                vec!["/bin/cat".into(), path.to_string_lossy().into()],
+            )
+        });
+
+        let _ = fs::remove_dir_all(&root);
+        if zone_target.is_none() {
+            eprintln!("skipping localtime probes; /etc/localtime is not a non-UTC symlink");
+        }
+        if let Some(localtime) = localtime {
+            assert_ne!(
+                localtime.status, 0,
+                "paths.read_only over the timezone DB re-allowed /etc/localtime"
+            );
+        }
+        if let Some(resolved_zone) = resolved_zone {
+            assert_ne!(
+                resolved_zone.status, 0,
+                "paths.read_only over the timezone DB re-allowed the zoneinfo target"
+            );
+        }
+        if let Some(utc) = utc {
+            assert_eq!(
+                utc.status, 0,
+                "UTC carve-out broken under a timezone read_only extra: {}",
+                utc.output
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

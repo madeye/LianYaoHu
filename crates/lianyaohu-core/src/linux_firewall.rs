@@ -68,13 +68,29 @@ impl LinuxFirewallRuleSet {
     }
 
     pub fn chain_name(&self) -> String {
-        format!("LYH-{}", self.anchor_key)
+        // User- and group-scoped rule sets must never share a chain: the
+        // sudo shared-user path flushes its chain wholesale on install and
+        // uninstall, and with a shared name that wipe would empty a live
+        // helper session's chain out from under a still-running agent (the
+        // helper's uid+gid OUTPUT jump would then fall through to the
+        // default-ACCEPT policy). Both prefixes stay under `LYH-` so the
+        // helper's stale-chain reaper covers them.
+        match self.socket_owner {
+            LinuxSocketOwner::User(_) => format!("LYH-U-{}", self.anchor_key),
+            LinuxSocketOwner::UserAndGroup(..) => format!("LYH-{}", self.anchor_key),
+        }
     }
 
     /// Proxy-only mode: no VPN interface at all; only loopback egress (the
     /// local proxy) may pass.
     pub fn is_proxy_only(&self) -> bool {
         self.interface_name == crate::interfaces::PROXY_ONLY_INTERFACE
+    }
+
+    /// True for the current-UID fallback scope (`install`); false for the
+    /// group-scoped rules a helper `run` session installs.
+    pub fn is_user_scoped(&self) -> bool {
+        matches!(self.socket_owner, LinuxSocketOwner::User(_))
     }
 
     pub fn render(&self) -> String {
@@ -119,6 +135,12 @@ impl LinuxFirewallRuleSet {
         let args =
             |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
 
+        // The loopback RETURN also exempts stub-resolver DNS (127.0.0.53 /
+        // 127.0.0.1): the stub daemon's upstream queries are sent by its own
+        // UID, so the owner match never sees them and they follow the system
+        // routing table — the Linux analogue of macOS mDNSResponder. This is
+        // documented in website/security-model.md (DNS resolution); scoping
+        // the rule would break resolution outright rather than confine it.
         let mut commands = vec![
             args(&["-w", "-N", &chain]),
             args(&["-w", "-F", &chain]),
@@ -466,14 +488,48 @@ mod tests {
     }
 
     #[test]
+    fn loopback_return_is_the_first_appended_rule() {
+        // Position, not containment: the documented stub-resolver DNS
+        // exemption (website/security-model.md, "DNS resolution") depends on
+        // the `-o lo -j RETURN` rule preceding every LAN REJECT in the
+        // first-match-wins chain, so assert its exact slot right after the
+        // chain create/flush for both families and both scopes.
+        let args =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
+        let rule_sets = [
+            LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000),
+            LinuxFirewallRuleSet::new_user("tun0", 1000),
+        ];
+        for rule_set in rule_sets {
+            let chain = rule_set.chain_name();
+            for family in [IpFamily::V4, IpFamily::V6] {
+                let commands = rule_set.setup_commands(family);
+                assert_eq!(commands[0], args(&["-w", "-N", &chain]));
+                assert_eq!(commands[1], args(&["-w", "-F", &chain]));
+                assert_eq!(
+                    commands[2],
+                    args(&["-w", "-A", &chain, "-o", "lo", "-j", "RETURN"])
+                );
+                // The loopback RETURN is the first `-A` overall, so no
+                // earlier rule can shadow it.
+                let first_append = commands
+                    .iter()
+                    .position(|command| command.get(1).map(String::as_str) == Some("-A"))
+                    .expect("setup commands must append rules");
+                assert_eq!(first_append, 2);
+            }
+        }
+    }
+
+    #[test]
     fn stale_chain_listing_parses_jumps_and_chains() {
         let listing = "\
 -P OUTPUT ACCEPT
 -N DOCKER-USER
 -N LYH-1000
--N LYH-1001
+-N LYH-U-1001
 -A OUTPUT -m owner --uid-owner 1000 --gid-owner 2000000 -j LYH-1000
--A OUTPUT -m owner --uid-owner 1001 -j LYH-1001
+-A OUTPUT -m owner --uid-owner 1001 -j LYH-U-1001
 -A OUTPUT -j DOCKER-USER
 -A LYH-1000 -o lo -j RETURN
 -A LYH-1000 -d 10.0.0.0/8 -j REJECT
@@ -481,7 +537,12 @@ mod tests {
 
         let (jumps, chains) = parse_stale_chain_listing(listing);
 
-        assert_eq!(chains, vec!["LYH-1000".to_string(), "LYH-1001".to_string()]);
+        // Group-scoped (`LYH-<uid>`) and sudo user-scoped (`LYH-U-<uid>`)
+        // chains are both reaped.
+        assert_eq!(
+            chains,
+            vec!["LYH-1000".to_string(), "LYH-U-1001".to_string()]
+        );
         assert_eq!(
             jumps,
             vec![
@@ -503,7 +564,7 @@ mod tests {
                     "--uid-owner".to_string(),
                     "1001".to_string(),
                     "-j".to_string(),
-                    "LYH-1001".to_string(),
+                    "LYH-U-1001".to_string(),
                 ],
             ]
         );
@@ -514,8 +575,37 @@ mod tests {
         let rules = LinuxFirewallRuleSet::new_user("wg0", 1000).render();
 
         assert!(rules.contains("# Scope: packets owned by uid 1000."));
-        assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 -j LYH-1000"));
-        assert!(rules.contains("iptables -w -A LYH-1000 -o wg0 -j RETURN"));
+        assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 -j LYH-U-1000"));
+        assert!(rules.contains("iptables -w -A LYH-U-1000 -o wg0 -j RETURN"));
+    }
+
+    // Regression test for #58: the sudo shared-user guard flushes its chain
+    // wholesale on install and uninstall, so the user-scoped rule set must
+    // own a chain distinct from the helper's group-scoped chain for the same
+    // uid — a shared name would let a shared-user launch (or exit) empty a
+    // live helper session's chain out from under a running agent.
+    #[test]
+    fn user_scope_commands_never_touch_the_group_chain() {
+        let user = LinuxFirewallRuleSet::new_user("wg0", 1000);
+        let group = LinuxFirewallRuleSet::new_group("wg0", 1000, 2_000_000);
+        assert_eq!(user.chain_name(), "LYH-U-1000");
+        assert_eq!(group.chain_name(), "LYH-1000");
+
+        let group_chain = group.chain_name();
+        for (_, command) in user.cleanup_commands() {
+            assert!(
+                !command.iter().any(|arg| arg == &group_chain),
+                "{command:?}"
+            );
+        }
+        for family in [IpFamily::V4, IpFamily::V6] {
+            for command in user.setup_commands(family) {
+                assert!(
+                    !command.iter().any(|arg| arg == &group_chain),
+                    "{command:?}"
+                );
+            }
+        }
     }
 
     fn policy(entries: &[(&str, &str)]) -> NetworkPolicy {

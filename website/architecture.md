@@ -37,7 +37,7 @@ launcher and the helper, so both sides always render identical rules:
 | `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, the rendered sandbox profile/summary field, and (spec v2) the typed `SandboxPolicy`. A helper older than the spec's version refuses to run it. |
 | `pf` | macOS: `PFRuleSet` renders the PF anchor rules for a `(utun, socket owner, network policy)` tuple; the default helper path matches the `_lianyaohu` group, while the fallback path matches the caller UID. `PFGuard` installs fallback rules via the helper or sudo and uninstalls on `Drop`. |
 | `linux_firewall` | Linux: `LinuxFirewallRuleSet` renders and installs iptables/ip6tables OUTPUT chains for a `(tun/wg, socket owner, network policy)` tuple; the default helper path matches `_lianyaohu`, while the fallback path matches the caller UID. |
-| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, `capabilities` probes policy support for version negotiation, and `install <utun>`, `uninstall`, `status` remain for the current-UID fallback. |
+| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, `capabilities` probes policy support for version negotiation, and `install <utun> [policy]`, `uninstall`, `status` remain for the current-UID fallback (a non-default network policy travels with the install request and is negotiated the same way). |
 
 ### `lianyaohu-app` (launcher)
 
@@ -89,14 +89,17 @@ that owns the privileged half of firewall enforcement:
   installs firewall rules matching the `_lianyaohu` group in the caller's
   anchor/chain, and runs the command as the caller UID with `_lianyaohu` as the
   effective GID and the caller's normal supplementary groups.
-- Also accepts `install <interface>`, `uninstall`, and `status` for the
-  `--shared-user-firewall` fallback. In that path generated rules are scoped
-  to the peer UID.
+- Also accepts `install <interface> [policy]`, `uninstall`, and `status` for
+  the `--shared-user-firewall` fallback. In that path generated rules are
+  scoped to the peer UID; a non-default network policy travels as typed JSON
+  in the install request and is re-validated helper-side before it is applied.
 - Answers `capabilities` with its supported spec features (`policy=1
-  spec_version=2`). Clients probe this before sending a non-default sandbox
-  policy; an old helper answers the unknown verb with an error line, which is
-  the client's signal to hard-error instead of running with a silently
-  narrower policy. The helper re-validates every policy field it receives —
+  install_policy=1 spec_version=2`). Clients probe this before sending a
+  non-default sandbox policy; an old helper answers the unknown verb with an
+  error line, which is the client's signal to hard-error instead of running
+  with a silently narrower policy. The install path probes `install_policy`
+  the same way and falls back to `sudo pfctl` — which renders the full rule
+  set — rather than letting an old helper install weaker default rules. The helper re-validates every policy field it receives —
   ownership and canonicalization for extra writable paths, a system-prefix
   denylist, other-users'-home rejection for read-only extras, LAN-exception
   containment, and list caps — before rebuilding the profile and rules.
@@ -105,16 +108,20 @@ that owns the privileged half of firewall enforcement:
 - On macOS, writes rules to `/var/run/lianyaohu/rules-<uid>-<utun>.pf` (mode
   `0600`), vets them with `pfctl -n`, enables PF with `pfctl -E` (tracking the
   enable token per uid), and loads the anchor.
-- On Linux, creates `LYH-<uid>` iptables/ip6tables chains and inserts an
-  OUTPUT owner jump matching either gid `2000000` or the caller uid.
+- On Linux, creates `LYH-<uid>` (group-scoped) or `LYH-U-<uid>` (user-scoped)
+  iptables/ip6tables chains and inserts an OUTPUT owner jump matching either
+  gid `2000000` or the caller uid. The scopes use distinct chain names so a
+  user-scoped install can never flush a live group session's chain.
 - `uninstall` flushes the caller's anchor/chain and releases tracked state.
   SIGINT/SIGTERM unlink the socket on the way out.
 
 ## PF anchor
 
-Rules load into `com.apple/lianyaohu-<uid>`, which macOS' default
-`/etc/pf.conf` evaluates through its `anchor "com.apple/*"` point — no edits
-to system PF configuration. For caller uid `U`, socket owner `O`, and
+Rules load into `com.apple/lianyaohu-<uid>` (group-scoped) or
+`com.apple/lianyaohu-user-<uid>` (the user-scoped fallback; distinct so a
+fallback install can never replace a live group session's rules), which
+macOS' default `/etc/pf.conf` evaluates through its `anchor "com.apple/*"`
+point — no edits to system PF configuration. For caller uid `U`, socket owner `O`, and
 interface `utunN` the generated policy is, in order:
 
 1. `pass` loopback TCP/UDP for owner `O`.
@@ -135,9 +142,13 @@ both paths.
 
 Linux rules use `iptables -m owner` and `ip6tables -m owner` from the OUTPUT
 hook. For caller uid `U`, socket owner `O`, and interface `tun0`/`wg0`, the
-generated `LYH-U` policy is:
+generated chain policy (`LYH-<uid>`, or `LYH-U-<uid>` for the user-scoped
+fallback) is:
 
-1. Return immediately for loopback.
+1. Return immediately for loopback. This exempts stub-resolver DNS
+   (`127.0.0.53`/`127.0.0.1`); the stub's upstream queries are not owner
+   `O` and follow the system routing table (see the security model's DNS
+   section).
 2. Reject LAN, carrier-grade NAT, link-local, multicast, and IPv6
    unique-local/link-local/multicast destinations.
 3. Return for traffic already leaving the selected VPN interface.

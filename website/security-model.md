@@ -26,9 +26,15 @@ On Linux, Landlock applies a deny-default filesystem ruleset. `$HOME`, the
 selected working directory, the per-launch tmpdir, `/tmp`, `/var/tmp`,
 `/dev/pts`, and `/dev/shm` are writable, plus the individual device files
 `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`,
-`/dev/tty`, and `/dev/ptmx` (the rest of `/dev` is not granted); `/bin`,
-`/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/opt`, and the process' own
-`/proc` entries are read-only. If the kernel does not
+`/dev/tty`, and `/dev/ptmx` (the rest of `/dev` is not granted); `/usr`,
+`/etc`, `/opt`, and the process's own `/proc/<pid>` directory are read-only
+(`/proc/self` and `/proc/thread-self` are magic symlinks that Landlock rule
+installation refuses, so the grant is attached to the real per-process
+directory, resolved in the sandboxed process itself; children the agent
+spawns share the Landlock domain but get no rule on their own `/proc`
+entries). `/bin`, `/sbin`, `/lib`, and `/lib64` are read-only where they are
+real directories; on merged-`/usr` systems they are symlinks covered by the
+`/usr` rule. If the kernel does not
 support Landlock, launch fails instead of silently degrading to firewall-only
 mode.
 
@@ -38,7 +44,11 @@ the agent; stronger identifiers such as `kern.uuid` remain blocked and
 `HOSTNAME` is still stripped from the environment.
 
 Timezone preference files are explicitly denied and the launched environment
-sets `TZ=UTC`.
+sets `TZ=UTC`. One caveat: in the default wide-home mode these are path-based
+denials inside a writable tree, so an in-sandbox process can evade them by
+renaming a parent directory (e.g. `mv ~/Library ~/L2`) and reading the files
+under the new path. Narrow-home mode keeps those parents read-only, which
+closes the rename route.
 
 By default the helper runs the guarded process with the caller's UID and the
 dedicated `_lianyaohu` effective GID. On macOS, the sandbox profile describes
@@ -57,8 +67,28 @@ The configuration layer can add to — or narrow — the default grants:
   re-validates them like the launch roots: canonicalized against the real
   filesystem, never `/`, and writable extras must be **owned by the caller**
   and outside a protected-prefix denylist (`/etc`, `/usr`, `/System`,
-  `/Library`, `/var/db`, …). Read-only extras may not reach into another
-  user's home.
+  `/Library`, `/var/db`, …). Read-only extras may not reach into — or
+  contain — another user's home: the helper checks the standard home roots
+  (`/Users`, `/home`, `/root`, `/var/root`, and the APFS
+  `/System/Volumes/Data/Users` alias) resolved through symlinks, plus every
+  user's home directory from the local passwd database (service-account
+  stubs like `/var/empty` excepted), and rejects a grant at or below any of
+  them. A grant **above** a home is rejected too when the contained home is
+  plausibly a real user's — the standard human-home roots, or a passwd home
+  whose account uid is at or above the platform's regular-user floor (500 on
+  macOS, 1000 on Linux) — so `/export/home` is refused just like
+  `/export/home/alice`, while system service accounts homed under `/Library`
+  or `/var` (e.g. `_www` at `/Library/WebServer`, Debian's `www-data` at
+  `/var/www`) do not make those system prefixes ungrantable; the service
+  homes themselves still reject grants at or below them. Nonstandard
+  layouts with local passwd entries (NFS exports, systemd-homed) are
+  covered the same way, provided the accounts use regular-range uids. Two
+  caveats: accounts served by a directory service with enumeration disabled
+  (LDAP, Active Directory, Open Directory) are invisible to the passwd
+  walk, so their homes are only auto-protected when they live under one of
+  the standard roots above; and a real user below the regular-uid floor
+  gets descent protection for their home but not the parent-grant
+  rejection.
 - **Denied paths** (`paths.deny`, e.g. `~/.ssh`) are rendered as the *final*
   seatbelt rules, so they override every allow — the entries become
   unreadable and unwritable even inside the writable `$HOME`. **Linux cannot
@@ -68,8 +98,14 @@ The configuration layer can add to — or narrow — the default grants:
 - **Narrow-home mode** replaces the blanket writable `$HOME` with per-entry
   grants for the configured agent state locations (plus cwd and the launch
   tmpdir); `$HOME` stays readable so dotfiles and installed tooling keep
-  working. This is enforced identically on both platforms and is the
-  strongest filesystem posture.
+  working. The state entries are writable grants, so the helper checks each
+  one against the real filesystem: an entry that resolves through a symlink
+  is refused outright — whether it points outside the home (`~/.cache -> /`),
+  at the home itself, or at a sibling inside the home (`~/.cache -> ~/.ssh`)
+  — and so is an entry not owned by the caller. Symlinked entries are never
+  rewritten to their targets, so a planted link cannot convert a state-dir
+  grant into a write grant on the link's destination. This mode is enforced
+  identically on both platforms and is the strongest filesystem posture.
 
 The helper never trusts client-supplied paths: every field of the policy is
 re-validated server-side, and the client's rendered profile text is ignored
@@ -104,11 +140,28 @@ inherited supplementary groups with the caller's normal groups before the
 drop.
 
 The helper treats the client-supplied launch spec as untrusted, since any
-local user can connect to its socket. It rebuilds the sandbox profile
+local user can connect to its socket. The spec file named in the request is
+itself opened defensively: the path must be absolute, symlinks are refused,
+it must be a regular file owned by the authenticated peer, and the read is
+size-bounded. Both the open and the read run on a dedicated reader thread
+under a deadline, so a hostile filesystem (a FUSE or network mount that
+stalls in `open()` or `read()`) cannot pin a helper worker. A reader stalled
+past its deadline is abandoned holding only its thread and file descriptor;
+the helper caps how many abandoned readers may be outstanding **per calling
+user** and refuses that user's spec reads until they drain, so the leak is
+bounded rather than cumulative and one user's hostile mount cannot block
+launches for any other user.
+Every spec-file rejection reaches the client as one generic message, and the
+per-cause detail is discarded rather than logged (the daemon's stderr can end
+up in a world-readable log file), so the root daemon cannot be used as an
+existence or ownership oracle for paths the
+caller cannot traverse. It rebuilds the sandbox profile
 server-side from inputs it validates itself — the home directory from the
 passwd database for the authenticated peer UID, and a working directory and
-temporary directory that must be real directories (the temporary directory
-owned by the caller) — and re-sanitizes the launch environment with the same
+temporary directory that must be real directories owned by the caller (the
+working directory becomes a read+write grant, so it is additionally refused
+when it sits inside — or contains — another user's home, the same check the
+read-only extras get) — and re-sanitizes the launch environment with the same
 privacy and injection blocklists the launcher applies. The client's profile
 text is never consumed. A custom sandbox policy travels as typed fields in
 the versioned launch spec and is re-validated field by field: destination
@@ -129,24 +182,60 @@ handle identically. The helper likewise rejects specs newer than itself.
 
 Firewall sessions are reference-counted per UID: concurrent launches by the
 same user share one set of rules, which are removed only when the last session
-ends, so an early-exiting session cannot strip the guard from a running one.
+ends. For helper `run` sessions the helper itself holds and releases each
+reference when the agent exits, so an early-exiting run session cannot strip
+the guard from a still-running one.
 Concurrent sessions for one UID must use the same VPN interface, scope, and
 network policy (the rules live under a single anchor/chain per UID); a
 mismatching launch is refused rather than silently weakening either session.
+The `uninstall` request can release only user-scoped state — the kind
+`install` creates: while a helper `run` session is live for that UID,
+`uninstall` is refused, so a stray same-UID client writing `uninstall` to the
+socket cannot strip a running session's group-scoped rules. Install sessions
+themselves enjoy no such protection: their reference count is keyed by UID
+alone, with no per-session token, so any process running as the same UID can
+send `uninstall` and release install-session state it did not create — once
+the count reaches zero the user-scoped rules come down even if the process
+that installed them is still running. On macOS the shared-user
+(`--shared-user-firewall`) path is exactly such a user-scoped install
+session, so a same-UID stranger can tear down a running shared-user agent's
+firewall guard. This is a same-user boundary only; other UIDs cannot reach
+that state.
 The helper also caps concurrent connections — globally and per UID, so one
 user's long-lived sessions cannot occupy every worker slot — and, on
 SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only
 writes to a pipe) that removes the socket and uninstalls any remaining
 firewall state before exit. On startup, before serving, the helper reaps
-firewall state orphaned by a previous instance that exited without cleanup
-(SIGKILL, crash, supervisor restart); orphaned rules fail closed — they
-over-block rather than open anything — but would otherwise keep blocking a
-user whose session is long gone. On macOS the child is spawned
+firewall state left behind by a previous instance that exited without cleanup
+(SIGKILL, crash, supervisor restart), because stale rules would otherwise
+keep blocking a user whose session is long gone. This reap is not purely
+fail-closed: the new instance cannot tell an orphan from a survivor, so a
+helper restart also flushes anchors/chains still guarding a running process —
+in particular a shared-user agent whose user-scoped rules were installed
+through the previous helper instance keeps running with its network guard
+stripped (fail-open for that agent) until it exits. On macOS the child is spawned
 through `launchctl asuser`, joining the caller's Mach bootstrap and audit
 session before credentials are dropped: keychain search lists and unlock state
 are per-session, and without this the agent lands in the system session where
 the caller's login keychain is invisible, so keychain-backed logins (Claude
 Code, `gh`, git credential helpers) would prompt again.
+
+The reference count lives in the helper, so it protects helper-managed
+sessions. Rules installed through `sudo` instead — Linux
+`--shared-user-firewall` always, and macOS `--shared-user-firewall` when the
+helper is unreachable — are not reference-counted: two overlapping sudo
+sessions for the same UID share one user-scoped chain/anchor, and whichever
+exits last removes the shared rules, taking the other session's guard down
+with it (last-exit-wins). Sudo user-scoped rules do live under their own
+names (`LYH-U-<uid>` on Linux, `com.apple/lianyaohu-user-<uid>` on macOS),
+distinct from the helper's group-scoped `LYH-<uid>` /
+`com.apple/lianyaohu-<uid>`, so a shared-user launch or exit cannot flush
+the rules of a live helper `run` session in the other scope. The separation
+is by scope, not by manager: helper `install` sessions are user-scoped and
+share the sudo path's user-scoped names, so a shared-user sudo fallback for
+the same UID (taken when the helper is unreachable) still replaces — and on
+exit flushes — a helper-managed user-scoped anchor/chain, and within one
+scope last-exit-wins applies as above.
 
 On macOS, the installed PF rules:
 
@@ -187,7 +276,8 @@ can send traffic.
 
 On Linux, the installed iptables/ip6tables chains:
 
-- allow loopback traffic to continue through the host firewall;
+- allow loopback traffic to continue through the host firewall (this exempts
+  stub-resolver DNS such as `127.0.0.53` — see *DNS resolution* below);
 - reject traffic to private, carrier-grade NAT, link-local, multicast, and IPv6
   unique-local/link-local/multicast ranges;
 - allow traffic already leaving the selected VPN interface to continue through
@@ -227,10 +317,28 @@ not by the agent process. Because the PF rules match the agent's group, they do
 not apply to mDNSResponder: its DNS queries follow the system's routing table
 rather than being steered by the agent's `route-to` rule.
 
-In the default configuration this is not a leak — the launcher refuses to start
-unless the selected VPN is already the default IPv4 route, so resolver queries
-traverse the same tunnel. The confinement of DNS therefore depends on that
-default-route invariant:
+Linux has the same exception in a different shape: the firewall chain's first
+rule is `-o lo -j RETURN`, and libc resolvers typically send DNS to a local
+stub — `127.0.0.53` (systemd-resolved) or `127.0.0.1` (dnsmasq/unbound) — so
+the agent's queries leave via loopback and never reach the VPN/LAN rules. The
+stub daemon's own upstream queries are then sent by *its* UID, which the
+`-m owner` match does not cover; they follow the system routing table, exactly
+like mDNSResponder on macOS. The exemption is not DNS-specific: it covers
+**all** loopback egress, so any host-local daemon the agent can reach — an
+existing HTTP/SOCKS proxy, an `ssh -D` tunnel — can relay the agent's traffic
+outward under its own UID, outside the owner-scoped rules.
+
+In the default configuration this is not a leak through the routing table —
+the launcher refuses to start unless the selected VPN is already the default
+IPv4 route, so resolver queries that follow that table traverse the same
+tunnel. The confinement of DNS therefore depends on that default-route
+invariant, and on the resolver actually using it:
+
+- On Linux, systemd-resolved can be configured with **per-link DNS servers**
+  bound to a physical NIC (common with DHCP-provided resolvers). Those
+  upstream queries are sent out that link, not the default route, so they
+  leave the tunnel even when the default-route preflight passed. Check
+  `resolvectl status` if DNS metadata must stay inside the tunnel.
 
 - On macOS with `--allow-non-default-route`, the agent's own connections are
   still pinned to the `utun` by `route-to`, but its DNS lookups can leave over
@@ -241,6 +349,10 @@ default-route invariant:
   cannot make another interface carry the default route.
 - If the system default route changes while the agent runs, DNS can leave the
   tunnel even though the agent's sockets remain pinned.
+- Only the default **IPv4** route is probed. If the system also has an IPv6
+  default route on a physical interface, RDNSS-learned resolvers and AAAA
+  transport can leave over it even when the IPv4 default is the tunnel;
+  IPv6 confinement of the system resolver is out of scope.
 
 ## Configuration Trust
 
@@ -275,6 +387,16 @@ arbitrary code-agent tools. The sandbox boundary for the agent is the generated
 On Linux, the process sandbox depends on kernel Landlock and seccomp support.
 LianYaoHu does not build a private mount namespace or overlay filesystem; it
 uses Landlock path rules for filesystem access and seccomp for syscall classes.
+Landlock rules are attached through `openat2(RESOLVE_NO_SYMLINKS)`: a rule
+path that is — or traverses — a symlink receives no grant at all, so a
+symlink swapped in after validation cannot redirect a grant to its target
+tree (symlinked targets stay reachable only when a real rule covers their
+destination, as with the merged-`/usr` `/bin -> usr/bin` layout). Where a
+nested runtime's seccomp filter blocks `openat2` itself (older Docker
+default profiles, gVisor), rule installation falls back to a plain
+`open(O_PATH|O_NOFOLLOW)` instead of failing the launch; the fallback still
+refuses a final-component symlink but cannot detect one in an intermediate
+component.
 
 macOS has no `PR_SET_NO_NEW_PRIVS`. Instead, Seatbelt refuses to exec
 setuid/setgid binaries from inside the generated sandbox profile, so the agent
@@ -302,8 +424,43 @@ trusting the machine, or run it against a dedicated user account.
 
 The `curl | bash` installer verifies the release tarball against a SHA-256
 checksum downloaded from the same GitHub release. This protects integrity (a
-corrupted download fails), not authenticity: releases are not yet signed, so
-trust rests on GitHub's account and release infrastructure. The uninstaller
-fetches the helper-teardown script from the repository pinned to a release
-tag. Review the scripts before piping them to `bash` if this trust model is
-not acceptable for your environment.
+corrupted download fails), not authenticity: a tampered release ships a
+matching checksum.
+
+Authenticity comes from Sigstore: the release workflow signs each tarball
+with `cosign sign-blob` (keyless, bound to the workflow's OIDC identity on a
+release tag) and publishes the resulting bundle next to the tarball. The
+tag binding is enforced, not assumed: the release workflow refuses to build
+or sign unless it is running from a `refs/tags/*` ref (a manual
+`workflow_dispatch` must be dispatched from the tag itself, and its tag
+input must match that ref), so every published bundle is signed as
+`release.yml@refs/tags/<tag>` — the exact identity the installer pins. When
+`cosign` is installed and the release carries a bundle, verification is
+**mandatory**: a bundle that is present but fails to verify against this
+repository's tag-bound release identity aborts the install, so tampering with
+a *signed* release is caught and cannot be downgraded to a checksum-only
+install. A release that ships **no** bundle (releases predating signing) is
+not refused by default — the installer proceeds with a loud, explicit warning
+that the tarball's authenticity is unverified, rather than failing every
+install until a signed release becomes `latest`. Set
+`LIANYAOHU_REQUIRE_SIGNATURE=1` to refuse anything unverified — a missing
+bundle, or a missing `cosign`, then becomes a hard failure.
+`LIANYAOHU_SKIP_SIGNATURE=1` is the explicit opt-out of the whole check.
+
+Known limits of this model:
+
+- **First-install trust.** The `install.sh` bootstrap itself is fetched over
+  TLS from the website and is not signature-verified; the first
+  `curl | bash` trusts the TLS connection and the hosting infrastructure.
+  Review the script before piping it if that is not acceptable.
+- **Checksum-only installs.** On machines without `cosign` (and for releases
+  predating signing), nothing authenticates the tarball beyond GitHub's
+  release infrastructure — the SHA-256 checksum ships next to the tarball
+  and proves integrity only.
+
+The uninstaller prefers the helper-teardown script that the installed
+package shipped (`/usr/local/libexec/lianyaohu-uninstall-helper.sh`), which
+involves no network fetch. When it must fetch the script, it pins the fetch
+to a resolved release tag and aborts if no tag resolves — it never falls back
+to a moving branch tip. Review the scripts before piping them to `bash` if
+this trust model is not acceptable for your environment.

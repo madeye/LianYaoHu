@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="io.github.madeye.lianyaohu.helper"
 BIN="/usr/local/libexec/lianyaohu"
+UNINSTALL_HELPER="/usr/local/libexec/lianyaohu-uninstall-helper.sh"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 SERVICE="/etc/systemd/system/${LABEL}.service"
 GROUP_NAME="_lianyaohu"
@@ -27,6 +28,9 @@ fi
 if [[ "$OS" == "Linux" ]]; then
   sudo install -d -m 755 /usr/local/libexec
   sudo install -m 755 "$HELPER_BINARY" "$BIN"
+  # Keep the teardown script next to the helper so uninstall.sh can run the
+  # exact script this install shipped instead of fetching one at run time.
+  sudo install -m 755 "$ROOT/scripts/uninstall-helper.sh" "$UNINSTALL_HELPER"
 
   if getent group "$GROUP_NAME" >"$tmp_group" 2>/dev/null; then
     existing_gid="$(awk -F: '{print $3; exit}' "$tmp_group")"
@@ -88,6 +92,9 @@ fi
 
 sudo install -d -m 755 /usr/local/libexec
 sudo install -m 755 "$HELPER_BINARY" "$BIN"
+# Keep the teardown script next to the helper so uninstall.sh can run the
+# exact script this install shipped instead of fetching one at run time.
+sudo install -m 755 "$ROOT/scripts/uninstall-helper.sh" "$UNINSTALL_HELPER"
 # Remove the split-binary helper from installs that predate the merged binary.
 sudo rm -f /usr/local/libexec/lianyaohu-helper
 

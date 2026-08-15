@@ -16,6 +16,8 @@ if [[ "$OS" == "Linux" ]]; then
   sudo rm -f "$SERVICE"
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
   sudo rm -f /usr/local/libexec/lianyaohu
+  # Self-removal is safe: bash keeps reading from the open file descriptor.
+  sudo rm -f /usr/local/libexec/lianyaohu-uninstall-helper.sh
   sudo rm -f /var/run/lianyaohu-helper.sock
 
   if getent group "$GROUP_NAME" >"$tmp_group" 2>/dev/null; then
@@ -38,6 +40,8 @@ sudo launchctl bootout system "$PLIST" >/dev/null 2>&1 || true
 sudo rm -f "$PLIST"
 sudo rm -f /usr/local/libexec/lianyaohu
 sudo rm -f /usr/local/libexec/lianyaohu-helper
+# Self-removal is safe: bash keeps reading from the open file descriptor.
+sudo rm -f /usr/local/libexec/lianyaohu-uninstall-helper.sh
 sudo rm -f /var/run/lianyaohu-helper.sock
 
 if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >"$tmp_group" 2>/dev/null; then

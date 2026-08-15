@@ -219,6 +219,17 @@ enum Prepare {
 /// Interactive prompts happen here, so callers can still daemonize after.
 fn prepare(options: &Options) -> Result<Prepare> {
     let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
+    // Landlock rule targets are opened without following symlinks, so a $HOME
+    // that traverses one (automount, `/home/u -> /export/u`) would silently
+    // lose every home rule in the direct no-helper path. Resolve it up front —
+    // the helper path canonicalizes server-side; this is the direct-path
+    // equivalent. On failure keep the raw value: a missing home gets no rule
+    // either way.
+    let home = Path::new(&home)
+        .canonicalize()
+        .ok()
+        .and_then(|canonical| canonical.to_str().map(str::to_owned))
+        .unwrap_or(home);
     let cwd = options.cwd.canonicalize().unwrap_or(options.cwd.clone());
     let cwd_string = cwd.to_string_lossy().to_string();
     let tmpdir = temporary_directory();
@@ -368,30 +379,7 @@ fn prepare(options: &Options) -> Result<Prepare> {
     // is meaningless: the firewall blocks direct egress regardless of routes.
     if require_default_route && !selected_interface.is_proxy_only() {
         let default_route = route::default_ipv4_interface()?;
-        if default_route.as_deref() != Some(selected_interface.name.as_str()) {
-            let default_route_name = default_route.as_deref().unwrap_or("<unknown>");
-            #[cfg(target_os = "macos")]
-            if enforce_pf && route_gateway.is_some() && PFHelperClient::default().status().is_ok() {
-                eprintln!(
-                    "note: default IPv4 route uses {default_route_name}; PF route-to will steer agent traffic through {}",
-                    selected_interface.name
-                );
-            } else {
-                return Err(err(format!(
-                    "default IPv4 route uses {default_route_name}, not selected VPN interface {} \
-                     (auto-allow needs the PF guard enabled, a point-to-point IPv4 peer on the utun, \
-                     and a reachable root helper; pass --allow-non-default-route to skip this check)",
-                    selected_interface.name
-                )));
-            }
-            #[cfg(target_os = "linux")]
-            return Err(err(format!(
-                "default IPv4 route uses {default_route_name}, not selected VPN interface {} \
-                 (Linux firewall support cannot route traffic by itself; configure the VPN as \
-                 the default route or pass --allow-non-default-route for diagnostics only)",
-                selected_interface.name
-            )));
-        }
+        check_default_route(default_route.as_deref(), &selected_interface.name)?;
     }
 
     Ok(Prepare::Ready(Box::new(Prepared {
@@ -410,6 +398,30 @@ fn prepare(options: &Options) -> Result<Prepare> {
         linux_sandbox,
         rule_set,
     })))
+}
+
+/// Default-route preflight: fail closed when the system default IPv4 route
+/// does not use the selected VPN interface. On macOS, PF `route-to` pins the
+/// agent's own TCP/UDP to the utun, but mDNSResponder is not group-matched
+/// and follows the system routing table, so DNS metadata would leave over the
+/// real default interface. Only the explicit `--allow-non-default-route`
+/// flag (or its config-file equivalent) may bypass this check.
+fn check_default_route(default_route: Option<&str>, selected: &str) -> Result<()> {
+    if default_route == Some(selected) {
+        return Ok(());
+    }
+    let default_route_name = default_route.unwrap_or("<unknown>");
+    #[cfg(target_os = "macos")]
+    let detail = "PF route-to would still pin the agent's own connections to the utun, but \
+                  mDNSResponder DNS follows the system routing table and would leak over the \
+                  default interface; pass --allow-non-default-route to accept that leak";
+    #[cfg(not(target_os = "macos"))]
+    let detail = "Linux firewall support cannot route traffic by itself; configure the VPN as \
+                  the default route or pass --allow-non-default-route for diagnostics only";
+    Err(err(format!(
+        "default IPv4 route uses {default_route_name}, not selected VPN interface {selected} \
+         ({detail})"
+    )))
 }
 
 fn launch_foreground(prepared: Prepared) -> Result<i32> {
@@ -691,7 +703,13 @@ fn run_session_daemon(
             let profile_path = prepared.tmpdir.join("agent.sb");
             fs::write(&profile_path, prepared.profile.render())?;
             let mut command = Command::new("/usr/bin/sandbox-exec");
-            command.arg("-f").arg(&profile_path).args(&prepared.command);
+            // `--` keeps an option-shaped agent command out of sandbox-exec's
+            // option parser, matching the helper launch path.
+            command
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("--")
+                .args(&prepared.command);
             command
         };
         #[cfg(target_os = "linux")]
@@ -1406,6 +1424,9 @@ fn launch_agent(
     let status = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&profile_path)
+        // `--` keeps an option-shaped agent command out of sandbox-exec's
+        // option parser, matching the helper launch path.
+        .arg("--")
         .args(command)
         .current_dir(cwd)
         .env_clear()
@@ -1587,9 +1608,9 @@ options:
   --shared-user-firewall      Use current-UID firewall rules instead of helper-managed group isolation.
                               Alias: --shared-user-pf.
   --allow-non-default-route   Do not require the system default route to use the selected VPN.
-                              On macOS, skipped automatically when the PF guard is enabled, the utun has an
-                              IPv4 peer, and the root helper is reachable (PF route-to steers
-                              agent traffic through the utun regardless of the default route).
+                              WARNING: on macOS this permits DNS leaks — mDNSResponder follows the
+                              system routing table even though PF route-to pins the agent's own
+                              traffic to the utun.
   --helper-status             Query the root firewall helper status for this user.
   --print-profile             Print the generated sandbox profile/summary and exit.
   --print-firewall            Print generated firewall rules and exit. Alias: --print-pf.
@@ -1606,6 +1627,26 @@ mod tests {
 
     fn parse_args(values: &[&str]) -> Result<Options> {
         parse(values.iter().map(|value| value.to_string()).collect())
+    }
+
+    #[test]
+    fn default_route_preflight_fails_closed_on_mismatch() {
+        // The VPN carrying the default route passes.
+        check_default_route(Some("utun5"), "utun5").unwrap();
+
+        // A non-VPN default route is always a hard error — there is no
+        // auto-skip; only --allow-non-default-route bypasses the call site.
+        let error = check_default_route(Some("en0"), "utun5").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("en0"), "message: {message}");
+        assert!(message.contains("utun5"), "message: {message}");
+        assert!(
+            message.contains("--allow-non-default-route"),
+            "message: {message}"
+        );
+
+        // An undetectable default route also fails closed.
+        assert!(check_default_route(None, "utun5").is_err());
     }
 
     #[test]
