@@ -54,6 +54,7 @@ enum Scope {
 enum Screen {
     Home,
     Interface,
+    Proxy,
     Network,
     Paths,
     Presets,
@@ -62,6 +63,7 @@ enum Screen {
 
 const HOME_MENU: &[(Screen, &str)] = &[
     (Screen::Interface, "VPN interface"),
+    (Screen::Proxy, "HTTP proxy"),
     (Screen::Network, "Network rules"),
     (Screen::Paths, "File paths"),
     (Screen::Presets, "Sensitive paths"),
@@ -322,7 +324,16 @@ impl Editor {
 
     /// The proxy URL currently configured in this scope's `[env]`, if any.
     fn proxy_url(&self) -> Option<String> {
-        self.scope_view().env.get("HTTPS_PROXY").cloned()
+        PROXY_ENV_KEYS
+            .iter()
+            .find_map(|key| self.scope_view().env.get(*key).cloned())
+    }
+
+    fn open_proxy_input(&mut self) {
+        self.input = Some(InputState::new(
+            InputTarget::Proxy,
+            self.proxy_url().unwrap_or_default(),
+        ));
     }
 
     /// Sets or clears the proxy environment variables in the scope draft.
@@ -577,6 +588,7 @@ impl Editor {
         match self.screen {
             Screen::Home => self.update_home(key),
             Screen::Interface => self.update_interface(key),
+            Screen::Proxy => self.update_proxy(key),
             Screen::Network => self.update_network(key),
             Screen::Paths => self.update_paths(key),
             Screen::Presets => self.update_presets(key),
@@ -618,13 +630,17 @@ impl Editor {
                 self.review_scroll = 0;
                 Step::Redraw
             }
-            KeyCode::Char(digit @ '1'..='5') => {
-                let index = digit as usize - '1' as usize;
-                self.menu_selected = index;
-                self.screen = HOME_MENU[index].0;
-                self.confirm_quit = false;
-                self.review_scroll = 0;
-                Step::Redraw
+            KeyCode::Char(digit @ '1'..='9') => {
+                let index = (digit as u8 - b'1') as usize;
+                if index < HOME_MENU.len() {
+                    self.menu_selected = index;
+                    self.screen = HOME_MENU[index].0;
+                    self.confirm_quit = false;
+                    self.review_scroll = 0;
+                    Step::Redraw
+                } else {
+                    Step::Continue
+                }
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
             _ => Step::Continue,
@@ -645,10 +661,41 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Enter if !self.interfaces.is_empty() => {
-                let name = self.interfaces[self.iface_selected].name.clone();
+                let selected = &self.interfaces[self.iface_selected];
+                let name = selected.name.clone();
+                let proxy_only = selected.is_proxy_only();
                 // Machine-specific: always the global draft, never the project.
                 self.global.defaults.vpn_interface = Some(name.clone());
-                self.set_success(format!("default VPN interface set to {name} (global)"));
+                if proxy_only && self.proxy_url().is_none() {
+                    self.set_success(
+                        "default VPN interface set to none (global) — set a proxy URL",
+                    );
+                    self.open_proxy_input();
+                } else {
+                    self.set_success(format!("default VPN interface set to {name} (global)"));
+                }
+                Step::Redraw
+            }
+            KeyCode::Char('p') => {
+                self.open_proxy_input();
+                Step::Redraw
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
+            _ => Step::Continue,
+        }
+    }
+
+    fn update_proxy(&mut self, key: KeyEvent) -> Step {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('p') => {
+                self.open_proxy_input();
+                Step::Redraw
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if self.proxy_url().is_some() {
+                    self.set_proxy(None);
+                    self.set_success("proxy cleared");
+                }
                 Step::Redraw
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
@@ -738,10 +785,7 @@ impl Editor {
                 Step::Redraw
             }
             KeyCode::Char('p') => {
-                self.input = Some(InputState::new(
-                    InputTarget::Proxy,
-                    self.proxy_url().unwrap_or_default(),
-                ));
+                self.open_proxy_input();
                 Step::Redraw
             }
             KeyCode::Esc | KeyCode::Char('q') => self.leave_screen(),
@@ -1048,6 +1092,7 @@ fn draw(frame: &mut Frame, editor: &Editor) {
     match editor.screen {
         Screen::Home => draw_home(frame, editor, body_area),
         Screen::Interface => draw_interface(frame, editor, body_area),
+        Screen::Proxy => draw_proxy(frame, editor, body_area),
         Screen::Network => draw_network(frame, editor, body_area),
         Screen::Paths => draw_paths(frame, editor, body_area),
         Screen::Presets => draw_presets(frame, editor, body_area),
@@ -1129,7 +1174,7 @@ fn keybar(editor: &Editor) -> Line<'static> {
     }
     match editor.screen {
         Screen::Home => theme::keybar_line(&[
-            ("↑↓ 1-5", "select"),
+            ("↑↓ 1-6", "select"),
             ("Enter", "open"),
             ("s", "scope"),
             ("Ctrl-S", "review & save"),
@@ -1139,6 +1184,13 @@ fn keybar(editor: &Editor) -> Line<'static> {
         Screen::Interface => theme::keybar_line(&[
             ("↑↓", "select"),
             ("Enter", "set default (global)"),
+            ("p", "proxy"),
+            ("Esc", "back"),
+            ("?", "help"),
+        ]),
+        Screen::Proxy => theme::keybar_line(&[
+            ("Enter/e", "edit"),
+            ("d", "clear"),
             ("Esc", "back"),
             ("?", "help"),
         ]),
@@ -1199,54 +1251,57 @@ fn draw_home(frame: &mut Frame, editor: &Editor, area: Rect) {
     );
 }
 
-fn home_summaries(editor: &Editor) -> [String; 5] {
+fn home_summaries(editor: &Editor) -> Vec<String> {
     let view = editor.scope_view();
-    let interface = editor
-        .global
-        .defaults
-        .vpn_interface
-        .clone()
-        .map(|name| format!("{name} (global)"))
-        .unwrap_or_else(|| "not set — prompted each run".to_string());
-    let network = format!(
-        "{} allow · {} deny · {} LAN exceptions · default {}{}",
-        view.network.allow.len(),
-        view.network.deny.len(),
-        view.network.lan_allow.len(),
-        match view.network.default_action {
-            Some(lianyaohu_core::policy::NetAction::Deny) => "deny",
-            _ => "allow",
-        },
-        if editor.proxy_url().is_some() {
-            " · proxy"
-        } else {
-            ""
-        }
-    );
-    let paths = format!(
-        "{} writable · {} read-only · narrow home: {}",
-        view.paths.writable.len(),
-        view.paths.read_only.len(),
-        if view.paths.narrow_home == Some(true) {
-            "on"
-        } else {
-            "off"
-        }
-    );
-    let presets = format!("{} denied paths", view.paths.deny.len());
-    let mut changed = Vec::new();
-    if editor.global_dirty() {
-        changed.push("global");
-    }
-    if editor.project_dirty() {
-        changed.push("project");
-    }
-    let review = if changed.is_empty() {
-        "no pending changes".to_string()
-    } else {
-        format!("pending: {}", changed.join(" + "))
-    };
-    [interface, network, paths, presets, review]
+    HOME_MENU
+        .iter()
+        .map(|(screen, _)| match screen {
+            Screen::Home => String::new(),
+            Screen::Interface => editor
+                .global
+                .defaults
+                .vpn_interface
+                .clone()
+                .map(|name| format!("{name} (global)"))
+                .unwrap_or_else(|| "not set — prompted each run".to_string()),
+            Screen::Proxy => editor.proxy_url().unwrap_or_else(|| "not set".to_string()),
+            Screen::Network => format!(
+                "{} allow · {} deny · {} LAN exceptions · default {}",
+                view.network.allow.len(),
+                view.network.deny.len(),
+                view.network.lan_allow.len(),
+                match view.network.default_action {
+                    Some(lianyaohu_core::policy::NetAction::Deny) => "deny",
+                    _ => "allow",
+                },
+            ),
+            Screen::Paths => format!(
+                "{} writable · {} read-only · narrow home: {}",
+                view.paths.writable.len(),
+                view.paths.read_only.len(),
+                if view.paths.narrow_home == Some(true) {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            Screen::Presets => format!("{} denied paths", view.paths.deny.len()),
+            Screen::Review => {
+                let mut changed = Vec::new();
+                if editor.global_dirty() {
+                    changed.push("global");
+                }
+                if editor.project_dirty() {
+                    changed.push("project");
+                }
+                if changed.is_empty() {
+                    "no pending changes".to_string()
+                } else {
+                    format!("pending: {}", changed.join(" + "))
+                }
+            }
+        })
+        .collect()
 }
 
 fn draw_interface(frame: &mut Frame, editor: &Editor, area: Rect) {
@@ -1296,6 +1351,36 @@ fn draw_interface(frame: &mut Frame, editor: &Editor, area: Rect) {
     frame.render_widget(
         Paragraph::new(detail).block(Block::bordered().title(title)),
         detail_area,
+    );
+}
+
+fn draw_proxy(frame: &mut Frame, editor: &Editor, area: Rect) {
+    let url_line = match editor.proxy_url() {
+        Some(url) => Line::from(vec![
+            Span::raw("URL  "),
+            Span::styled(url, theme::success_style()),
+        ]),
+        None => Line::from(vec![
+            Span::raw("URL  "),
+            Span::styled("not set", theme::dim_style()),
+        ]),
+    };
+    let lines = vec![
+        url_line,
+        Line::from(""),
+        Line::from(
+            "Sets HTTP_PROXY, HTTPS_PROXY, and ALL_PROXY (both cases) for the launched agent.",
+        ),
+        Line::from("Empty + Enter clears. Pair with VPN interface \"none\" (proxy-only)"),
+        Line::from("or network default DENY so tools that ignore the proxy cannot leak."),
+        Line::from(""),
+        Line::styled("Enter / e edits · d clears", theme::dim_style()),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("HTTP proxy"))
+            .wrap(Wrap { trim: true }),
+        area,
     );
 }
 
@@ -1604,8 +1689,8 @@ fn draw_help_overlay(frame: &mut Frame, body: Rect) {
         "u            undo the last delete",
         "Space        toggle checkbox (narrow-home, presets)",
         "m            toggle network default allow/deny",
-        "p            set/clear the proxy (HTTP(S)_PROXY/ALL_PROXY env vars);",
-        "             combine with default DENY for proxy-or-nothing",
+        "p            set/clear the HTTP proxy (HTTP(S)_PROXY/ALL_PROXY);",
+        "             also a home-menu item; pair with DENY or VPN \"none\"",
         "Ctrl-S       jump to Review & save (↑↓ scrolls the preview)",
         "Esc / q      back; on Home: quit (asks when unsaved)",
         "",
@@ -1788,11 +1873,11 @@ mod tests {
     #[test]
     fn home_menu_navigates_to_screens_and_back() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2')));
+        editor.update(press(KeyCode::Char('3')));
         assert_eq!(editor.screen, Screen::Network);
         editor.update(press(KeyCode::Esc));
         assert_eq!(editor.screen, Screen::Home);
-        // Selection is sticky: it stayed on Network (index 1), so Down lands
+        // Selection is sticky: it stayed on Network (index 2), so Down lands
         // on Paths.
         editor.update(press(KeyCode::Down));
         editor.update(press(KeyCode::Enter));
@@ -1816,7 +1901,7 @@ mod tests {
     #[test]
     fn scope_toggle_routes_edits_to_the_right_draft() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('4'))); // Paths screen
         editor.update(press(KeyCode::Char(' '))); // narrow home on (global)
         assert_eq!(editor.global.paths.narrow_home, Some(true));
         assert_eq!(editor.project.paths.narrow_home, None);
@@ -1829,7 +1914,7 @@ mod tests {
     #[test]
     fn network_add_validates_and_stores_canonical_form() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2'))); // Network
+        editor.update(press(KeyCode::Char('3'))); // Network
         editor.update(press(KeyCode::Char('a')));
         type_text(&mut editor, "140.82.112.0/20:443");
         editor.update(press(KeyCode::Enter));
@@ -1850,7 +1935,7 @@ mod tests {
     #[test]
     fn lan_exception_containment_is_checked_in_the_editor() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2')));
+        editor.update(press(KeyCode::Char('3')));
         editor.update(press(KeyCode::Tab));
         editor.update(press(KeyCode::Tab)); // lan_allow pane
         editor.update(press(KeyCode::Char('a')));
@@ -1871,7 +1956,7 @@ mod tests {
     fn network_default_action_toggles() {
         use lianyaohu_core::policy::NetAction;
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2')));
+        editor.update(press(KeyCode::Char('3')));
         editor.update(press(KeyCode::Char('m')));
         assert_eq!(editor.global.network.default_action, Some(NetAction::Deny));
         editor.update(press(KeyCode::Char('m')));
@@ -1881,7 +1966,7 @@ mod tests {
     #[test]
     fn path_entries_accept_tilde_and_reject_relative() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('3')));
+        editor.update(press(KeyCode::Char('4')));
         editor.update(press(KeyCode::Char('a')));
         type_text(&mut editor, "~/models");
         editor.update(press(KeyCode::Enter));
@@ -1901,7 +1986,7 @@ mod tests {
     #[test]
     fn preset_toggle_adds_and_removes_deny_entries() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('4')));
+        editor.update(press(KeyCode::Char('5')));
         editor.update(press(KeyCode::Char(' ')));
         assert_eq!(editor.global.paths.deny, ["~/.ssh"]);
         editor.update(press(KeyCode::Char(' ')));
@@ -1984,9 +2069,58 @@ mod tests {
     }
 
     #[test]
+    fn http_proxy_home_item_edits_and_clears() {
+        let mut editor = test_editor();
+        editor.update(press(KeyCode::Char('2')));
+        assert_eq!(editor.screen, Screen::Proxy);
+        let rendered = render(&editor);
+        assert!(rendered.contains("HTTP proxy"));
+        assert!(rendered.contains("not set"));
+
+        editor.update(press(KeyCode::Enter));
+        type_text(&mut editor, "http://127.0.0.1:7890");
+        editor.update(press(KeyCode::Enter));
+        assert_eq!(editor.proxy_url().as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(
+            editor.global.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+
+        editor.update(press(KeyCode::Char('d')));
+        assert!(editor.global.env.is_empty());
+        assert_eq!(editor.status_text(), Some("proxy cleared"));
+    }
+
+    #[test]
+    fn selecting_proxy_only_without_proxy_opens_the_url_input() {
+        let mut editor = test_editor();
+        editor.interfaces.push(NetworkInterface::proxy_only());
+        editor.iface_selected = 1;
+        editor.update(press(KeyCode::Char('1')));
+        editor.update(press(KeyCode::Enter));
+        assert_eq!(
+            editor.global.defaults.vpn_interface.as_deref(),
+            Some("none")
+        );
+        let input = editor.input.as_ref().expect("proxy prompt");
+        assert_eq!(input.target, InputTarget::Proxy);
+        assert!(input.buffer.is_empty());
+    }
+
+    #[test]
+    fn proxy_url_reads_any_standard_key() {
+        let mut editor = test_editor();
+        editor
+            .global
+            .env
+            .insert("http_proxy".to_string(), "http://127.0.0.1:9".to_string());
+        assert_eq!(editor.proxy_url().as_deref(), Some("http://127.0.0.1:9"));
+    }
+
+    #[test]
     fn proxy_input_fans_out_env_vars_and_clears_them() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Char('3'))); // Network screen
         editor.update(press(KeyCode::Char('p')));
         type_text(&mut editor, "http://127.0.0.1:7890");
         editor.update(press(KeyCode::Enter));
@@ -2021,7 +2155,7 @@ mod tests {
     #[test]
     fn proxy_input_rejects_bad_urls() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2')));
+        editor.update(press(KeyCode::Char('3')));
         for bad in ["127.0.0.1:7890", "ftp://x:1", "http://has space:1"] {
             editor.update(press(KeyCode::Char('p')));
             type_text(&mut editor, bad);
@@ -2039,7 +2173,7 @@ mod tests {
     fn delete_records_undo_and_u_restores_into_the_same_scope() {
         let mut editor = test_editor();
         editor.global.network.allow = vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()];
-        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Char('3'))); // Network screen
         editor.update(press(KeyCode::Char('d')));
         assert_eq!(editor.global.network.allow, ["9.9.9.9"]);
         assert!(editor.status_text().unwrap().contains("u to undo"));
@@ -2071,7 +2205,7 @@ mod tests {
 
         let mut editor = test_editor();
         editor.home_dir = scratch.to_string_lossy().to_string();
-        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('4'))); // Paths screen
         editor.update(press(KeyCode::Char('a')));
 
         // Unique match completes fully and appends '/' for directories.
@@ -2082,7 +2216,7 @@ mod tests {
         // Ambiguous match extends to the common prefix and offers candidates.
         let mut editor2 = test_editor();
         editor2.home_dir = scratch.to_string_lossy().to_string();
-        editor2.update(press(KeyCode::Char('3')));
+        editor2.update(press(KeyCode::Char('4')));
         editor2.update(press(KeyCode::Char('a')));
         type_text(&mut editor2, "~/m");
         editor2.update(press(KeyCode::Tab));
@@ -2146,6 +2280,7 @@ mod tests {
         editor.screen = Screen::Home;
         let rendered = render(&editor);
         assert!(rendered.contains("VPN interface"));
+        assert!(rendered.contains("HTTP proxy"));
         assert!(rendered.contains("Review & save"));
         assert!(rendered.contains("pending: global"));
 
@@ -2153,6 +2288,12 @@ mod tests {
         let rendered = render(&editor);
         assert!(rendered.contains("utun5 [up]"));
         assert!(rendered.contains("yes (matches)"));
+
+        editor.screen = Screen::Proxy;
+        let rendered = render(&editor);
+        assert!(rendered.contains("HTTP proxy"));
+        assert!(rendered.contains("not set"));
+        assert!(rendered.contains("HTTP_PROXY"));
 
         editor.screen = Screen::Network;
         let rendered = render(&editor);
@@ -2199,7 +2340,7 @@ mod tests {
     fn input_line_editing_shortcuts() {
         let ctrl = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('4'))); // Paths screen
         editor.update(press(KeyCode::Char('a')));
         type_text(&mut editor, "~/models/llama");
 
@@ -2229,7 +2370,7 @@ mod tests {
     #[test]
     fn arrow_keys_and_hl_switch_panes() {
         let mut editor = test_editor();
-        editor.update(press(KeyCode::Char('2'))); // Network screen
+        editor.update(press(KeyCode::Char('3'))); // Network screen
         editor.update(press(KeyCode::Right));
         assert_eq!(editor.net_pane, 1);
         editor.update(press(KeyCode::Char('l')));
@@ -2240,7 +2381,7 @@ mod tests {
         assert_eq!(editor.net_pane, 0);
 
         editor.update(press(KeyCode::Esc));
-        editor.update(press(KeyCode::Char('3'))); // Paths screen
+        editor.update(press(KeyCode::Char('4'))); // Paths screen
         editor.update(press(KeyCode::Right));
         assert_eq!(editor.path_pane, 1);
         editor.update(press(KeyCode::Char('h')));
@@ -2252,7 +2393,7 @@ mod tests {
         let mut editor = test_editor();
         // Enough entries that the preview has plenty of lines to scroll.
         editor.global.network.allow = (0..30).map(|index| format!("10.0.0.{index}")).collect();
-        editor.update(press(KeyCode::Char('5'))); // Review screen
+        editor.update(press(KeyCode::Char('6'))); // Review screen
         assert_eq!(editor.review_scroll, 0);
 
         editor.update(press(KeyCode::Char('j')));
@@ -2274,7 +2415,7 @@ mod tests {
         }
         assert_eq!(editor.review_scroll, max);
         editor.update(press(KeyCode::Esc));
-        editor.update(press(KeyCode::Char('5')));
+        editor.update(press(KeyCode::Char('6')));
         assert_eq!(editor.review_scroll, 0);
     }
 

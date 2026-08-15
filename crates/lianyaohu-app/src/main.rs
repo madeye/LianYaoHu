@@ -1304,8 +1304,8 @@ fn ensure_proxy_configured(environment: &mut BTreeMap<String, String>) -> Result
         None if stdin_is_tty() => prompt_proxy_url()?,
         None => {
             return Err(err(
-                "proxy-only mode needs a local proxy: set the proxy in `lyh config` (Network \
-                 rules → p), add [env] HTTPS_PROXY to the config, or pass --env \
+                "proxy-only mode needs a local proxy: set the proxy in `lyh config` (HTTP \
+                 proxy), add [env] HTTPS_PROXY to the config, or pass --env \
                  HTTPS_PROXY=http://127.0.0.1:PORT",
             ));
         }
