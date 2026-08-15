@@ -441,8 +441,16 @@ mod tests {
     }
 
     fn tempfile_file() -> File {
+        // Unique per call: tests share one process and run on parallel
+        // threads, so a pid-only name lets one test truncate another's
+        // still-linked inode.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut path = std::env::temp_dir();
-        path.push(format!("lianyaohu-helper-fd-test-{}", std::process::id()));
+        path.push(format!(
+            "lianyaohu-helper-fd-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let file = OpenOptions::new()
             .read(true)
             .write(true)

@@ -63,7 +63,7 @@ pub(crate) fn interface_detail_lines(
             "Proxy-only: no VPN interface.".to_string(),
             "All direct egress is blocked (loopback only);".to_string(),
             "outbound traffic must use a local proxy,".to_string(),
-            "e.g. http://127.0.0.1:7890 (prompted at launch).".to_string(),
+            "e.g. http://127.0.0.1:7890 — set it under HTTP proxy.".to_string(),
         ];
     }
     let state = match (interface.is_up(), interface.is_running()) {
