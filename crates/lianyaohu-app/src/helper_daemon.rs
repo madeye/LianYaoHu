@@ -1670,15 +1670,16 @@ mod tests {
         let listing = "\
   com.apple/250.ApplicationFirewall
   com.apple/lianyaohu-501
-  com.apple/lianyaohu-502
+  com.apple/lianyaohu-user-502
   org.example/other
 ";
 
+        // Group-scoped and sudo user-scoped anchors are both reaped.
         assert_eq!(
             parse_stale_anchor_listing(listing),
             vec![
                 "com.apple/lianyaohu-501".to_string(),
-                "com.apple/lianyaohu-502".to_string(),
+                "com.apple/lianyaohu-user-502".to_string(),
             ]
         );
     }

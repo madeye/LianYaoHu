@@ -79,7 +79,15 @@ impl PFRuleSet {
     }
 
     pub fn anchor_name(&self) -> String {
-        format!("com.apple/lianyaohu-{}", self.anchor_key)
+        // User- and group-scoped rule sets must never share an anchor: the
+        // sudo fallback loads and flushes its anchor wholesale, and with a
+        // shared name that would replace or strip a live helper session's
+        // group-scoped rules. Both names stay under `com.apple/lianyaohu-`
+        // so the helper's stale-anchor reaper covers them.
+        match self.socket_owner {
+            SocketOwner::User(_) => format!("com.apple/lianyaohu-user-{}", self.anchor_key),
+            SocketOwner::UserAndGroup(..) => format!("com.apple/lianyaohu-{}", self.anchor_key),
+        }
     }
 
     /// Proxy-only mode: no VPN interface at all; only loopback egress (the
@@ -464,6 +472,18 @@ mod tests {
             "pass out quick on utun4 proto { tcp udp } from any to any user 501 group 2000000 keep state"
         ));
         assert!(rules.contains("# Scope: TCP/UDP sockets owned by uid 501 gid 2000000."));
+    }
+
+    // Regression test for #58: the sudo fallback loads and flushes its anchor
+    // wholesale, so the user-scoped rule set must own an anchor distinct from
+    // the helper's group-scoped anchor for the same uid.
+    #[test]
+    fn user_scope_anchor_is_distinct_from_group_anchor() {
+        let user = PFRuleSet::new_user("utun4", 501, None);
+        let group = PFRuleSet::new_group("utun4", 501, 2_000_000, None);
+
+        assert_eq!(user.anchor_name(), "com.apple/lianyaohu-user-501");
+        assert_eq!(group.anchor_name(), "com.apple/lianyaohu-501");
     }
 
     #[test]

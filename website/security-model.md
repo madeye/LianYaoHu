@@ -163,6 +163,18 @@ are per-session, and without this the agent lands in the system session where
 the caller's login keychain is invisible, so keychain-backed logins (Claude
 Code, `gh`, git credential helpers) would prompt again.
 
+The reference count lives in the helper, so it protects helper-managed
+sessions. Rules installed through `sudo` instead — Linux
+`--shared-user-firewall` always, and macOS `--shared-user-firewall` when the
+helper is unreachable — are not reference-counted: two overlapping sudo
+sessions for the same UID share one user-scoped chain/anchor, and whichever
+exits last removes the shared rules, taking the other session's guard down
+with it (last-exit-wins). Sudo user-scoped rules do live under their own
+names (`LYH-U-<uid>` on Linux, `com.apple/lianyaohu-user-<uid>` on macOS),
+distinct from the helper's group-scoped `LYH-<uid>` /
+`com.apple/lianyaohu-<uid>`, so a shared-user launch or exit can never flush
+the rules of a live helper-managed session.
+
 On macOS, the installed PF rules:
 
 - allow loopback TCP/UDP;

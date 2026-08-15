@@ -68,7 +68,17 @@ impl LinuxFirewallRuleSet {
     }
 
     pub fn chain_name(&self) -> String {
-        format!("LYH-{}", self.anchor_key)
+        // User- and group-scoped rule sets must never share a chain: the
+        // sudo shared-user path flushes its chain wholesale on install and
+        // uninstall, and with a shared name that wipe would empty a live
+        // helper session's chain out from under a still-running agent (the
+        // helper's uid+gid OUTPUT jump would then fall through to the
+        // default-ACCEPT policy). Both prefixes stay under `LYH-` so the
+        // helper's stale-chain reaper covers them.
+        match self.socket_owner {
+            LinuxSocketOwner::User(_) => format!("LYH-U-{}", self.anchor_key),
+            LinuxSocketOwner::UserAndGroup(..) => format!("LYH-{}", self.anchor_key),
+        }
     }
 
     /// Proxy-only mode: no VPN interface at all; only loopback egress (the
@@ -477,9 +487,9 @@ mod tests {
 -P OUTPUT ACCEPT
 -N DOCKER-USER
 -N LYH-1000
--N LYH-1001
+-N LYH-U-1001
 -A OUTPUT -m owner --uid-owner 1000 --gid-owner 2000000 -j LYH-1000
--A OUTPUT -m owner --uid-owner 1001 -j LYH-1001
+-A OUTPUT -m owner --uid-owner 1001 -j LYH-U-1001
 -A OUTPUT -j DOCKER-USER
 -A LYH-1000 -o lo -j RETURN
 -A LYH-1000 -d 10.0.0.0/8 -j REJECT
@@ -487,7 +497,12 @@ mod tests {
 
         let (jumps, chains) = parse_stale_chain_listing(listing);
 
-        assert_eq!(chains, vec!["LYH-1000".to_string(), "LYH-1001".to_string()]);
+        // Group-scoped (`LYH-<uid>`) and sudo user-scoped (`LYH-U-<uid>`)
+        // chains are both reaped.
+        assert_eq!(
+            chains,
+            vec!["LYH-1000".to_string(), "LYH-U-1001".to_string()]
+        );
         assert_eq!(
             jumps,
             vec![
@@ -509,7 +524,7 @@ mod tests {
                     "--uid-owner".to_string(),
                     "1001".to_string(),
                     "-j".to_string(),
-                    "LYH-1001".to_string(),
+                    "LYH-U-1001".to_string(),
                 ],
             ]
         );
@@ -520,8 +535,37 @@ mod tests {
         let rules = LinuxFirewallRuleSet::new_user("wg0", 1000).render();
 
         assert!(rules.contains("# Scope: packets owned by uid 1000."));
-        assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 -j LYH-1000"));
-        assert!(rules.contains("iptables -w -A LYH-1000 -o wg0 -j RETURN"));
+        assert!(rules.contains("iptables -w -I OUTPUT 1 -m owner --uid-owner 1000 -j LYH-U-1000"));
+        assert!(rules.contains("iptables -w -A LYH-U-1000 -o wg0 -j RETURN"));
+    }
+
+    // Regression test for #58: the sudo shared-user guard flushes its chain
+    // wholesale on install and uninstall, so the user-scoped rule set must
+    // own a chain distinct from the helper's group-scoped chain for the same
+    // uid — a shared name would let a shared-user launch (or exit) empty a
+    // live helper session's chain out from under a running agent.
+    #[test]
+    fn user_scope_commands_never_touch_the_group_chain() {
+        let user = LinuxFirewallRuleSet::new_user("wg0", 1000);
+        let group = LinuxFirewallRuleSet::new_group("wg0", 1000, 2_000_000);
+        assert_eq!(user.chain_name(), "LYH-U-1000");
+        assert_eq!(group.chain_name(), "LYH-1000");
+
+        let group_chain = group.chain_name();
+        for (_, command) in user.cleanup_commands() {
+            assert!(
+                !command.iter().any(|arg| arg == &group_chain),
+                "{command:?}"
+            );
+        }
+        for family in [IpFamily::V4, IpFamily::V6] {
+            for command in user.setup_commands(family) {
+                assert!(
+                    !command.iter().any(|arg| arg == &group_chain),
+                    "{command:?}"
+                );
+            }
+        }
     }
 
     fn policy(entries: &[(&str, &str)]) -> NetworkPolicy {

@@ -108,16 +108,20 @@ that owns the privileged half of firewall enforcement:
 - On macOS, writes rules to `/var/run/lianyaohu/rules-<uid>-<utun>.pf` (mode
   `0600`), vets them with `pfctl -n`, enables PF with `pfctl -E` (tracking the
   enable token per uid), and loads the anchor.
-- On Linux, creates `LYH-<uid>` iptables/ip6tables chains and inserts an
-  OUTPUT owner jump matching either gid `2000000` or the caller uid.
+- On Linux, creates `LYH-<uid>` (group-scoped) or `LYH-U-<uid>` (user-scoped)
+  iptables/ip6tables chains and inserts an OUTPUT owner jump matching either
+  gid `2000000` or the caller uid. The scopes use distinct chain names so a
+  user-scoped install can never flush a live group session's chain.
 - `uninstall` flushes the caller's anchor/chain and releases tracked state.
   SIGINT/SIGTERM unlink the socket on the way out.
 
 ## PF anchor
 
-Rules load into `com.apple/lianyaohu-<uid>`, which macOS' default
-`/etc/pf.conf` evaluates through its `anchor "com.apple/*"` point — no edits
-to system PF configuration. For caller uid `U`, socket owner `O`, and
+Rules load into `com.apple/lianyaohu-<uid>` (group-scoped) or
+`com.apple/lianyaohu-user-<uid>` (the user-scoped fallback; distinct so a
+fallback install can never replace a live group session's rules), which
+macOS' default `/etc/pf.conf` evaluates through its `anchor "com.apple/*"`
+point — no edits to system PF configuration. For caller uid `U`, socket owner `O`, and
 interface `utunN` the generated policy is, in order:
 
 1. `pass` loopback TCP/UDP for owner `O`.
@@ -138,7 +142,8 @@ both paths.
 
 Linux rules use `iptables -m owner` and `ip6tables -m owner` from the OUTPUT
 hook. For caller uid `U`, socket owner `O`, and interface `tun0`/`wg0`, the
-generated `LYH-U` policy is:
+generated chain policy (`LYH-<uid>`, or `LYH-U-<uid>` for the user-scoped
+fallback) is:
 
 1. Return immediately for loopback.
 2. Reject LAN, carrier-grade NAT, link-local, multicast, and IPv6
