@@ -4,21 +4,30 @@ on:
   push:
     tags:
       - 'v*'
+  # A manual dispatch MUST be run from the tag ref itself (pick the tag, not
+  # a branch, as the run's ref in the UI/API). Sigstore binds the signing
+  # identity to the workflow's own ref, so a branch-dispatched run would sign
+  # as @refs/heads/<branch> and fail install.sh's @refs/tags/ identity pin.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to package, for example v0.1.0'
+        description: >-
+          Release tag to package, for example v0.1.0. Must match the tag ref
+          the run is dispatched from; dispatching from a branch is refused.
         required: true
         type: string
 
 permissions:
   contents: write
   # Sigstore keyless signing exchanges the workflow's OIDC token for a
-  # short-lived signing certificate tied to this workflow's identity.
+  # short-lived signing certificate tied to this workflow's identity,
+  # including the ref the workflow runs from (enforced below to be a tag).
   id-token: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # The run ref is required to be the release tag itself, so the ref name is
+  # the tag for both push and workflow_dispatch triggers.
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -35,11 +44,26 @@ jobs:
       - name: Resolve release tag
         id: release
         shell: bash
+        env:
+          DISPATCH_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${GITHUB_REF_NAME}"
+          # Sigstore/Fulcio derives the certificate identity from the
+          # workflow's *own* ref (github.ref), not the ref checked out below.
+          # install.sh pins the identity to ...release.yml@refs/tags/, so a
+          # run on a branch ref would sign as @refs/heads/<branch> and every
+          # cosign-equipped install of that release would hard-fail. Refuse
+          # to build and sign from anything but a tag ref.
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "::error::Release must run from a tag ref, got '${GITHUB_REF}'." \
+              "For workflow_dispatch, select the tag itself as the run's ref."
+            exit 1
+          fi
+
+          tag="${GITHUB_REF_NAME}"
+
+          if [[ -n "${DISPATCH_TAG}" && "${DISPATCH_TAG}" != "${tag}" ]]; then
+            echo "::error::Dispatched tag input '${DISPATCH_TAG}' does not match the run's tag ref '${tag}'"
+            exit 1
           fi
 
           if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
@@ -50,6 +74,8 @@ jobs:
           echo "tag=${tag}" >>"$GITHUB_OUTPUT"
           echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
 
+      # The resolve step guarantees this equals the run's own ref
+      # (refs/tags/<tag>); the explicit ref just makes the intent obvious.
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.release.outputs.tag }}

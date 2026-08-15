@@ -429,7 +429,12 @@ matching checksum.
 
 Authenticity comes from Sigstore: the release workflow signs each tarball
 with `cosign sign-blob` (keyless, bound to the workflow's OIDC identity on a
-release tag) and publishes the resulting bundle next to the tarball. When
+release tag) and publishes the resulting bundle next to the tarball. The
+tag binding is enforced, not assumed: the release workflow refuses to build
+or sign unless it is running from a `refs/tags/*` ref (a manual
+`workflow_dispatch` must be dispatched from the tag itself, and its tag
+input must match that ref), so every published bundle is signed as
+`release.yml@refs/tags/<tag>` — the exact identity the installer pins. When
 `cosign` is installed, verification is **mandatory**: the installer refuses a
 release whose bundle is missing, unfetchable, or fails to verify against this
 repository's release workflow running from a tag ref — a missing bundle does
