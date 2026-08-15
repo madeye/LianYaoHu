@@ -6,30 +6,82 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 const MAX_LAUNCH_SPEC_BYTES: u64 = 1024 * 1024;
 
-/// Cap on spec-reader threads abandoned past their deadline that may still be
-/// in flight. A hostile filesystem that never returns would otherwise convert
-/// each timed-out read into a permanently leaked thread and file descriptor
-/// inside the root helper; once this many abandoned readers are outstanding,
-/// new spec reads fail closed until some of them finish.
+/// Per-uid cap on spec-reader threads abandoned past their deadline that may
+/// still be in flight. A hostile filesystem that never returns would
+/// otherwise convert each timed-out read into a permanently leaked thread and
+/// file descriptor inside the root helper; once this many abandoned readers
+/// are outstanding for a uid, that uid's spec reads fail closed until some of
+/// them finish.
 const MAX_ABANDONED_SPEC_READS: usize = 16;
 
-static ABANDONED_SPEC_READS: AtomicUsize = AtomicUsize::new(0);
+/// Outstanding abandoned readers keyed by the requesting peer's uid. The cap
+/// is enforced per uid — never process-wide — so one user stalling readers on
+/// a hostile mount locks out only their own launches, not every other user's.
+static ABANDONED_SPEC_READS: AbandonedReads = AbandonedReads::new();
 
 /// One client-visible message for every way a spec file can be rejected.
 /// The helper runs as root, so per-cause errors (`ENOENT` vs "not a regular
 /// file" vs "not owned by uid N") would let a local user probe existence and
 /// ownership of arbitrary paths — including ones under directories they
-/// cannot traverse. Detail stays in the helper's own log.
+/// cannot traverse. The per-cause detail is discarded entirely, not logged:
+/// the daemon's stderr can be routed to a world-readable log file (launchd
+/// does exactly that on macOS), which would reopen the same oracle.
 const SPEC_REJECTED: &str = "launch spec rejected: it must be an existing regular file owned by \
                              the calling user (no symlinks), at most 1 MiB";
+
+/// Tracks abandoned spec readers per uid. Increments happen on the caller
+/// side when it gives up on a stalled reader; decrements happen on whichever
+/// side loses the [`AtomicBool`] handoff race once the reader finally
+/// finishes, so the count for a uid can never underflow.
+struct AbandonedReads {
+    per_uid: Mutex<BTreeMap<u32, usize>>,
+}
+
+impl AbandonedReads {
+    const fn new() -> Self {
+        Self {
+            per_uid: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, usize>> {
+        // The map holds plain counters mutated one at a time, so a panic in
+        // another thread cannot leave a torn invariant; recover rather than
+        // poison every future launch.
+        self.per_uid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_at_cap(&self, uid: u32) -> bool {
+        self.lock().get(&uid).copied().unwrap_or(0) >= MAX_ABANDONED_SPEC_READS
+    }
+
+    fn increment(&self, uid: u32) {
+        *self.lock().entry(uid).or_insert(0) += 1;
+    }
+
+    fn decrement(&self, uid: u32) {
+        let mut counts = self.lock();
+        match counts.get_mut(&uid) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                counts.remove(&uid);
+            }
+            // Unreachable — every decrement is preceded by an increment for
+            // the same uid — but never underflow if the invariant breaks.
+            None => {}
+        }
+    }
+}
 
 /// The newest spec revision this build understands. Legacy specs carry no
 /// version field (0); specs with a custom sandbox policy carry 2.
@@ -121,18 +173,19 @@ impl LaunchSpec {
     // itself runs on the deadlined reader thread — open() blocks just like
     // read() on a hostile filesystem — and every rejection collapses into one
     // generic client-visible message so the root daemon is not a path oracle.
+    // `required_owner` is the authenticated peer uid; it also keys the
+    // abandoned-reader cap so one uid's stalled readers cannot block others.
     pub fn read_json(path: &Path, required_owner: u32, timeout: Duration) -> Result<Self> {
         let owned_path = path.to_path_buf();
         let bytes = read_with_deadline(
             move || {
-                open_and_read_spec(&owned_path, required_owner).map_err(|error| {
-                    // Detail goes to the helper's own log only; the client
-                    // sees the same message for every rejection cause.
-                    eprintln!("launch spec {}: rejected: {error}", owned_path.display());
-                    err(SPEC_REJECTED)
-                })
+                // The per-cause detail (and the path) is dropped, not merely
+                // kept off the socket: the daemon's stderr may land in a
+                // world-readable log, which would reopen the path oracle.
+                open_and_read_spec(&owned_path, required_owner).map_err(|_| err(SPEC_REJECTED))
             },
             timeout,
+            required_owner,
             &ABANDONED_SPEC_READS,
         )?;
         let spec = serde_json::from_slice::<Self>(&bytes)?;
@@ -177,17 +230,19 @@ fn open_and_read_spec(path: &Path, required_owner: u32) -> Result<Vec<u8>> {
 /// and read() can both block arbitrarily long (FUSE, network mounts), and the
 /// caller must not pin a worker slot on either. On timeout the reader thread
 /// is abandoned holding its file descriptor; `abandoned` counts those still
-/// in flight, and new reads are refused once [`MAX_ABANDONED_SPEC_READS`] are
-/// outstanding so a hostile mount cannot leak unbounded threads and fds.
+/// in flight per uid, and new reads for `uid` are refused once
+/// [`MAX_ABANDONED_SPEC_READS`] are outstanding for it, so a hostile mount
+/// cannot leak unbounded threads and fds — and cannot lock out other uids.
 fn read_with_deadline<F>(
     read: F,
     timeout: Duration,
-    abandoned: &'static AtomicUsize,
+    uid: u32,
+    abandoned: &'static AbandonedReads,
 ) -> Result<Vec<u8>>
 where
     F: FnOnce() -> Result<Vec<u8>> + Send + 'static,
 {
-    if abandoned.load(Ordering::SeqCst) >= MAX_ABANDONED_SPEC_READS {
+    if abandoned.is_at_cap(uid) {
         return Err(err(
             "too many stalled launch spec readers; refusing new spec reads until they finish",
         ));
@@ -207,7 +262,7 @@ where
             // If the caller already gave up, this thread was counted as
             // abandoned; release that count now that it has finished.
             if reader_finished.swap(true, Ordering::SeqCst) {
-                abandoned.fetch_sub(1, Ordering::SeqCst);
+                abandoned.decrement(uid);
             }
         })
         .map_err(|error| err(format!("spawn launch spec reader: {error}")))?;
@@ -217,9 +272,9 @@ where
             // Count the abandonment before flagging the handoff: if the
             // reader finished in the window, the swap reports it and the
             // count is taken back, so the counter can never underflow.
-            abandoned.fetch_add(1, Ordering::SeqCst);
+            abandoned.increment(uid);
             if finished.swap(true, Ordering::SeqCst) {
-                abandoned.fetch_sub(1, Ordering::SeqCst);
+                abandoned.decrement(uid);
             }
             Err(err("timed out reading launch spec"))
         }
@@ -353,14 +408,15 @@ mod tests {
 
     // The one mechanism the availability fix relies on: a filesystem that
     // never delivers data must hit the deadline instead of pinning the
-    // caller, and the abandoned reader must be counted while it is stalled
-    // and released once it finally finishes.
+    // caller, and the abandoned reader must be counted against its uid while
+    // it is stalled and released once it finally finishes.
     #[test]
     fn stalled_read_times_out_and_counts_the_abandoned_reader() {
         use std::fs::File;
         use std::os::fd::FromRawFd;
 
-        static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+        static ABANDONED: AbandonedReads = AbandonedReads::new();
+        const UID: u32 = 1001;
 
         // A pipe with the write end held open but silent: read_to_end blocks
         // indefinitely, like a stalling FUSE mount.
@@ -377,18 +433,19 @@ mod tests {
                 Ok(bytes)
             },
             Duration::from_millis(100),
+            UID,
             &ABANDONED,
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
-        // The abandoned reader occupies a slot while it is stalled...
-        assert_eq!(ABANDONED.load(Ordering::SeqCst), 1);
+        // The abandoned reader occupies a slot for its uid while stalled...
+        assert_eq!(ABANDONED.lock().get(&UID).copied(), Some(1));
 
         // ...and releases it once the blocked read completes (EOF on close).
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while ABANDONED.load(Ordering::SeqCst) != 0 {
+        while ABANDONED.lock().get(&UID).is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "abandoned reader slot was never released"
@@ -397,17 +454,75 @@ mod tests {
         }
     }
 
-    // At the cap, new reads are refused before spawning anything (fail
-    // closed), and the refusal itself does not consume a slot.
+    // The cap is per uid: a uid at the cap is refused before anything is
+    // spawned (fail closed, without consuming a slot), while every other uid
+    // keeps reading normally — one user's hostile mount must not lock out
+    // launches for the rest of the machine.
     #[test]
-    fn spec_reads_fail_closed_at_the_abandoned_reader_cap() {
-        static ABANDONED: AtomicUsize = AtomicUsize::new(0);
-        ABANDONED.store(MAX_ABANDONED_SPEC_READS, Ordering::SeqCst);
+    fn abandoned_reader_cap_is_enforced_per_uid() {
+        static ABANDONED: AbandonedReads = AbandonedReads::new();
+        const CAPPED_UID: u32 = 1001;
+        const OTHER_UID: u32 = 1002;
+        ABANDONED
+            .lock()
+            .insert(CAPPED_UID, MAX_ABANDONED_SPEC_READS);
 
-        let error =
-            read_with_deadline(|| Ok(Vec::new()), Duration::from_secs(1), &ABANDONED).unwrap_err();
-
+        let error = read_with_deadline(
+            || Ok(Vec::new()),
+            Duration::from_secs(1),
+            CAPPED_UID,
+            &ABANDONED,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("stalled launch spec"), "{error}");
-        assert_eq!(ABANDONED.load(Ordering::SeqCst), MAX_ABANDONED_SPEC_READS);
+
+        // The other uid is unaffected by the capped uid's stalled readers.
+        let bytes = read_with_deadline(
+            || Ok(vec![42]),
+            Duration::from_secs(5),
+            OTHER_UID,
+            &ABANDONED,
+        )
+        .unwrap();
+        assert_eq!(bytes, vec![42]);
+
+        let counts = ABANDONED.lock();
+        assert_eq!(
+            counts.get(&CAPPED_UID).copied(),
+            Some(MAX_ABANDONED_SPEC_READS)
+        );
+        assert_eq!(counts.get(&OTHER_UID), None);
+    }
+
+    // Every rejection must collapse into the one generic message: no probed
+    // path and no per-cause detail (existence, type, ownership) may reach the
+    // client — or anywhere else — from the root helper.
+    #[test]
+    fn rejection_message_reveals_neither_path_nor_cause() {
+        let dir = scratch_dir();
+        let missing = dir.join("no-such-spec.json");
+        let uid = unsafe { libc::getuid() };
+
+        let error = LaunchSpec::read_json(&missing, uid, READ_TIMEOUT).unwrap_err();
+        let message = error.to_string();
+        assert_eq!(message, SPEC_REJECTED);
+        assert!(!message.contains(missing.to_str().unwrap()));
+        for cause in [
+            "No such file",
+            "os error",
+            "not a regular file",
+            "not owned",
+        ] {
+            assert!(!message.contains(cause), "leaks cause: {message}");
+        }
+
+        // Wrong owner collapses into the identical message, so the two causes
+        // are indistinguishable to the caller.
+        let owned = dir.join("launch.json");
+        sample_spec().write_json(&owned).unwrap();
+        let error = LaunchSpec::read_json(&owned, uid + 1, READ_TIMEOUT).unwrap_err();
+        assert_eq!(error.to_string(), message);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

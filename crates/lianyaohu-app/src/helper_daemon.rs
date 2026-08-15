@@ -440,7 +440,9 @@ impl HelperDaemon {
         // read_json refuses symlinks and non-regular files, requires the file
         // to be owned by the authenticated peer, and runs the open and read
         // on an abandonable reader thread bounded by the same deadline as the
-        // socket I/O, so a hostile filesystem cannot pin this worker.
+        // socket I/O, so a hostile filesystem cannot pin this worker. The
+        // peer uid also keys the abandoned-reader cap, so one uid's stalled
+        // readers cannot block other users' launches.
         let spec = LaunchSpec::read_json(spec_path, peer.uid, IO_TIMEOUT)?;
         ensure_session_group()?;
         let selected = validated_vpn_interface(interface_name)?;

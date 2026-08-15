@@ -138,10 +138,14 @@ size-bounded. Both the open and the read run on a dedicated reader thread
 under a deadline, so a hostile filesystem (a FUSE or network mount that
 stalls in `open()` or `read()`) cannot pin a helper worker. A reader stalled
 past its deadline is abandoned holding only its thread and file descriptor;
-the helper caps how many abandoned readers may be outstanding and refuses new
-spec reads until they drain, so the leak is bounded rather than cumulative.
-Every spec-file rejection reaches the client as one generic message, so the
-root daemon cannot be used as an existence or ownership oracle for paths the
+the helper caps how many abandoned readers may be outstanding **per calling
+user** and refuses that user's spec reads until they drain, so the leak is
+bounded rather than cumulative and one user's hostile mount cannot block
+launches for any other user.
+Every spec-file rejection reaches the client as one generic message, and the
+per-cause detail is discarded rather than logged (the daemon's stderr can end
+up in a world-readable log file), so the root daemon cannot be used as an
+existence or ownership oracle for paths the
 caller cannot traverse. It rebuilds the sandbox profile
 server-side from inputs it validates itself — the home directory from the
 passwd database for the authenticated peer UID, and a working directory and
