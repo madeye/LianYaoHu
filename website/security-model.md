@@ -68,8 +68,13 @@ The configuration layer can add to — or narrow — the default grants:
 - **Narrow-home mode** replaces the blanket writable `$HOME` with per-entry
   grants for the configured agent state locations (plus cwd and the launch
   tmpdir); `$HOME` stays readable so dotfiles and installed tooling keep
-  working. This is enforced identically on both platforms and is the
-  strongest filesystem posture.
+  working. The state entries are writable grants, so the helper resolves
+  each one against the real filesystem like the writable extras: an entry
+  whose canonical path leaves the caller's home, resolves to the home
+  itself, or is not owned by the caller is refused — a symlink such as
+  `~/.cache -> /` cannot widen narrow-home into its target tree. This mode
+  is enforced identically on both platforms and is the strongest filesystem
+  posture.
 
 The helper never trusts client-supplied paths: every field of the policy is
 re-validated server-side, and the client's rendered profile text is ignored
@@ -275,6 +280,11 @@ arbitrary code-agent tools. The sandbox boundary for the agent is the generated
 On Linux, the process sandbox depends on kernel Landlock and seccomp support.
 LianYaoHu does not build a private mount namespace or overlay filesystem; it
 uses Landlock path rules for filesystem access and seccomp for syscall classes.
+Landlock rules are attached through `openat2(RESOLVE_NO_SYMLINKS)`: a rule
+path that is — or traverses — a symlink receives no grant at all, so a
+symlink swapped in after validation cannot redirect a grant to its target
+tree (symlinked targets stay reachable only when a real rule covers their
+destination, as with the merged-`/usr` `/bin -> usr/bin` layout).
 
 macOS has no `PR_SET_NO_NEW_PRIVS`. Instead, Seatbelt refuses to exec
 setuid/setgid binaries from inside the generated sandbox profile, so the agent

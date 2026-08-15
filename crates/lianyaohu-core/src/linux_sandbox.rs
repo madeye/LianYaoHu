@@ -168,23 +168,18 @@ fn apply_landlock(sandbox: &LinuxSandbox) -> Result<()> {
     let file_access = (read_access | write_access) & file_landlock_access();
 
     for path in read_only_paths(sandbox) {
-        let access = if path.is_file() {
-            read_access & file_landlock_access()
-        } else {
-            read_access
-        };
-        add_path_rule(ruleset_fd.0, &path, access)?;
+        add_path_rule(
+            ruleset_fd.0,
+            &path,
+            read_access,
+            read_access & file_landlock_access(),
+        )?;
     }
     for path in writable_paths(sandbox) {
-        let access = if path.is_file() {
-            file_access
-        } else {
-            read_access | write_access
-        };
-        add_path_rule(ruleset_fd.0, &path, access)?;
+        add_path_rule(ruleset_fd.0, &path, read_access | write_access, file_access)?;
     }
     for path in writable_device_files() {
-        add_path_rule(ruleset_fd.0, &path, file_access)?;
+        add_path_rule(ruleset_fd.0, &path, file_access, file_access)?;
     }
 
     let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd.0, 0) };
@@ -361,20 +356,76 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn add_path_rule(ruleset_fd: RawFd, path: &Path, allowed_access: u64) -> Result<()> {
+/// openat2(2) resolve flag: fail with ELOOP when ANY path component is a
+/// symlink. Plain `O_NOFOLLOW` only protects the final component, so a raced
+/// swap of an intermediate directory could still redirect the rule target.
+/// openat2 is Linux 5.6+, older than the 5.13 Landlock baseline, so no
+/// fallback path is needed.
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Opens a rule target without resolving symlinks anywhere in the path, so a
+/// Landlock rule always attaches to the named inode and a symlink such as
+/// `~/.cache -> /` can never widen a grant to its destination tree. Returns
+/// `None` when there is nothing to safely grant: the path does not exist, or
+/// a component is a symlink (the destination stays reachable only if a real
+/// rule covers it, e.g. `/bin -> usr/bin` under the `/usr` rule).
+fn open_rule_target(path: &Path) -> Result<Option<FdGuard>> {
     let Some(path) = path.to_str() else {
-        return Ok(());
+        return Ok(None);
     };
     let c_path = CString::new(path)?;
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            &how as *const OpenHow,
+            mem::size_of::<OpenHow>(),
+        )
+    };
     if fd < 0 {
         let error = io::Error::last_os_error();
-        if matches!(error.kind(), io::ErrorKind::NotFound) {
-            return Ok(());
+        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ELOOP)) {
+            return Ok(None);
         }
         return Err(error.into());
     }
-    let fd = FdGuard(fd);
+    Ok(Some(FdGuard(fd as RawFd)))
+}
+
+fn add_path_rule(
+    ruleset_fd: RawFd,
+    path: &Path,
+    directory_access: u64,
+    file_access: u64,
+) -> Result<()> {
+    let Some(fd) = open_rule_target(path)? else {
+        return Ok(());
+    };
+    // Classify directory vs file on the opened fd, never through a path-based
+    // stat: `Path::is_file()` follows symlinks, so a symlink-to-directory
+    // would otherwise be treated as a directory of the target inode.
+    let mut stat = unsafe { mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd.0, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let allowed_access = if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+        directory_access
+    } else {
+        file_access
+    };
     let path_beneath = LandlockPathBeneathAttr {
         allowed_access,
         parent_fd: fd.0,
@@ -745,6 +796,33 @@ mod tests {
         assert_eq!(handled_landlock_access(1) & LANDLOCK_ACCESS_FS_REFER, 0);
         assert_ne!(handled_landlock_access(2) & LANDLOCK_ACCESS_FS_REFER, 0);
         assert_ne!(handled_landlock_access(3) & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
+    }
+
+    #[test]
+    fn rule_targets_skip_symlinks_and_missing_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "lyh-landlock-test-{}-{}",
+            std::process::id(),
+            unsafe { libc::getuid() }
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/", &link).unwrap();
+
+        // Missing targets are optional grants, not errors.
+        assert!(open_rule_target(&dir.join("missing")).unwrap().is_none());
+        // A symlink never yields an fd — the rule would otherwise attach to
+        // the symlink's destination (`~/.cache -> /` would grant `/`)...
+        assert!(open_rule_target(&link).unwrap().is_none());
+        // ...and neither does a path that traverses one.
+        assert!(open_rule_target(&link.join("tmp")).unwrap().is_none());
+        // A real directory opens normally.
+        assert!(open_rule_target(&real).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

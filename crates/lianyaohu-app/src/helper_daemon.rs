@@ -601,6 +601,17 @@ fn validate_policy(
         .map(|entry| lexically_normalized_absolute(entry))
         .collect::<Result<Vec<_>>>()?;
 
+    // Narrow-home state dirs become writable grants, so like the writable
+    // extras they are resolved against the real filesystem: a symlinked
+    // ~/.cache pointing outside $HOME must not widen narrow-home into its
+    // target tree.
+    let agent_state_dirs = policy
+        .paths
+        .agent_state_dirs
+        .iter()
+        .map(|entry| validated_state_dir(entry, uid, caller_home))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(SandboxPolicy {
         network: policy.network.clone(),
         paths: PathPolicy {
@@ -608,12 +619,50 @@ fn validate_policy(
             read_only,
             deny,
             narrow_home: policy.paths.narrow_home,
-            // Relative, `..`-free entries (checked by policy.validate above);
-            // joined against the passwd-derived home at render time, so a
-            // client can never smuggle an absolute path through narrow-home.
-            agent_state_dirs: policy.paths.agent_state_dirs.clone(),
+            agent_state_dirs,
         },
     })
+}
+
+/// Canonicalizes a narrow-home state dir entry (relative and `..`-free per
+/// `policy.validate`) against the caller's home. The canonical path must stay
+/// strictly inside the home directory and be owned by the caller; the entry is
+/// stored back in canonical home-relative form so the rendered grant matches
+/// the checked inode. A not-yet-created entry passes through unchanged — it
+/// grants nothing until it exists, and on Linux rule installation refuses
+/// symlinks again at apply time.
+fn validated_state_dir(entry: &str, uid: u32, caller_home: &str) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let joined = Path::new(caller_home).join(entry);
+    let canonical = match joined.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(entry.to_string()),
+        Err(error) => {
+            return Err(err(format!("agent state dir {entry:?}: {error}")));
+        }
+    };
+    let relative = canonical
+        .strip_prefix(caller_home)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .ok_or_else(|| {
+            err(format!(
+                "agent state dir {entry:?} resolves to {}, outside the caller's home directory",
+                canonical.display()
+            ))
+        })?;
+    let metadata = fs::metadata(&canonical)?;
+    if metadata.uid() != uid {
+        return Err(err(format!(
+            "agent state dir {entry:?} resolves to {}, which is not owned by uid {uid}",
+            canonical.display()
+        )));
+    }
+    relative
+        .to_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| err(format!("agent state dir {entry:?} is not valid UTF-8")))
 }
 
 fn validated_directory(what: &str, path: &Path, required_owner: Option<u32>) -> Result<String> {
@@ -1638,6 +1687,52 @@ mod tests {
             .map(|i| format!("/deny/{i}"))
             .collect();
         assert!(validate_policy(Some(&policy), uid, &caller_home).is_err());
+    }
+
+    #[test]
+    fn state_dirs_resolve_within_home_and_refuse_symlink_escapes() {
+        let uid = unsafe { libc::getuid() };
+        let home = owned_tmpdir().canonicalize().unwrap();
+        let caller_home = home.to_str().unwrap();
+
+        fs::create_dir_all(home.join("state")).unwrap();
+        fs::create_dir_all(home.join("real")).unwrap();
+        std::os::unix::fs::symlink(home.join("real"), home.join("inner")).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), home.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&home, home.join("self")).unwrap();
+
+        // A real dir keeps its name; a missing one passes through untouched.
+        assert_eq!(
+            validated_state_dir("state", uid, caller_home).unwrap(),
+            "state"
+        );
+        assert_eq!(
+            validated_state_dir("absent", uid, caller_home).unwrap(),
+            "absent"
+        );
+        // A symlink staying inside the home is rewritten to its canonical
+        // target, so the rendered grant matches the checked inode.
+        assert_eq!(
+            validated_state_dir("inner", uid, caller_home).unwrap(),
+            "real"
+        );
+        // A symlink out of the home (the `~/.cache -> /` escape) is refused...
+        let error = validated_state_dir("escape", uid, caller_home).unwrap_err();
+        assert!(
+            error.to_string().contains("outside the caller's home"),
+            "{error}"
+        );
+        // ...and so is one resolving to the home itself, which would undo
+        // narrow-home entirely.
+        assert!(validated_state_dir("self", uid, caller_home).is_err());
+
+        // The same refusal holds end-to-end through policy validation.
+        let mut policy = SandboxPolicy::default();
+        policy.paths.narrow_home = true;
+        policy.paths.agent_state_dirs = vec!["escape".into()];
+        assert!(validate_policy(Some(&policy), uid, caller_home).is_err());
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
