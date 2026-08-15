@@ -88,6 +88,12 @@ impl PFRuleSet {
         self.interface_name == crate::interfaces::PROXY_ONLY_INTERFACE
     }
 
+    /// True for the current-UID fallback scope (`install`); false for the
+    /// group-scoped rules a helper `run` session installs.
+    pub fn is_user_scoped(&self) -> bool {
+        matches!(self.socket_owner, SocketOwner::User(_))
+    }
+
     pub fn render(&self) -> String {
         let owner = self.socket_owner.clause();
         let lan4 = LAN4_BLOCKED

@@ -232,7 +232,7 @@ impl HelperDaemon {
                 spec_path,
             } => self.run_session(peer, &interface_name, Path::new(&spec_path), received.fds),
             HelperRequest::Uninstall => {
-                self.release_session(peer.uid);
+                self.release_install_session(peer.uid)?;
                 Ok(format!("uninstalled firewall guard for uid {}", peer.uid))
             }
             HelperRequest::Status => {
@@ -391,6 +391,33 @@ impl HelperDaemon {
         if let Some(state) = sessions.remove(&uid) {
             teardown_session(&state);
         }
+    }
+
+    /// Release one reference to the UID's user-scoped `install` session.
+    /// `uninstall` carries no session token — any same-UID process can write
+    /// it to the socket — so it must never touch state owned by a live `run`
+    /// session: the run path releases its own reference when the agent
+    /// exits, and letting an unrelated client decrement that refcount would
+    /// strip the group-scoped firewall out from under a still-running agent.
+    fn release_install_session(&self, uid: u32) -> Result<()> {
+        let mut sessions = self.lock_sessions();
+        let Some(state) = sessions.get_mut(&uid) else {
+            return Ok(());
+        };
+        if !state.rule_set.is_user_scoped() {
+            return Err(err(format!(
+                "uid {uid} has a live helper run session; its firewall rules come down when that \
+                 session exits, not via uninstall"
+            )));
+        }
+        state.refcount -= 1;
+        if state.refcount > 0 {
+            return Ok(());
+        }
+        if let Some(state) = sessions.remove(&uid) {
+            teardown_session(&state);
+        }
+        Ok(())
     }
 
     /// Uninstall every remaining session's firewall state. Used on shutdown
@@ -1552,6 +1579,65 @@ mod tests {
         ] {
             assert!(parse_drop_exec_args(case).is_err(), "{case:?}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_session(rule_set: PFRuleSet, refcount: usize) -> SessionState {
+        SessionState {
+            rule_set,
+            refcount,
+            enable_token: None,
+            rules_path: std::path::PathBuf::from("/nonexistent-lianyaohu-test-rules"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_session(rule_set: LinuxFirewallRuleSet, refcount: usize) -> SessionState {
+        SessionState { rule_set, refcount }
+    }
+
+    // Regression test for #56: `uninstall` is authorized only as "same UID",
+    // so it must not decrement the refcount of a live group-scoped `run`
+    // session — that would strip the firewall while run_launch_spec is still
+    // blocked on the agent.
+    #[test]
+    fn uninstall_cannot_release_a_live_run_session() {
+        let daemon = HelperDaemon::default();
+        #[cfg(target_os = "macos")]
+        let rule_set = PFRuleSet::new_group("utun9", 501, LIANYAOHU_GROUP_GID, None);
+        #[cfg(target_os = "linux")]
+        let rule_set = LinuxFirewallRuleSet::new_group("tun9", 501, LIANYAOHU_GROUP_GID);
+        daemon
+            .lock_sessions()
+            .insert(501, test_session(rule_set, 1));
+
+        let error = daemon.release_install_session(501).unwrap_err();
+
+        assert!(
+            error.to_string().contains("live helper run session"),
+            "{error}"
+        );
+        // The run session and its refcount are untouched.
+        assert_eq!(daemon.lock_sessions().get(&501).unwrap().refcount, 1);
+    }
+
+    #[test]
+    fn uninstall_releases_install_sessions_by_refcount() {
+        let daemon = HelperDaemon::default();
+        #[cfg(target_os = "macos")]
+        let rule_set = PFRuleSet::new_user("utun9", 501, None);
+        #[cfg(target_os = "linux")]
+        let rule_set = LinuxFirewallRuleSet::new_user("tun9", 501);
+        daemon
+            .lock_sessions()
+            .insert(501, test_session(rule_set, 2));
+
+        // A second concurrent install still holds a reference: no teardown.
+        daemon.release_install_session(501).unwrap();
+        assert_eq!(daemon.lock_sessions().get(&501).unwrap().refcount, 1);
+
+        // Unknown UIDs are a no-op rather than an error.
+        daemon.release_install_session(4_000_000).unwrap();
     }
 
     #[test]

@@ -144,6 +144,10 @@ ends, so an early-exiting session cannot strip the guard from a running one.
 Concurrent sessions for one UID must use the same VPN interface, scope, and
 network policy (the rules live under a single anchor/chain per UID); a
 mismatching launch is refused rather than silently weakening either session.
+The `uninstall` request releases only the user-scoped state that `install`
+created: while a helper `run` session is live for that UID, `uninstall` is
+refused, so a stray same-UID client writing `uninstall` to the socket cannot
+strip a running session's group-scoped rules.
 The helper also caps concurrent connections — globally and per UID, so one
 user's long-lived sessions cannot occupy every worker slot — and, on
 SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only

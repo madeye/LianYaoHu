@@ -77,6 +77,12 @@ impl LinuxFirewallRuleSet {
         self.interface_name == crate::interfaces::PROXY_ONLY_INTERFACE
     }
 
+    /// True for the current-UID fallback scope (`install`); false for the
+    /// group-scoped rules a helper `run` session installs.
+    pub fn is_user_scoped(&self) -> bool {
+        matches!(self.socket_owner, LinuxSocketOwner::User(_))
+    }
+
     pub fn render(&self) -> String {
         let mut lines = vec![
             "# LianYaoHu Linux network guard.".to_string(),
