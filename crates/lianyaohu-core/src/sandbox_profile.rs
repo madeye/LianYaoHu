@@ -136,28 +136,10 @@ impl SandboxProfile {
     (subpath "/private/tmp")
     (subpath "/tmp"))
 
-; The timezone database is denied wholesale here, BEFORE the UTC-only allow
-; below. Seatbelt is last-match-wins, so the ordering makes the later allow
-; carve the UTC data files back out while every other zone file — including
-; the real zone file that the /etc/localtime symlink resolves to before rule
-; matching — is denied by an explicit rule instead of being blocked only
-; incidentally by not matching any allow.
-(deny file-read*
-    (subpath "/var/db/timezone")
-    (subpath "/private/var/db/timezone"))
-
-; Bun/JavaScriptCore initializes ICU timezone data during startup. With TZ=UTC,
-; it still reads the versioned UTC zoneinfo and ICU timezone bundle; allow only
-; those UTC data files. Preference-based timezone identity stays blocked by the
-; identity deny block rendered at the end of the profile, after the user-policy
-; read-only allows.
-(allow file-read*
-    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")
-    (regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$")
-    (regex #"^/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$")
-    (regex #"^/private/var/db/timezone/tz/[^/]+/icutz/[^/]+\.dat$"))
+; The timezone-database deny and its UTC-only carve-out are emitted in the
+; user sections at the end of the profile, AFTER any user read-only allows —
+; seatbelt is last-match-wins, so emitting them here would let a
+; `paths.read_only` extra covering the tree re-open it.
 
 ; TUI agents (codex, fish, claude) put the terminal into raw mode with
 ; tcsetattr and open /dev/tty; both need ioctl access to the pty devices.
@@ -252,10 +234,11 @@ impl SandboxProfile {
     /// User-policy blocks plus the identity/timezone denials, appended after
     /// everything else. Seatbelt is last-match-wins, so the ordering here is
     /// load-bearing: the user's read-only allows render first, then the
-    /// identity deny block (so a `paths.read_only` entry covering the identity
-    /// paths cannot re-allow them), and the user `paths.deny` block stays the
-    /// very last rules in the profile so it overrides every allow above,
-    /// including the writable roots.
+    /// timezone-database deny with its UTC-only carve-out and the identity
+    /// deny block (so a `paths.read_only` entry covering the timezone tree or
+    /// the identity paths cannot re-allow them), and the user `paths.deny`
+    /// block stays the very last rules in the profile so it overrides every
+    /// allow above, including the writable roots.
     fn user_sections(&self) -> String {
         let home_global_preferences = scheme_string(&format!(
             "{}/Library/Preferences/.GlobalPreferences.plist",
@@ -271,6 +254,31 @@ impl SandboxProfile {
             }
             out.push_str(")\n");
         }
+        out.push_str(
+            "\n; The timezone database is denied wholesale, AFTER any user read-only\n\
+             ; allows above (so a read-only extra covering the tree cannot re-open\n\
+             ; it) and BEFORE the UTC-only allow below. Seatbelt is last-match-wins,\n\
+             ; so the later allow carves the UTC data files back out while every\n\
+             ; other zone file — including the real zone file that the\n\
+             ; /etc/localtime symlink resolves to before rule matching — is denied\n\
+             ; by an explicit rule instead of being blocked only incidentally by\n\
+             ; not matching any allow.\n\
+             (deny file-read*\n    \
+             (subpath \"/var/db/timezone\")\n    \
+             (subpath \"/private/var/db/timezone\"))\n\
+             \n\
+             ; Bun/JavaScriptCore initializes ICU timezone data during startup. With\n\
+             ; TZ=UTC, it still reads the versioned UTC zoneinfo and ICU timezone\n\
+             ; bundle; allow only those UTC data files. Preference-based timezone\n\
+             ; identity stays blocked by the identity deny block just below.\n\
+             (allow file-read*\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/zoneinfo/UTC$\")\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/zoneinfo/posixrules$\")\n    \
+             (regex #\"^/var/db/timezone/tz/[^/]+/icutz/[^/]+\\.dat$\")\n    \
+             (regex #\"^/private/var/db/timezone/tz/[^/]+/icutz/[^/]+\\.dat$\"))\n",
+        );
         out.push_str(&format!(
             "\n; Timezone/identity denials. Seatbelt is last-match-wins, so these must\n\
              ; come AFTER the $HOME writable allow, the /private/etc read allow, and\n\
@@ -472,6 +480,49 @@ mod tests {
         );
         assert!(
             identity_deny_at < user_deny_at,
+            "user paths.deny must remain the very last rules"
+        );
+    }
+
+    #[test]
+    fn zoneinfo_deny_renders_after_user_read_only_allow_and_before_user_deny() {
+        let paths = PathPolicy {
+            read_only: vec!["/private/var/db/timezone".into()],
+            deny: vec!["/Users/example/.ssh".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        // Seatbelt is last-match-wins: a paths.read_only extra covering the
+        // timezone database must render BEFORE the zoneinfo deny or it
+        // re-opens the whole tree (and with it the resolved target of the
+        // /etc/localtime symlink). The UTC carve-out must immediately follow
+        // the deny so UTC data stays readable, and the user paths.deny block
+        // must stay the very last rules.
+        let read_only_allow_at = profile
+            .find("(allow file-read*\n    (subpath \"/private/var/db/timezone\"))")
+            .expect("user read_only allow");
+        let zoneinfo_deny_at = profile
+            .find("(deny file-read*\n    (subpath \"/var/db/timezone\")")
+            .expect("zoneinfo tree deny");
+        let utc_allow_at = profile
+            .find(r##"(regex #"^/var/db/timezone/tz/[^/]+/zoneinfo/UTC$")"##)
+            .expect("UTC allow");
+        let user_deny_at = profile
+            .find("(literal \"/Users/example/.ssh\")")
+            .expect("user deny");
+        assert!(
+            read_only_allow_at < zoneinfo_deny_at,
+            "zoneinfo deny must come after the user read_only allow"
+        );
+        assert!(
+            zoneinfo_deny_at < utc_allow_at,
+            "UTC carve-out must follow the zoneinfo deny or the deny kills it"
+        );
+        assert!(
+            utc_allow_at < user_deny_at,
             "user paths.deny must remain the very last rules"
         );
     }
@@ -968,6 +1019,83 @@ mod tests {
             "control read under the read_only grant failed: {}",
             control.output
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_extra_cannot_reallow_timezone_database() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // A user paths.read_only grant covering /private/var/db/timezone
+        // renders as an (allow file-read* ...) in the user sections. Seatbelt
+        // is last-match-wins, so if the zoneinfo deny rendered before that
+        // allow, the allow would silently re-open the timezone database — and
+        // with it /etc/localtime, whose symlink target resolves into the tree
+        // before rule matching. This pins the runtime behavior: the tree and
+        // /etc/localtime stay denied while the UTC carve-out keeps working.
+        let (root, home, tmpdir) = scratch_home_layout();
+        let cwd = std::env::current_dir().unwrap();
+        let paths = PathPolicy {
+            read_only: vec!["/private/var/db/timezone".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        )
+        .with_paths(paths);
+
+        // The host's configured zone target. Skip the localtime probes on the
+        // (unusual) host whose local zone IS one of the carved-out UTC data
+        // files, where a successful read is the intended behavior.
+        let zone_target = fs::read_link("/etc/localtime")
+            .map(|target| target.to_string_lossy().to_string())
+            .ok()
+            .filter(|target| !target.ends_with("/UTC") && !target.ends_with("/posixrules"));
+        let localtime = zone_target.as_ref().map(|_| {
+            run_profile(
+                &profile,
+                &tmpdir,
+                vec!["/bin/cat".into(), "/etc/localtime".into()],
+            )
+        });
+        let resolved_zone = zone_target
+            .as_ref()
+            .map(|target| run_profile(&profile, &tmpdir, vec!["/bin/cat".into(), target.clone()]));
+        let utc = find_utc_timezone_file().map(|path| {
+            run_profile(
+                &profile,
+                &tmpdir,
+                vec!["/bin/cat".into(), path.to_string_lossy().into()],
+            )
+        });
+
+        let _ = fs::remove_dir_all(&root);
+        if zone_target.is_none() {
+            eprintln!("skipping localtime probes; /etc/localtime is not a non-UTC symlink");
+        }
+        if let Some(localtime) = localtime {
+            assert_ne!(
+                localtime.status, 0,
+                "paths.read_only over the timezone DB re-allowed /etc/localtime"
+            );
+        }
+        if let Some(resolved_zone) = resolved_zone {
+            assert_ne!(
+                resolved_zone.status, 0,
+                "paths.read_only over the timezone DB re-allowed the zoneinfo target"
+            );
+        }
+        if let Some(utc) = utc {
+            assert_eq!(
+                utc.status, 0,
+                "UTC carve-out broken under a timezone read_only extra: {}",
+                utc.output
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
