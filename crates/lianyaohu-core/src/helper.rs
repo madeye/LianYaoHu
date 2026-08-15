@@ -5,6 +5,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use std::{io, mem, ptr};
 
 pub const SOCKET_PATH: &str = "/var/run/lianyaohu-helper.sock";
@@ -329,11 +330,25 @@ pub fn send_message_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -
 /// (or EOF) arrives, reassembling segmented delivery, and reports a request
 /// that exceeds `max_bytes` before its newline with a distinct "too large"
 /// error instead of parsing the truncated prefix.
+///
+/// Two bounds keep a hostile peer from abusing the loop:
+/// - the fd cap is enforced per segment, immediately after each segment's
+///   SCM_RIGHTS payload is harvested, so a peer sending many small segments
+///   each carrying descriptors cannot make the daemon accumulate fds beyond
+///   `max_fds` before the rejection fires (every harvested fd is still closed
+///   by the rejection);
+/// - `total_timeout` is a wall-clock budget across the WHOLE receive. The
+///   caller's per-syscall `SO_RCVTIMEO` restarts on every `recvmsg`, so on
+///   its own it lets a peer trickling one byte per almost-timeout pin a
+///   worker indefinitely; once the budget is spent the next incomplete
+///   segment returns a `TimedOut` error instead of looping again.
 pub fn receive_message_with_fds(
     stream: &UnixStream,
     max_bytes: usize,
     max_fds: usize,
+    total_timeout: Duration,
 ) -> io::Result<ReceivedMessage> {
+    let start = Instant::now();
     // One spare byte past the cap: filling it proves the request is over the
     // limit (would have been truncated), which is reported explicitly below.
     let mut bytes = vec![0u8; max_bytes + 1];
@@ -397,6 +412,16 @@ pub fn receive_message_with_fds(
                 header = libc::CMSG_NXTHDR(&msg, header);
             }
         }
+        // Enforced here, inside the loop, right after the harvest: checking
+        // only after the loop would let a peer sending many small segments
+        // each carrying SCM_RIGHTS accumulate thousands of descriptors in the
+        // daemon before the rejection fired. Returning drops `fds`, closing
+        // everything harvested so far.
+        if fds.len() > max_fds {
+            return Err(io::Error::other(
+                "too many file descriptors in helper request",
+            ));
+        }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
             control_truncated = true;
         }
@@ -411,6 +436,17 @@ pub fn receive_message_with_fds(
         if saw_newline || total > max_bytes {
             break;
         }
+        // Wall-clock deadline before waiting for another segment: the
+        // per-syscall receive timeout restarts on every recvmsg, so without
+        // this a peer trickling one byte per almost-timeout holds the worker
+        // forever. Checked after the completion tests so a request that just
+        // finished is never spuriously timed out.
+        if start.elapsed() >= total_timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper request receive timed out",
+            ));
+        }
     }
     bytes.truncate(total);
 
@@ -422,11 +458,6 @@ pub fn receive_message_with_fds(
     }
     if malformed_control {
         return Err(io::Error::other("malformed helper control message"));
-    }
-    if fds.len() > max_fds {
-        return Err(io::Error::other(
-            "too many file descriptors in helper request",
-        ));
     }
     if total > max_bytes {
         return Err(io::Error::other(format!(
@@ -444,6 +475,11 @@ mod tests {
     use super::*;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
+
+    /// Generous wall-clock budget for tests that must never trip the
+    /// deadline: everything here runs over a local socketpair, so anything
+    /// close to this is already a failure.
+    const RECEIVE_TEST_BUDGET: Duration = Duration::from_secs(30);
 
     #[test]
     fn parses_helper_requests() {
@@ -556,6 +592,14 @@ mod tests {
     #[test]
     fn segmented_request_is_reassembled_by_the_receiver() {
         let (left, right) = UnixStream::pair().unwrap();
+        // Fail fast on regression instead of hanging: a receiver that stops
+        // reading mid-request leaves the sender blocked in write_all, so the
+        // assert must run (and the receiver side must be dropped) before the
+        // join, and a read timeout turns a receiver that never terminates
+        // into a visible error rather than a stuck test.
+        right
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let request = format!("install utun5 {}\n", "x".repeat(32 * 1024));
         let sender = std::thread::spawn({
             let request = request.clone();
@@ -565,9 +609,11 @@ mod tests {
             }
         });
 
-        let received = receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3).unwrap();
-        sender.join().unwrap();
+        let received =
+            receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3, RECEIVE_TEST_BUDGET).unwrap();
         assert_eq!(received.message, request);
+        drop(right);
+        sender.join().unwrap();
     }
 
     // An over-cap request must fail with the distinct "too large" error —
@@ -576,6 +622,11 @@ mod tests {
     #[test]
     fn oversized_request_is_rejected_as_too_large_not_truncated() {
         let (left, right) = UnixStream::pair().unwrap();
+        // Fail fast on regression: a receiver that never reaches the cap
+        // would otherwise block in recvmsg forever once the sender is done.
+        right
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let sender = std::thread::spawn(move || {
             let mut left = &left;
             // No newline: the receiver must hit the cap, not a terminator.
@@ -585,7 +636,8 @@ mod tests {
             let _ = left.write_all(&payload);
         });
 
-        let error = receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3).unwrap_err();
+        let error = receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3, RECEIVE_TEST_BUDGET)
+            .unwrap_err();
         assert!(
             error.to_string().contains("too large"),
             "expected a too-large rejection, got: {error}"
@@ -641,7 +693,7 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
 
         send_message_with_fds(&left, b"run test\n", &[file.as_raw_fd()]).unwrap();
-        let received = receive_message_with_fds(&right, 1024, 1).unwrap();
+        let received = receive_message_with_fds(&right, 1024, 1, RECEIVE_TEST_BUDGET).unwrap();
 
         assert_eq!(received.message, "run test\n");
         assert_eq!(received.fds.len(), 1);
@@ -664,13 +716,82 @@ mod tests {
             let (left, right) = UnixStream::pair().unwrap();
             send_message_with_fds(&left, b"run test\n", &[file.as_raw_fd(); 4]).unwrap();
 
-            let error = receive_message_with_fds(&right, 1024, 3).unwrap_err();
+            let error = receive_message_with_fds(&right, 1024, 3, RECEIVE_TEST_BUDGET).unwrap_err();
 
             assert!(
                 error.to_string().contains("file descriptors"),
                 "expected fd-count rejection, got: {error}"
             );
         }
+    }
+
+    // Regression test for cross-segment SCM_RIGHTS accumulation: the fd cap
+    // must fire on the first segment that pushes the total over `max_fds`,
+    // not after the whole request has been read — otherwise a peer sending
+    // many small fd-bearing segments makes the root daemon hold thousands of
+    // descriptors before the rejection. The sender stops without a newline
+    // and without EOF, so a receiver that keeps looping past the cap hits the
+    // 500 ms read timeout and fails the assert below with a WouldBlock-style
+    // error instead of hanging the suite.
+    #[test]
+    fn over_cap_fds_across_segments_are_rejected_on_the_offending_segment() {
+        let (left, right) = UnixStream::pair().unwrap();
+        right
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let file = tempfile_file();
+        // Four segments of 3 fds each (SCM_RIGHTS is a message boundary, so
+        // recvmsg cannot coalesce them): the total of 12 exceeds max_fds = 3
+        // on the second segment already.
+        for _ in 0..4 {
+            send_message_with_fds(&left, b"x", &[file.as_raw_fd(); 3]).unwrap();
+        }
+
+        let started = Instant::now();
+        let error = receive_message_with_fds(&right, 1024, 3, RECEIVE_TEST_BUDGET).unwrap_err();
+        assert!(
+            error.to_string().contains("file descriptors"),
+            "expected fd-count rejection, got: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "over-cap rejection was not prompt"
+        );
+        drop(left);
+    }
+
+    // The wall-clock deadline must bound the whole receive: the per-syscall
+    // read timeout restarts on every segment, so it alone cannot stop a peer
+    // trickling bytes forever. A zero budget makes the deadline trip
+    // deterministically on the first incomplete segment — no real waiting.
+    #[test]
+    fn receive_deadline_bounds_a_trickling_sender() {
+        let (left, right) = UnixStream::pair().unwrap();
+        // Fail fast on regression: without the deadline check the receiver
+        // would block in recvmsg waiting for a second segment that never
+        // comes; the socket timeout turns that into a WouldBlock-style error
+        // that fails the TimedOut assert instead of hanging the suite.
+        right
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        send_message_with_fds(&left, b"install ", &[]).unwrap();
+
+        let error = receive_message_with_fds(&right, 1024, 3, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(left);
+    }
+
+    // The deadline is checked only between segments: a request that completes
+    // in one segment must never be spuriously timed out, even with a spent
+    // budget.
+    #[test]
+    fn completed_request_is_not_timed_out_by_the_deadline() {
+        let (left, right) = UnixStream::pair().unwrap();
+        send_message_with_fds(&left, b"status\n", &[]).unwrap();
+
+        let received = receive_message_with_fds(&right, 1024, 3, Duration::ZERO).unwrap();
+        assert_eq!(received.message, "status\n");
+        drop(left);
     }
 
     fn nofile_soft_limit() -> u64 {

@@ -37,9 +37,20 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use std::{mem, ptr, thread};
 
-/// Cap how long a single peer may take to send its request / receive its
-/// reply, so one stalled client cannot pin a worker forever.
+/// Cap how long a single blocking socket syscall (one recvmsg / one write)
+/// may take. This alone does NOT bound a whole request: the segment loop in
+/// [`receive_message_with_fds`] restarts the per-syscall timer on every
+/// segment, so the whole-receive bound is [`REQUEST_RECEIVE_TIMEOUT`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for receiving one complete request, enforced inside
+/// [`receive_message_with_fds`]. Without it a peer trickling one byte per
+/// almost-`IO_TIMEOUT` resets the per-syscall timer indefinitely and pins a
+/// worker (and its UID slot) essentially forever. Twice `IO_TIMEOUT` is
+/// generous headroom: even the maximal 64 KiB request arrives over a local
+/// Unix socket in well under a second on a loaded machine, while a peer that
+/// stalls mid-request is cut off within ~10 s.
+const REQUEST_RECEIVE_TIMEOUT: Duration = IO_TIMEOUT.saturating_mul(2);
 
 /// Upper bound on concurrent worker threads. Run sessions hold a worker for
 /// the lifetime of the agent, so the cap must comfortably cover legitimate
@@ -219,7 +230,8 @@ impl HelperDaemon {
     }
 
     fn handle_inner(&self, stream: &mut UnixStream, peer: PeerCredentials) -> Result<String> {
-        let received = receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3)?;
+        let received =
+            receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3, REQUEST_RECEIVE_TIMEOUT)?;
         match parse_request(&received.message)? {
             HelperRequest::Install {
                 interface_name,
