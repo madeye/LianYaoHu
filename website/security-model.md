@@ -167,14 +167,25 @@ handle identically. The helper likewise rejects specs newer than itself.
 
 Firewall sessions are reference-counted per UID: concurrent launches by the
 same user share one set of rules, which are removed only when the last session
-ends, so an early-exiting session cannot strip the guard from a running one.
+ends. For helper `run` sessions the helper itself holds and releases each
+reference when the agent exits, so an early-exiting run session cannot strip
+the guard from a still-running one.
 Concurrent sessions for one UID must use the same VPN interface, scope, and
 network policy (the rules live under a single anchor/chain per UID); a
 mismatching launch is refused rather than silently weakening either session.
-The `uninstall` request releases only the user-scoped state that `install`
-created: while a helper `run` session is live for that UID, `uninstall` is
-refused, so a stray same-UID client writing `uninstall` to the socket cannot
-strip a running session's group-scoped rules.
+The `uninstall` request can release only user-scoped state — the kind
+`install` creates: while a helper `run` session is live for that UID,
+`uninstall` is refused, so a stray same-UID client writing `uninstall` to the
+socket cannot strip a running session's group-scoped rules. Install sessions
+themselves enjoy no such protection: their reference count is keyed by UID
+alone, with no per-session token, so any process running as the same UID can
+send `uninstall` and release install-session state it did not create — once
+the count reaches zero the user-scoped rules come down even if the process
+that installed them is still running. On macOS the shared-user
+(`--shared-user-firewall`) path is exactly such a user-scoped install
+session, so a same-UID stranger can tear down a running shared-user agent's
+firewall guard. This is a same-user boundary only; other UIDs cannot reach
+that state.
 The helper also caps concurrent connections — globally and per UID, so one
 user's long-lived sessions cannot occupy every worker slot — and, on
 SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only
