@@ -219,6 +219,17 @@ enum Prepare {
 /// Interactive prompts happen here, so callers can still daemonize after.
 fn prepare(options: &Options) -> Result<Prepare> {
     let home = env::var("HOME").map_err(|_| err("HOME is not set"))?;
+    // Landlock rule targets are opened without following symlinks, so a $HOME
+    // that traverses one (automount, `/home/u -> /export/u`) would silently
+    // lose every home rule in the direct no-helper path. Resolve it up front —
+    // the helper path canonicalizes server-side; this is the direct-path
+    // equivalent. On failure keep the raw value: a missing home gets no rule
+    // either way.
+    let home = Path::new(&home)
+        .canonicalize()
+        .ok()
+        .and_then(|canonical| canonical.to_str().map(str::to_owned))
+        .unwrap_or(home);
     let cwd = options.cwd.canonicalize().unwrap_or(options.cwd.clone());
     let cwd_string = cwd.to_string_lossy().to_string();
     let tmpdir = temporary_directory();

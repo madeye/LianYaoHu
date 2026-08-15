@@ -89,7 +89,7 @@ impl LinuxSandbox {
             )
         };
         format!(
-            "Linux sandbox:\n  writable: {writable}\n  writable devices: {devices}\n  read-only: /bin, /sbin, /usr, /lib, /lib64, /etc, /opt, /proc/self{read_only_extras}\n{narrow_note}{deny_note}  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
+            "Linux sandbox:\n  writable: {writable}\n  writable devices: {devices}\n  read-only: /usr, /etc, /opt, /proc/<pid> (own proc entries); /bin, /sbin, /lib, /lib64 where real directories (merged-/usr symlinks are covered by /usr){read_only_extras}\n{narrow_note}{deny_note}  seccomp: deny bind/listen/accept, raw/non-IP sockets, mount/ns/ptrace/bpf/key/kernel APIs\n"
         )
     }
 }
@@ -256,20 +256,19 @@ fn write_landlock_access(handled_access: u64) -> u64 {
 }
 
 fn read_only_paths(sandbox: &LinuxSandbox) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = [
-        "/bin",
-        "/sbin",
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/etc",
-        "/opt",
-        "/proc/self",
-        "/proc/thread-self",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect();
+    let mut paths: Vec<PathBuf> = ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/opt"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    // /proc/self and /proc/thread-self are magic symlinks, so
+    // openat2(RESOLVE_NO_SYMLINKS) refuses them (ELOOP) and a rule on either
+    // name would be silently dropped — losing reads of /proc/self/{maps,
+    // status,cmdline,fd,...}, which glibc, Node, Go, and Python all touch.
+    // Grant the real per-process directory instead; this runs in the forked
+    // child (pre-exec), so std::process::id() is the sandboxed process's own
+    // pid, and one rule on /proc/<pid> also covers /proc/<pid>/task/<tid>,
+    // everything /proc/thread-self points into.
+    paths.push(PathBuf::from(format!("/proc/{}", std::process::id())));
     // Narrow-home mode: home drops out of the writable set but stays readable
     // so dotfiles and installed tooling keep working.
     if sandbox.paths.narrow_home {
@@ -359,8 +358,9 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 /// openat2(2) resolve flag: fail with ELOOP when ANY path component is a
 /// symlink. Plain `O_NOFOLLOW` only protects the final component, so a raced
 /// swap of an intermediate directory could still redirect the rule target.
-/// openat2 is Linux 5.6+, older than the 5.13 Landlock baseline, so no
-/// fallback path is needed.
+/// openat2 is Linux 5.6+, older than the 5.13 Landlock baseline; the only
+/// fallback needed is for nested runtimes whose seccomp filters block the
+/// syscall itself (see `open_rule_target_without_openat2`).
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
 #[repr(C)]
@@ -400,9 +400,39 @@ fn open_rule_target(path: &Path) -> Result<Option<FdGuard>> {
         if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ELOOP)) {
             return Ok(None);
         }
+        // Nested sandbox runtimes (pre-20.10.10 Docker default seccomp
+        // profiles, gVisor) report openat2 as ENOSYS or filter it into EPERM.
+        // Fall back to a plain open rather than aborting the launch. The
+        // fallback's O_NOFOLLOW protects only the final path component
+        // against symlinks, not intermediate ones — a strictly weaker
+        // guarantee, accepted only because openat2 itself is unavailable.
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+            return open_rule_target_without_openat2(&c_path);
+        }
         return Err(error.into());
     }
     Ok(Some(FdGuard(fd as RawFd)))
+}
+
+/// Fallback for kernels/runtimes where openat2 is blocked. O_PATH|O_NOFOLLOW
+/// opens a final-component symlink as the symlink inode itself (it does not
+/// fail with ELOOP); `add_path_rule` classifies that via fstat and skips it,
+/// so a symlink target still receives no grant.
+fn open_rule_target_without_openat2(c_path: &CString) -> Result<Option<FdGuard>> {
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ELOOP)) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    Ok(Some(FdGuard(fd)))
 }
 
 fn add_path_rule(
@@ -420,6 +450,12 @@ fn add_path_rule(
     let mut stat = unsafe { mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(fd.0, &mut stat) } != 0 {
         return Err(io::Error::last_os_error().into());
+    }
+    // The openat2 fallback can hand back the symlink inode itself
+    // (O_PATH|O_NOFOLLOW opens it rather than failing); a rule on a symlink
+    // inode grants nothing useful and must never stand in for its target.
+    if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        return Ok(());
     }
     let allowed_access = if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
         directory_access
@@ -681,7 +717,11 @@ mod tests {
         assert!(summary.contains("/home/alice"));
         assert!(summary.contains("/home/alice/project"));
         assert!(summary.contains("/tmp/lyh"));
-        assert!(summary.contains("read-only: /bin"));
+        assert!(summary.contains("read-only: /usr"));
+        assert!(summary.contains("/proc/<pid>"));
+        // The summary must not claim rules on the magic /proc symlinks or an
+        // unconditional /bin rule — neither is installed any more.
+        assert!(!summary.contains("/proc/self"));
         assert!(summary.contains("seccomp: deny bind/listen/accept"));
         assert!(summary.contains("writable devices: /dev/null"));
     }
@@ -823,6 +863,49 @@ mod tests {
         assert!(open_rule_target(&real).unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_rule_targets_the_real_process_directory() {
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh");
+        let paths = read_only_paths(&sandbox);
+
+        // /proc/self and /proc/thread-self are magic symlinks that
+        // openat2(RESOLVE_NO_SYMLINKS) refuses; listing them would silently
+        // drop the rule. The list must carry the resolved directory instead,
+        // and that directory must actually open as a rule target.
+        assert!(!paths.iter().any(|path| {
+            path == Path::new("/proc/self") || path == Path::new("/proc/thread-self")
+        }));
+        let proc_dir = PathBuf::from(format!("/proc/{}", std::process::id()));
+        assert!(paths.contains(&proc_dir));
+        assert!(open_rule_target(&proc_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn every_default_read_only_target_yields_a_rule_or_is_a_merged_usr_alias() {
+        // /bin, /sbin, /lib, and /lib64 are symlinks into /usr on
+        // merged-/usr systems, where the /usr rule covers their targets.
+        // Every other default target that exists must produce a rule fd, or
+        // its grant is silently lost — the regression that dropped
+        // /proc/self after the switch to openat2(RESOLVE_NO_SYMLINKS).
+        let aliases = ["/bin", "/sbin", "/lib", "/lib64"].map(Path::new);
+        let sandbox = LinuxSandbox::new("/home/alice", "/home/alice/project", "/tmp/lyh");
+        for path in read_only_paths(&sandbox) {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                // Absent on this layout (e.g. /lib64 on arm64): nothing to
+                // grant, nothing lost.
+                continue;
+            };
+            if open_rule_target(&path).unwrap().is_some() {
+                continue;
+            }
+            assert!(
+                aliases.contains(&path.as_path()) && metadata.file_type().is_symlink(),
+                "default read-only target {} produced no Landlock rule and is not a merged-/usr symlink alias",
+                path.display()
+            );
+        }
     }
 
     #[test]
