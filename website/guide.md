@@ -16,6 +16,12 @@ and installs the root firewall helper:
 curl -fsSL https://lyh.maxlv.net/install.sh | bash
 ```
 
+The checksum guards integrity only. If `cosign` is installed, the installer
+also verifies the release's Sigstore signature against the repository's
+release-workflow identity (set `LIANYAOHU_REQUIRE_SIGNATURE=1` to make that
+mandatory); see [the security model](/security-model#supply-chain) for the
+full supply-chain trust model.
+
 Prebuilt releases cover Apple Silicon macOS (`aarch64-apple-darwin`) and
 x86-64 Linux (`x86_64-unknown-linux-gnu`); on other platforms the installer
 tells you to build from source. Pass options after `bash -s --` to skip the

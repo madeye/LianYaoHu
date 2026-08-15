@@ -18,6 +18,13 @@ and installs the root firewall helper:
 curl -fsSL https://lyh.maxlv.net/install.sh | bash
 ```
 
+The checksum guards integrity only. If `cosign` is installed, the installer
+also verifies the release's Sigstore signature against this repository's
+release-workflow identity (set `LIANYAOHU_REQUIRE_SIGNATURE=1` to make that
+mandatory); otherwise trust rests on GitHub's release infrastructure. See
+[the security model](https://lyh.maxlv.net/security-model) for the full
+supply-chain trust model.
+
 Prebuilt releases cover Apple Silicon macOS (`aarch64-apple-darwin`) and
 x86-64 Linux (`x86_64-unknown-linux-gnu`); on other platforms the installer
 tells you to build from source. Pass options after `bash -s --`, for example
@@ -190,7 +197,8 @@ enforcement around a real launched process.
 Pushing a tag like `v0.1.0` runs the release workflow. It verifies formatting,
 clippy, and tests, builds `lianyaohu`, creates a
 `lianyaohu-<version>-<target>.tar.gz` package, and attaches that package plus a
-SHA-256 checksum to the GitHub Release for the tag.
+SHA-256 checksum and a Sigstore signature bundle (`cosign sign-blob`, keyless,
+bound to the workflow's OIDC identity) to the GitHub Release for the tag.
 
 ## License
 

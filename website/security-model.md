@@ -354,8 +354,19 @@ trusting the machine, or run it against a dedicated user account.
 
 The `curl | bash` installer verifies the release tarball against a SHA-256
 checksum downloaded from the same GitHub release. This protects integrity (a
-corrupted download fails), not authenticity: releases are not yet signed, so
-trust rests on GitHub's account and release infrastructure. The uninstaller
-fetches the helper-teardown script from the repository pinned to a release
-tag. Review the scripts before piping them to `bash` if this trust model is
-not acceptable for your environment.
+corrupted download fails), not authenticity: a tampered release ships a
+matching checksum.
+
+Authenticity comes from Sigstore: the release workflow signs each tarball
+with `cosign sign-blob` (keyless, bound to the workflow's OIDC identity) and
+publishes the resulting bundle next to the tarball. When `cosign` is
+installed, the installer verifies the bundle against the repository's release
+workflow identity and refuses a tarball whose signature does not check out;
+set `LIANYAOHU_REQUIRE_SIGNATURE=1` to make a missing `cosign` or an unsigned
+release a hard failure instead of a note. Without `cosign` (or for releases
+predating signing), trust rests on GitHub's account and release
+infrastructure alone.
+
+The uninstaller fetches the helper-teardown script from the repository pinned
+to a release tag. Review the scripts before piping them to `bash` if this
+trust model is not acceptable for your environment.
