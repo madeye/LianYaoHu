@@ -38,7 +38,11 @@ the agent; stronger identifiers such as `kern.uuid` remain blocked and
 `HOSTNAME` is still stripped from the environment.
 
 Timezone preference files are explicitly denied and the launched environment
-sets `TZ=UTC`.
+sets `TZ=UTC`. One caveat: in the default wide-home mode these are path-based
+denials inside a writable tree, so an in-sandbox process can evade them by
+renaming a parent directory (e.g. `mv ~/Library ~/L2`) and reading the files
+under the new path. Narrow-home mode keeps those parents read-only, which
+closes the rename route.
 
 By default the helper runs the guarded process with the caller's UID and the
 dedicated `_lianyaohu` effective GID. On macOS, the sandbox profile describes

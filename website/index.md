@@ -43,7 +43,9 @@ features:
     details: >-
       Host-identifying environment variables (hostname, SSH, MAC, serial,
       timezone markers) are stripped, TZ is pinned to UTC, and timezone
-      preference files are unreadable from inside the sandbox.
+      preference files are denied by path. In the default writable home a
+      renamed parent directory can evade a path-based deny; narrow-home
+      mode closes this.
   - icon: 🧪
     title: Verified end to end
     details: >-
