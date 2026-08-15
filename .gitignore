@@ -4,3 +4,4 @@ dist/
 node_modules/
 website/.vitepress/dist/
 website/.vitepress/cache/
+.grok/
