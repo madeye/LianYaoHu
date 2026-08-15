@@ -191,10 +191,14 @@ user's long-lived sessions cannot occupy every worker slot — and, on
 SIGINT/SIGTERM, hands shutdown to a dedicated thread (the signal handler only
 writes to a pipe) that removes the socket and uninstalls any remaining
 firewall state before exit. On startup, before serving, the helper reaps
-firewall state orphaned by a previous instance that exited without cleanup
-(SIGKILL, crash, supervisor restart); orphaned rules fail closed — they
-over-block rather than open anything — but would otherwise keep blocking a
-user whose session is long gone. On macOS the child is spawned
+firewall state left behind by a previous instance that exited without cleanup
+(SIGKILL, crash, supervisor restart), because stale rules would otherwise
+keep blocking a user whose session is long gone. This reap is not purely
+fail-closed: the new instance cannot tell an orphan from a survivor, so a
+helper restart also flushes anchors/chains still guarding a running process —
+in particular a shared-user agent whose user-scoped rules were installed
+through the previous helper instance keeps running with its network guard
+stripped (fail-open for that agent) until it exits. On macOS the child is spawned
 through `launchctl asuser`, joining the caller's Mach bootstrap and audit
 session before credentials are dropped: keychain search lists and unlock state
 are per-session, and without this the agent lands in the system session where
@@ -210,8 +214,13 @@ exits last removes the shared rules, taking the other session's guard down
 with it (last-exit-wins). Sudo user-scoped rules do live under their own
 names (`LYH-U-<uid>` on Linux, `com.apple/lianyaohu-user-<uid>` on macOS),
 distinct from the helper's group-scoped `LYH-<uid>` /
-`com.apple/lianyaohu-<uid>`, so a shared-user launch or exit can never flush
-the rules of a live helper-managed session.
+`com.apple/lianyaohu-<uid>`, so a shared-user launch or exit cannot flush
+the rules of a live helper `run` session in the other scope. The separation
+is by scope, not by manager: helper `install` sessions are user-scoped and
+share the sudo path's user-scoped names, so a shared-user sudo fallback for
+the same UID (taken when the helper is unreachable) still replaces — and on
+exit flushes — a helper-managed user-scoped anchor/chain, and within one
+scope last-exit-wins applies as above.
 
 On macOS, the installed PF rules:
 

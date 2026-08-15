@@ -149,8 +149,14 @@ impl HelperDaemon {
         ensure_session_group()?;
         // The session map is in-memory, so firewall state installed by a
         // previous helper instance that exited uncleanly (SIGKILL, crash,
-        // supervisor restart) would never be reaped. No session is live yet,
-        // so anything found now is stale by definition.
+        // supervisor restart) would never be reaped. This instance has no
+        // live session yet, but the rules found now are not necessarily
+        // orphans: an agent guarded by rules the previous instance installed
+        // (e.g. a shared-user install session) may still be running, and
+        // flushing its anchor/chain strips its guard — fail-OPEN for that
+        // agent — while leaving the rules would keep over-blocking users
+        // whose sessions really are gone. The reap accepts the former to
+        // avoid the latter; see security-model.md.
         reap_stale_sessions();
 
         let socket_path = Path::new(SOCKET_PATH);
@@ -1259,11 +1265,14 @@ fn validated_vpn_interface(
     Ok(selected)
 }
 
-/// Flush firewall state orphaned by a previous helper instance. The PF
-/// enable-reference tokens from `pfctl -E` died with the old process and
-/// cannot be released, so PF may stay enabled; that is benign (an enabled PF
-/// with empty anchors filters nothing extra), unlike stale rules, which keep
-/// blocking a user whose session is long gone.
+/// Flush firewall state left behind by a previous helper instance. Not
+/// purely fail-closed: a still-running agent guarded by rules the old
+/// instance installed loses that guard when its anchor is flushed here
+/// (fail-open for that agent), accepted so stale rules cannot keep blocking
+/// users whose sessions are long gone. The PF enable-reference tokens from
+/// `pfctl -E` died with the old process and cannot be released, so PF may
+/// stay enabled; that is benign (an enabled PF with empty anchors filters
+/// nothing extra).
 #[cfg(target_os = "macos")]
 fn reap_stale_sessions() {
     match run_pf(&["-a", "com.apple", "-s", "Anchors"]) {
