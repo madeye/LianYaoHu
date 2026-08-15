@@ -268,6 +268,10 @@ default-route invariant:
   cannot make another interface carry the default route.
 - If the system default route changes while the agent runs, DNS can leave the
   tunnel even though the agent's sockets remain pinned.
+- Only the default **IPv4** route is probed. If the system also has an IPv6
+  default route on a physical interface, RDNSS-learned resolvers and AAAA
+  transport can leave over it even when the IPv4 default is the tunnel;
+  IPv6 confinement of the system resolver is out of scope.
 
 ## Configuration Trust
 
