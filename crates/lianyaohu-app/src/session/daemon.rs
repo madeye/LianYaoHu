@@ -43,13 +43,17 @@ pub fn open_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd)> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // Raw pointer, not `&mut`: Linux libc declares `winp` as `*const winsize`
+    // (macOS keeps `*mut`), and a `&mut` argument trips
+    // clippy::unnecessary_mut_passed there.
+    let winp: *mut libc::winsize = &mut size;
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            winp,
         )
     };
     if rc != 0 {
