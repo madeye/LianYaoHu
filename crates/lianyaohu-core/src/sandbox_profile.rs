@@ -37,13 +37,6 @@ impl SandboxProfile {
 
 (deny default)
 
-(deny file-read*
-    (literal "/etc/localtime")
-    (literal "/private/etc/localtime")
-    (literal "/Library/Preferences/.GlobalPreferences.plist")
-    (literal "{home_global_preferences}")
-    (subpath "{home_by_host_preferences}"))
-
 (deny system-socket)
 (deny socket-ioctl)
 (deny sysctl-write)
@@ -197,6 +190,16 @@ impl SandboxProfile {
     (remote tcp "*:*")
     (remote udp "*:*")
     (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+
+; Timezone/identity denials. Seatbelt is last-match-wins, so these must come
+; AFTER the $HOME writable allow and the /private/etc read allow above, or
+; those allows override them. Only the user-policy deny block may follow.
+(deny file-read* file-write*
+    (literal "/etc/localtime")
+    (literal "/private/etc/localtime")
+    (literal "/Library/Preferences/.GlobalPreferences.plist")
+    (literal "{home_global_preferences}")
+    (subpath "{home_by_host_preferences}"))
 {user_sections}"#
         )
     }
@@ -238,8 +241,9 @@ impl SandboxProfile {
         } else {
             format!(
                 r#"; $HOME is writable so agents can maintain their own state (~/.claude,
-; ~/.codex, credential and cache files). The identity-surface denials above
-; still win over this allow. /opt/homebrew is writable so agents can
+; ~/.codex, credential and cache files). Seatbelt is last-match-wins, so the
+; identity-surface denials emitted after this allow carve the timezone
+; preference files back out of it. /opt/homebrew is writable so agents can
 ; brew install the tools they need.
 (allow file-read* file-write* file-map-executable
     (subpath "{home}")
@@ -365,9 +369,57 @@ mod tests {
         // render to the historical profile.
         assert!(!profile.contains("user policy"));
         assert!(!profile.contains("Narrow-home"));
-        assert!(profile.ends_with(
-            "(remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n"
-        ));
+        assert!(profile.ends_with("(subpath \"/Users/example/Library/Preferences/ByHost\"))\n"));
+    }
+
+    #[test]
+    fn identity_denials_come_after_home_and_etc_allows() {
+        let profile =
+            SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh").render();
+
+        // Seatbelt is last-match-wins: if the timezone/identity denials sit
+        // before the blanket $HOME write allow or the /private/etc read allow,
+        // those allows silently override them and the denials are dead rules.
+        let deny_block = r#"(deny file-read* file-write*
+    (literal "/etc/localtime")
+    (literal "/private/etc/localtime")
+    (literal "/Library/Preferences/.GlobalPreferences.plist")
+    (literal "/Users/example/Library/Preferences/.GlobalPreferences.plist")
+    (subpath "/Users/example/Library/Preferences/ByHost"))"#;
+        let deny_at = profile.find(deny_block).expect("identity deny block");
+        let home_allow_at = profile
+            .find("(subpath \"/Users/example\")")
+            .expect("home allow");
+        let etc_allow_at = profile
+            .find("(subpath \"/private/etc\")")
+            .expect("/private/etc allow");
+        assert!(
+            deny_at > home_allow_at,
+            "identity denials before home allow"
+        );
+        assert!(deny_at > etc_allow_at, "identity denials before /etc allow");
+    }
+
+    #[test]
+    fn user_deny_paths_stay_last_after_identity_denials() {
+        let paths = PathPolicy {
+            deny: vec!["/Users/example/.ssh".into()],
+            ..PathPolicy::default()
+        };
+        let profile = SandboxProfile::new("/Users/example", "/Users/example/project", "/tmp/lyh")
+            .with_paths(paths)
+            .render();
+
+        let identity_deny_at = profile
+            .find("(literal \"/Users/example/Library/Preferences/.GlobalPreferences.plist\")")
+            .expect("identity deny");
+        let user_deny_at = profile
+            .find("(literal \"/Users/example/.ssh\")")
+            .expect("user deny");
+        assert!(
+            user_deny_at > identity_deny_at,
+            "user paths.deny must remain the very last rules"
+        );
     }
 
     #[test]
@@ -681,6 +733,87 @@ mod tests {
         let result = run_in_sandbox(&["/bin/cat", "/private/etc/localtime"]);
 
         assert_ne!(result.status, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_profile_blocks_home_timezone_preferences() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // The $HOME copies of the timezone/identity preferences sit inside the
+        // blanket-writable home. Seatbelt is last-match-wins, so the identity
+        // denials must be emitted after the home allow or the allow silently
+        // wins; this pins the runtime behavior with a scratch home.
+        let (root, home, tmpdir) = scratch_home_layout();
+        let prefs = home.join("Library/Preferences");
+        fs::create_dir_all(prefs.join("ByHost")).unwrap();
+        fs::write(prefs.join(".GlobalPreferences.plist"), "identity").unwrap();
+        fs::write(prefs.join("ByHost/com.apple.example.plist"), "identity").unwrap();
+        fs::write(home.join("readable"), "fine").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let profile = SandboxProfile::new(
+            home.to_string_lossy(),
+            cwd.to_string_lossy(),
+            tmpdir.to_string_lossy(),
+        );
+
+        let global_prefs = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join(".GlobalPreferences.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let by_host = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                prefs
+                    .join("ByHost/com.apple.example.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
+        let write_attempt = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/touch".into(),
+                prefs.join("ByHost/planted.plist").to_string_lossy().into(),
+            ],
+        );
+        let control = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/bin/cat".into(),
+                home.join("readable").to_string_lossy().into(),
+            ],
+        );
+
+        let planted = prefs.join("ByHost/planted.plist").exists();
+        let _ = fs::remove_dir_all(&root);
+        assert_ne!(
+            global_prefs.status, 0,
+            "$HOME .GlobalPreferences.plist was readable despite the deny"
+        );
+        assert_ne!(
+            by_host.status, 0,
+            "$HOME Library/Preferences/ByHost was readable despite the deny"
+        );
+        assert_ne!(
+            write_attempt.status, 0,
+            "$HOME Library/Preferences/ByHost was writable despite the deny"
+        );
+        assert!(!planted);
+        assert_eq!(control.status, 0, "control read failed: {}", control.output);
     }
 
     #[cfg(target_os = "macos")]
