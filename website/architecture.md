@@ -37,7 +37,7 @@ launcher and the helper, so both sides always render identical rules:
 | `launch` | Serialize the helper launch spec: argv, cwd, sanitized environment, the rendered sandbox profile/summary field, and (spec v2) the typed `SandboxPolicy`. A helper older than the spec's version refuses to run it. |
 | `pf` | macOS: `PFRuleSet` renders the PF anchor rules for a `(utun, socket owner, network policy)` tuple; the default helper path matches the `_lianyaohu` group, while the fallback path matches the caller UID. `PFGuard` installs fallback rules via the helper or sudo and uninstalls on `Drop`. |
 | `linux_firewall` | Linux: `LinuxFirewallRuleSet` renders and installs iptables/ip6tables OUTPUT chains for a `(tun/wg, socket owner, network policy)` tuple; the default helper path matches `_lianyaohu`, while the fallback path matches the caller UID. |
-| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, `capabilities` probes policy support for version negotiation, and `install <utun>`, `uninstall`, `status` remain for the current-UID fallback. |
+| `helper` | Client for the helper daemon's protocol over `/var/run/lianyaohu-helper.sock`; the default `run <utun> <spec>` request passes stdio FDs with `SCM_RIGHTS`, `capabilities` probes policy support for version negotiation, and `install <utun> [policy]`, `uninstall`, `status` remain for the current-UID fallback (a non-default network policy travels with the install request and is negotiated the same way). |
 
 ### `lianyaohu-app` (launcher)
 
@@ -89,14 +89,17 @@ that owns the privileged half of firewall enforcement:
   installs firewall rules matching the `_lianyaohu` group in the caller's
   anchor/chain, and runs the command as the caller UID with `_lianyaohu` as the
   effective GID and the caller's normal supplementary groups.
-- Also accepts `install <interface>`, `uninstall`, and `status` for the
-  `--shared-user-firewall` fallback. In that path generated rules are scoped
-  to the peer UID.
+- Also accepts `install <interface> [policy]`, `uninstall`, and `status` for
+  the `--shared-user-firewall` fallback. In that path generated rules are
+  scoped to the peer UID; a non-default network policy travels as typed JSON
+  in the install request and is re-validated helper-side before it is applied.
 - Answers `capabilities` with its supported spec features (`policy=1
-  spec_version=2`). Clients probe this before sending a non-default sandbox
-  policy; an old helper answers the unknown verb with an error line, which is
-  the client's signal to hard-error instead of running with a silently
-  narrower policy. The helper re-validates every policy field it receives —
+  install_policy=1 spec_version=2`). Clients probe this before sending a
+  non-default sandbox policy; an old helper answers the unknown verb with an
+  error line, which is the client's signal to hard-error instead of running
+  with a silently narrower policy. The install path probes `install_policy`
+  the same way and falls back to `sudo pfctl` — which renders the full rule
+  set — rather than letting an old helper install weaker default rules. The helper re-validates every policy field it receives —
   ownership and canonicalization for extra writable paths, a system-prefix
   denylist, other-users'-home rejection for read-only extras, LAN-exception
   containment, and list caps — before rebuilding the profile and rules.

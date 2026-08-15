@@ -263,14 +263,10 @@ impl PFGuard {
     }
 
     pub fn install(&mut self) -> Result<()> {
-        match PFHelperClient::default().install(&self.rule_set.interface_name) {
-            Ok(()) => {
-                self.backend = Some(Backend::Helper);
-                self.installed = true;
-                return Ok(());
-            }
-            Err(error) if helper_unavailable(error.as_ref()) => {}
-            Err(error) => return Err(err(format!("PF helper refused request: {error}"))),
+        if self.try_helper_install()? {
+            self.backend = Some(Backend::Helper);
+            self.installed = true;
+            return Ok(());
         }
 
         let dir = std::env::temp_dir().join("lianyaohu-pf");
@@ -306,6 +302,37 @@ impl PFGuard {
         self.backend = Some(Backend::Sudo);
         self.installed = true;
         Ok(())
+    }
+
+    /// Asks the helper to install this rule set. `Ok(true)` means the helper
+    /// holds the rules; `Ok(false)` means the caller must use the sudo
+    /// fallback, which renders the full rule set itself. A non-default
+    /// network policy is negotiated first: a helper that predates
+    /// install-time policies would install the default (weaker) rules and
+    /// report success — exactly the silent partial enforcement the run path's
+    /// capability probe exists to prevent — so such a helper is skipped in
+    /// favor of sudo rather than trusted with the install.
+    fn try_helper_install(&self) -> Result<bool> {
+        let client = PFHelperClient::default();
+        if self.rule_set.network != NetworkPolicy::default() {
+            match client.supports_install_policy() {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "note: the installed root helper predates install-time network policies; \
+                         applying the custom policy through sudo pfctl instead"
+                    );
+                    return Ok(false);
+                }
+                Err(error) if helper_unavailable(error.as_ref()) => return Ok(false),
+                Err(error) => return Err(err(format!("PF helper refused request: {error}"))),
+            }
+        }
+        match client.install(&self.rule_set.interface_name, &self.rule_set.network) {
+            Ok(()) => Ok(true),
+            Err(error) if helper_unavailable(error.as_ref()) => Ok(false),
+            Err(error) => Err(err(format!("PF helper refused request: {error}"))),
+        }
     }
 
     pub fn uninstall(&mut self) {
@@ -509,6 +536,37 @@ mod tests {
         assert!(rules.find(lan_allow).unwrap() < rules.find(lan_block).unwrap());
         assert!(rules.find(lan_block).unwrap() < rules.find(deny4).unwrap());
         assert!(rules.find(deny6).unwrap() < rules.find(pass).unwrap());
+    }
+
+    // Regression test for #54: an `install` via the helper must enforce the
+    // same rules the sudo fallback renders — a helper-side reconstruction of
+    // the wire policy has to produce byte-identical PF rules, custom
+    // default-deny/deny/lan_allow entries included.
+    #[test]
+    fn helper_install_renders_the_same_rules_as_the_sudo_path() {
+        use crate::helper::{HelperRequest, install_request, parse_request};
+
+        let mut network = policy(&[
+            ("allow", "140.82.112.0/20:443"),
+            ("deny", "169.254.169.254"),
+            ("lan_allow", "192.168.1.10:22"),
+        ]);
+        network.default_action = NetAction::Deny;
+        let sudo_rules = PFRuleSet::new_user("utun4", 501, Some("10.9.0.1".into()))
+            .with_network(network.clone());
+
+        let request = install_request("utun4", &network).unwrap();
+        let HelperRequest::Install {
+            interface_name,
+            network: received,
+        } = parse_request(&request).unwrap()
+        else {
+            panic!("expected an install request");
+        };
+        let helper_rules = PFRuleSet::new_user(interface_name, 501, Some("10.9.0.1".into()))
+            .with_network(received);
+
+        assert_eq!(sudo_rules.render(), helper_rules.render());
     }
 
     #[test]

@@ -217,8 +217,11 @@ impl HelperDaemon {
     fn handle_inner(&self, stream: &mut UnixStream, peer: PeerCredentials) -> Result<String> {
         let received = receive_message_with_fds(stream, MAX_REQUEST_BYTES, 3)?;
         match parse_request(&received.message)? {
-            HelperRequest::Install { interface_name } => {
-                self.install(peer.uid, &interface_name)?;
+            HelperRequest::Install {
+                interface_name,
+                network,
+            } => {
+                self.install(peer.uid, &interface_name, network)?;
                 Ok(format!(
                     "installed firewall guard for uid {} on {interface_name}",
                     peer.uid
@@ -243,9 +246,9 @@ impl HelperDaemon {
             // non-default sandbox policy require a helper that understands
             // versioned specs, and an old helper answers this verb with an
             // error line — which is exactly the negative signal they need.
-            HelperRequest::Capabilities => {
-                Ok(format!("policy=1 spec_version={LAUNCH_SPEC_VERSION}"))
-            }
+            HelperRequest::Capabilities => Ok(format!(
+                "policy=1 install_policy=1 spec_version={LAUNCH_SPEC_VERSION}"
+            )),
         }
     }
 
@@ -253,21 +256,35 @@ impl HelperDaemon {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn install(&self, uid: u32, interface_name: &str) -> Result<()> {
+    fn install(
+        &self,
+        uid: u32,
+        interface_name: &str,
+        network: lianyaohu_core::policy::NetworkPolicy,
+    ) -> Result<()> {
         let selected = validated_vpn_interface(interface_name)?;
 
+        // The client-supplied policy (already re-validated by parse_request)
+        // is applied the same way run_session applies the launch spec's
+        // policy: dropping it here would silently install weaker rules than
+        // the client rendered and showed with --print-firewall.
         #[cfg(target_os = "macos")]
         {
-            self.acquire_session(PFRuleSet::new_user(
-                selected.name,
-                uid,
-                selected.ipv4_peer_addresses.first().cloned(),
-            ))
+            self.acquire_session(
+                PFRuleSet::new_user(
+                    selected.name,
+                    uid,
+                    selected.ipv4_peer_addresses.first().cloned(),
+                )
+                .with_network(network),
+            )
         }
 
         #[cfg(target_os = "linux")]
         {
-            self.acquire_session(LinuxFirewallRuleSet::new_user(selected.name, uid))
+            self.acquire_session(
+                LinuxFirewallRuleSet::new_user(selected.name, uid).with_network(network),
+            )
         }
     }
 

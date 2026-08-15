@@ -1,3 +1,4 @@
+use crate::policy::NetworkPolicy;
 use crate::{Result, err};
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -20,8 +21,8 @@ impl PFHelperClient {
         }
     }
 
-    pub fn install(&self, interface_name: &str) -> Result<()> {
-        let response = self.send(&format!("install {interface_name}\n"))?;
+    pub fn install(&self, interface_name: &str, network: &NetworkPolicy) -> Result<()> {
+        let response = self.send(&install_request(interface_name, network)?)?;
         if response.ok {
             Ok(())
         } else {
@@ -47,12 +48,24 @@ impl PFHelperClient {
     /// with an error line — that error IS the negative signal, so this returns
     /// `Ok(false)` for it and only propagates transport failures.
     pub fn supports_policy(&self) -> Result<bool> {
+        self.supports_capability("policy=1")
+    }
+
+    /// Probes whether the running helper applies a client-supplied network
+    /// policy to `install` requests. A helper that predates this token would
+    /// install the default (weaker) rules and report success, so callers with
+    /// a non-default policy must not send `install` without checking first.
+    pub fn supports_install_policy(&self) -> Result<bool> {
+        self.supports_capability("install_policy=1")
+    }
+
+    fn supports_capability(&self, token: &str) -> Result<bool> {
         let response = self.send("capabilities\n")?;
         Ok(response.ok
             && response
                 .message
                 .split_whitespace()
-                .any(|token| token == "policy=1"))
+                .any(|candidate| candidate == token))
     }
 
     pub fn run_session(&self, interface_name: &str, spec_path: &Path) -> Result<i32> {
@@ -149,6 +162,20 @@ pub fn parse_response(response: &str) -> Result<HelperResponse> {
     Err(err(format!("invalid helper response: {response:?}")))
 }
 
+/// Builds the wire form of an `install` request. The default policy keeps the
+/// legacy single-token form so old and new helpers behave identically; a
+/// non-default policy is appended as compact JSON (no whitespace — typed
+/// addresses, prefixes, and ports only), which a helper without
+/// `install_policy` support rejects rather than silently ignoring.
+pub fn install_request(interface_name: &str, network: &NetworkPolicy) -> Result<String> {
+    if *network == NetworkPolicy::default() {
+        return Ok(format!("install {interface_name}\n"));
+    }
+    let policy = serde_json::to_string(network)
+        .map_err(|error| err(format!("serialize network policy: {error}")))?;
+    Ok(format!("install {interface_name} {policy}\n"))
+}
+
 pub fn parse_request(line: &str) -> Result<HelperRequest> {
     let trimmed = line.trim();
     if trimmed == "uninstall" {
@@ -160,12 +187,29 @@ pub fn parse_request(line: &str) -> Result<HelperRequest> {
     if trimmed == "capabilities" {
         return Ok(HelperRequest::Capabilities);
     }
-    if let Some(interface_name) = trimmed.strip_prefix("install ") {
+    if let Some(rest) = trimmed.strip_prefix("install ") {
+        let (interface_name, policy_json) = match rest.split_once(' ') {
+            Some((interface_name, policy_json)) => (interface_name, Some(policy_json)),
+            None => (rest, None),
+        };
         if interface_name.is_empty() || interface_name.contains(char::is_whitespace) {
             return Err(err("invalid helper install interface"));
         }
+        let network = match policy_json {
+            None => NetworkPolicy::default(),
+            Some(json) => {
+                let network: NetworkPolicy = serde_json::from_str(json).map_err(|error| {
+                    err(format!("invalid helper install network policy: {error}"))
+                })?;
+                // Same grammar, list-cap, and LAN-containment checks as the
+                // run-path policy: the sender is untrusted.
+                network.validate()?;
+                network
+            }
+        };
         return Ok(HelperRequest::Install {
             interface_name: interface_name.to_string(),
+            network,
         });
     }
     if let Some(rest) = trimmed.strip_prefix("run ") {
@@ -191,6 +235,7 @@ pub fn parse_request(line: &str) -> Result<HelperRequest> {
 pub enum HelperRequest {
     Install {
         interface_name: String,
+        network: NetworkPolicy,
     },
     Run {
         interface_name: String,
@@ -352,7 +397,8 @@ mod tests {
         assert_eq!(
             parse_request("install utun5\n").unwrap(),
             HelperRequest::Install {
-                interface_name: "utun5".to_string()
+                interface_name: "utun5".to_string(),
+                network: NetworkPolicy::default(),
             }
         );
         assert_eq!(
@@ -368,8 +414,59 @@ mod tests {
             }
         );
         assert!(parse_request("install en0").is_ok());
-        assert!(parse_request("install utun 5").is_err());
         assert!(parse_request("run utun5 /tmp/has space.json").is_err());
+    }
+
+    // Regression test for silent policy widening: an `install` carrying a
+    // custom NetworkPolicy must arrive helper-side as exactly the policy the
+    // client rendered locally, so the helper-installed rules cannot be weaker
+    // than what `--print-firewall` showed.
+    #[test]
+    fn install_request_round_trips_a_custom_network_policy() {
+        use crate::policy::{DestRule, NetAction};
+
+        let network = NetworkPolicy {
+            default_action: NetAction::Deny,
+            allow: vec![DestRule::parse("140.82.112.0/20:443").unwrap()],
+            deny: vec![DestRule::parse("169.254.169.254").unwrap()],
+            lan_allow: vec![DestRule::parse("192.168.1.10:22").unwrap()],
+        };
+
+        let request = install_request("utun5", &network).unwrap();
+        assert_eq!(
+            parse_request(&request).unwrap(),
+            HelperRequest::Install {
+                interface_name: "utun5".to_string(),
+                network,
+            }
+        );
+
+        // The default policy keeps the legacy single-token wire form.
+        assert_eq!(
+            install_request("utun5", &NetworkPolicy::default()).unwrap(),
+            "install utun5\n"
+        );
+    }
+
+    #[test]
+    fn install_request_parsing_rejects_hostile_input() {
+        use crate::policy::{DestRule, NetAction};
+
+        // Interface names never contain whitespace; a second token must be a
+        // valid policy document, not a stray word.
+        assert!(parse_request("install utun 5").is_err());
+        assert!(parse_request("install utun5 not-json").is_err());
+        assert!(parse_request("install utun5 {\"unknown_field\":1}").is_err());
+        // Helper-side re-validation: an uncontained lan_allow entry would
+        // bypass the VPN-only guarantee, so it is refused at parse time.
+        let hostile = NetworkPolicy {
+            default_action: NetAction::Allow,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            lan_allow: vec![DestRule::parse("0.0.0.0/0").unwrap()],
+        };
+        let json = serde_json::to_string(&hostile).unwrap();
+        assert!(parse_request(&format!("install utun5 {json}")).is_err());
     }
 
     #[test]
