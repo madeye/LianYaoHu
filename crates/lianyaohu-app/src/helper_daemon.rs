@@ -31,7 +31,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use std::{mem, ptr, thread};
 
@@ -606,43 +606,73 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
-/// First uid the OS assigns to regular user accounts. Passwd entries below it
-/// (other than root) are service accounts whose pw_dir points at shared
-/// system directories (`/var/empty`, `/var/www`, `/bin`), not private homes.
-#[cfg(target_os = "macos")]
-const FIRST_REGULAR_UID: u32 = 500;
-#[cfg(not(target_os = "macos"))]
-const FIRST_REGULAR_UID: u32 = 1000;
+/// pw_dir values that are shared system stubs, not private homes: service
+/// accounts point at these (`/var/empty` on macOS, `/nonexistent`, `/bin`,
+/// and `/usr/sbin` on Debian-family systems). Treating them as home roots
+/// would make large system prefixes ungrantable, so they are skipped; every
+/// other passwd home counts regardless of uid — a uid-999 system user's real
+/// home deserves the same protection as anyone else's.
+const SYSTEM_STUB_HOMES: &[&str] = &[
+    "/",
+    "/bin",
+    "/dev",
+    "/dev/null",
+    "/nonexistent",
+    "/private/var/empty",
+    "/sbin",
+    "/usr/bin",
+    "/usr/games",
+    "/usr/sbin",
+    "/var/empty",
+];
 
 /// Directories that are — or contain — user home directories: the standard
-/// platform home roots, root's home, plus every regular user's passwd home
-/// (NFS `/export/home/...`, systemd-homed, and other nonstandard layouts).
+/// platform home roots, root's home, plus every user's passwd home (NFS
+/// `/export/home/...`, systemd-homed, and other nonstandard layouts).
 /// Each root is listed both as written and canonicalized, so a symlinked
 /// `/home` or macOS's `/var/root` -> `/private/var/root` cannot dodge the
 /// prefix check; the APFS firmlink alias of `/Users` is covered explicitly
 /// because canonicalization does not resolve firmlinks.
+///
+/// The static platform roots are computed once; the passwd walk stays
+/// per-request so accounts created while the helper runs are still covered.
+/// The tradeoff: each run/policy request re-enumerates passwd behind the
+/// process-wide PASSWD_LOCK, so on hosts whose passwd resolves through a
+/// slow directory service this serializes concurrent requests. Note getpwent
+/// cannot see directory-service accounts at all when enumeration is off
+/// (LDAP/AD/Open Directory), so such homes are only covered when they live
+/// under one of the static roots.
 fn home_directory_roots() -> Vec<String> {
-    let statics = [
-        "/Users",
-        "/home",
-        "/root",
-        "/var/root",
-        "/System/Volumes/Data/Users",
-    ];
-    let mut roots = Vec::new();
-    for root in statics
-        .iter()
-        .map(ToString::to_string)
-        .chain(passwd_home_directories())
-    {
-        if let Ok(canonical) = Path::new(&root).canonicalize()
-            && let Some(canonical) = canonical.to_str()
-        {
-            push_home_root(&mut roots, canonical.to_string());
-        }
-        push_home_root(&mut roots, root);
+    static STATIC_ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+    let mut roots = STATIC_ROOTS
+        .get_or_init(|| {
+            let statics = [
+                "/Users",
+                "/home",
+                "/root",
+                "/var/root",
+                "/System/Volumes/Data/Users",
+            ];
+            let mut roots = Vec::new();
+            for root in statics {
+                push_home_root_with_canonical(&mut roots, root.to_string());
+            }
+            roots
+        })
+        .clone();
+    for home in passwd_home_directories() {
+        push_home_root_with_canonical(&mut roots, home);
     }
     roots
+}
+
+fn push_home_root_with_canonical(roots: &mut Vec<String>, root: String) {
+    if let Ok(canonical) = Path::new(&root).canonicalize()
+        && let Some(canonical) = canonical.to_str()
+    {
+        push_home_root(roots, canonical.to_string());
+    }
+    push_home_root(roots, root);
 }
 
 fn push_home_root(roots: &mut Vec<String>, root: String) {
@@ -651,7 +681,11 @@ fn push_home_root(roots: &mut Vec<String>, root: String) {
     }
 }
 
-/// pw_dir of root and every regular user from the full passwd enumeration.
+fn is_system_stub_home(dir: &str) -> bool {
+    SYSTEM_STUB_HOMES.contains(&dir)
+}
+
+/// pw_dir of every passwd entry whose home is not a shared system stub.
 /// getpwent walks shared static state, so enumeration is serialized.
 fn passwd_home_directories() -> Vec<String> {
     static PASSWD_LOCK: Mutex<()> = Mutex::new(());
@@ -664,11 +698,12 @@ fn passwd_home_directories() -> Vec<String> {
             if entry.is_null() {
                 break;
             }
-            let uid = (*entry).pw_uid;
-            if (uid != 0 && uid < FIRST_REGULAR_UID) || (*entry).pw_dir.is_null() {
+            if (*entry).pw_dir.is_null() {
                 continue;
             }
-            if let Ok(dir) = CStr::from_ptr((*entry).pw_dir).to_str() {
+            if let Ok(dir) = CStr::from_ptr((*entry).pw_dir).to_str()
+                && !is_system_stub_home(dir)
+            {
                 homes.push(dir.to_string());
             }
         }
@@ -677,12 +712,22 @@ fn passwd_home_directories() -> Vec<String> {
     homes
 }
 
-/// True when `canonical` reaches into a home-directory tree that is not the
-/// caller's own.
+/// True when `canonical` reaches into — or wholly contains — a home-directory
+/// tree that is not the caller's own. Both directions matter: a grant at or
+/// below a foreign home reads part of it, and a grant ABOVE a home root
+/// (`/export/home`, macOS `/System/Volumes/Data`) reads every home below it
+/// just the same, because read-only extras render as recursive subpath
+/// allows with no counter-deny.
 fn inside_foreign_home(canonical: &str, caller_home: &str, home_roots: &[String]) -> bool {
-    home_roots
-        .iter()
-        .any(|root| path_has_prefix(canonical, root) && !path_has_prefix(canonical, caller_home))
+    home_roots.iter().any(|root| {
+        // A root at or below the caller's own home is the caller's, never
+        // foreign — the caller's home itself must stay grantable.
+        if path_has_prefix(root, caller_home) {
+            return false;
+        }
+        (path_has_prefix(canonical, root) && !path_has_prefix(canonical, caller_home))
+            || path_has_prefix(root, canonical)
+    })
 }
 
 /// Re-validates a client-supplied sandbox policy. The network policy and path
@@ -1977,11 +2022,22 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(roots.contains(&"/private/var/root".to_string()));
 
-        // Regular users' passwd homes are enumerated, wherever they live.
+        // Passwd homes are enumerated with no uid floor, wherever they live.
         let uid = unsafe { libc::getuid() };
-        if uid == 0 || uid >= FIRST_REGULAR_UID {
-            let home = home_directory_for_uid(uid).unwrap();
+        let home = home_directory_for_uid(uid).unwrap();
+        if !is_system_stub_home(&home) {
             assert!(roots.contains(&home), "{home} missing from {roots:?}");
+        }
+
+        // Service-account stubs never become home roots: treating /var/empty
+        // as a home would make most of /var ungrantable on macOS.
+        for stub in [
+            "/var/empty",
+            "/private/var/empty",
+            "/nonexistent",
+            "/usr/sbin",
+        ] {
+            assert!(!roots.contains(&stub.to_string()), "{stub}");
         }
     }
 
@@ -1991,6 +2047,7 @@ mod tests {
         let roots = vec![
             "/Users".to_string(),
             "/home".to_string(),
+            "/System/Volumes/Data/Users".to_string(),
             "/export/home/alice".to_string(),
             "/export/home/bob".to_string(),
         ];
@@ -2016,6 +2073,45 @@ mod tests {
         assert!(!inside_foreign_home("/opt/data", caller_home, &roots));
         // A caller homed under a standard root keeps access to their subtree.
         assert!(!inside_foreign_home("/home/bob/x", "/home/bob", &roots));
+    }
+
+    // A grant CONTAINING a foreign home grants that home's contents just the
+    // same as a grant below it — the read-only rules are recursive with no
+    // counter-deny — so parents of home roots are foreign too.
+    #[test]
+    fn foreign_home_check_rejects_parents_of_home_roots() {
+        let roots = vec![
+            "/Users".to_string(),
+            "/home".to_string(),
+            "/System/Volumes/Data/Users".to_string(),
+            "/export/home/alice".to_string(),
+            "/export/home/bob".to_string(),
+        ];
+        let caller_home = "/export/home/bob";
+
+        // The issue's NFS example: rejecting /export/home/alice but allowing
+        // /export/home would grant alice's home anyway.
+        assert!(inside_foreign_home("/export/home", caller_home, &roots));
+        assert!(inside_foreign_home("/export", caller_home, &roots));
+        // macOS: the firmlinked data volume contains /Users.
+        assert!(inside_foreign_home(
+            "/System/Volumes/Data",
+            caller_home,
+            &roots
+        ));
+        assert!(inside_foreign_home("/Users", caller_home, &roots));
+        assert!(inside_foreign_home("/home", caller_home, &roots));
+
+        // The caller's own home and unrelated directories stay grantable,
+        // even when the caller's home is itself an enumerated root.
+        assert!(!inside_foreign_home(
+            "/export/home/bob",
+            caller_home,
+            &roots
+        ));
+        assert!(!inside_foreign_home("/opt/data", caller_home, &roots));
+        assert!(!inside_foreign_home("/Users/bob", "/Users/bob", &roots));
+        assert!(!inside_foreign_home("/Users/bob/src", "/Users/bob", &roots));
     }
 
     #[test]

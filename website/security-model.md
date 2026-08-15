@@ -67,11 +67,19 @@ The configuration layer can add to — or narrow — the default grants:
   re-validates them like the launch roots: canonicalized against the real
   filesystem, never `/`, and writable extras must be **owned by the caller**
   and outside a protected-prefix denylist (`/etc`, `/usr`, `/System`,
-  `/Library`, `/var/db`, …). Read-only extras may not reach into another
-  user's home: the helper checks the standard home roots (`/Users`, `/home`,
-  `/root`, `/var/root`) resolved through symlinks, plus every regular user's
-  home directory from the passwd database, so nonstandard layouts (NFS
-  exports, systemd-homed) are covered too.
+  `/Library`, `/var/db`, …). Read-only extras may not reach into — or
+  contain — another user's home: the helper checks the standard home roots
+  (`/Users`, `/home`, `/root`, `/var/root`, and the APFS
+  `/System/Volumes/Data/Users` alias) resolved through symlinks, plus every
+  user's home directory from the local passwd database (service-account
+  stubs like `/var/empty` excepted), and rejects a grant at, below, **or
+  above** any of them — so `/export/home` is refused just like
+  `/export/home/alice`. Nonstandard layouts with local passwd entries (NFS
+  exports, systemd-homed) are covered the same way. One caveat: accounts
+  served by a directory service with enumeration disabled (LDAP, Active
+  Directory, Open Directory) are invisible to the passwd walk, so their
+  homes are only auto-protected when they live under one of the standard
+  roots above.
 - **Denied paths** (`paths.deny`, e.g. `~/.ssh`) are rendered as the *final*
   seatbelt rules, so they override every allow — the entries become
   unreadable and unwritable even inside the writable `$HOME`. **Linux cannot
