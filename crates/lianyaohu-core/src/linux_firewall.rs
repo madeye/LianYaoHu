@@ -488,6 +488,40 @@ mod tests {
     }
 
     #[test]
+    fn loopback_return_is_the_first_appended_rule() {
+        // Position, not containment: the documented stub-resolver DNS
+        // exemption (website/security-model.md, "DNS resolution") depends on
+        // the `-o lo -j RETURN` rule preceding every LAN REJECT in the
+        // first-match-wins chain, so assert its exact slot right after the
+        // chain create/flush for both families and both scopes.
+        let args =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
+        let rule_sets = [
+            LinuxFirewallRuleSet::new_group("tun0", 1000, 2_000_000),
+            LinuxFirewallRuleSet::new_user("tun0", 1000),
+        ];
+        for rule_set in rule_sets {
+            let chain = rule_set.chain_name();
+            for family in [IpFamily::V4, IpFamily::V6] {
+                let commands = rule_set.setup_commands(family);
+                assert_eq!(commands[0], args(&["-w", "-N", &chain]));
+                assert_eq!(commands[1], args(&["-w", "-F", &chain]));
+                assert_eq!(
+                    commands[2],
+                    args(&["-w", "-A", &chain, "-o", "lo", "-j", "RETURN"])
+                );
+                // The loopback RETURN is the first `-A` overall, so no
+                // earlier rule can shadow it.
+                let first_append = commands
+                    .iter()
+                    .position(|command| command.get(1).map(String::as_str) == Some("-A"))
+                    .expect("setup commands must append rules");
+                assert_eq!(first_append, 2);
+            }
+        }
+    }
+
+    #[test]
     fn stale_chain_listing_parses_jumps_and_chains() {
         let listing = "\
 -P OUTPUT ACCEPT

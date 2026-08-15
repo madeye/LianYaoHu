@@ -308,7 +308,10 @@ stub — `127.0.0.53` (systemd-resolved) or `127.0.0.1` (dnsmasq/unbound) — so
 the agent's queries leave via loopback and never reach the VPN/LAN rules. The
 stub daemon's own upstream queries are then sent by *its* UID, which the
 `-m owner` match does not cover; they follow the system routing table, exactly
-like mDNSResponder on macOS.
+like mDNSResponder on macOS. The exemption is not DNS-specific: it covers
+**all** loopback egress, so any host-local daemon the agent can reach — an
+existing HTTP/SOCKS proxy, an `ssh -D` tunnel — can relay the agent's traffic
+outward under its own UID, outside the owner-scoped rules.
 
 In the default configuration this is not a leak through the routing table —
 the launcher refuses to start unless the selected VPN is already the default
