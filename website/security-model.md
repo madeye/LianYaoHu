@@ -410,15 +410,33 @@ corrupted download fails), not authenticity: a tampered release ships a
 matching checksum.
 
 Authenticity comes from Sigstore: the release workflow signs each tarball
-with `cosign sign-blob` (keyless, bound to the workflow's OIDC identity) and
-publishes the resulting bundle next to the tarball. When `cosign` is
-installed, the installer verifies the bundle against the repository's release
-workflow identity and refuses a tarball whose signature does not check out;
-set `LIANYAOHU_REQUIRE_SIGNATURE=1` to make a missing `cosign` or an unsigned
-release a hard failure instead of a note. Without `cosign` (or for releases
-predating signing), trust rests on GitHub's account and release
-infrastructure alone.
+with `cosign sign-blob` (keyless, bound to the workflow's OIDC identity on a
+release tag) and publishes the resulting bundle next to the tarball. When
+`cosign` is installed, verification is **mandatory**: the installer refuses a
+release whose bundle is missing, unfetchable, or fails to verify against this
+repository's release workflow running from a tag ref — a missing bundle does
+not silently downgrade to a checksum-only install, because an attacker who
+can tamper with a release asset can also delete the bundle.
+`LIANYAOHU_SKIP_SIGNATURE=1` is the explicit opt-out. Without `cosign` the
+check cannot run at all: the installer proceeds with a loud warning, and
+trust rests on GitHub's account and release infrastructure alone. Install
+`cosign` before running the installer, or set
+`LIANYAOHU_REQUIRE_SIGNATURE=1` to make a missing `cosign` a hard failure.
 
-The uninstaller fetches the helper-teardown script from the repository pinned
-to a release tag. Review the scripts before piping them to `bash` if this
-trust model is not acceptable for your environment.
+Known limits of this model:
+
+- **First-install trust.** The `install.sh` bootstrap itself is fetched over
+  TLS from the website and is not signature-verified; the first
+  `curl | bash` trusts the TLS connection and the hosting infrastructure.
+  Review the script before piping it if that is not acceptable.
+- **Checksum-only installs.** On machines without `cosign` (and for releases
+  predating signing), nothing authenticates the tarball beyond GitHub's
+  release infrastructure — the SHA-256 checksum ships next to the tarball
+  and proves integrity only.
+
+The uninstaller prefers the helper-teardown script that the installed
+package shipped (`/usr/local/libexec/lianyaohu-uninstall-helper.sh`), which
+involves no network fetch. When it must fetch the script, it pins the fetch
+to a resolved release tag and aborts if no tag resolves — it never falls back
+to a moving branch tip. Review the scripts before piping them to `bash` if
+this trust model is not acceptable for your environment.

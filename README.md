@@ -19,10 +19,11 @@ curl -fsSL https://lyh.maxlv.net/install.sh | bash
 ```
 
 The checksum guards integrity only. If `cosign` is installed, the installer
-also verifies the release's Sigstore signature against this repository's
-release-workflow identity (set `LIANYAOHU_REQUIRE_SIGNATURE=1` to make that
-mandatory); otherwise trust rests on GitHub's release infrastructure. See
-[the security model](https://lyh.maxlv.net/security-model) for the full
+requires the release's Sigstore signature to verify against this repository's
+release-workflow identity and refuses the install otherwise; without `cosign`
+it warns and trust rests on GitHub's release infrastructure (set
+`LIANYAOHU_REQUIRE_SIGNATURE=1` to make a missing `cosign` a hard failure).
+See [the security model](https://lyh.maxlv.net/security-model) for the full
 supply-chain trust model.
 
 Prebuilt releases cover Apple Silicon macOS (`aarch64-apple-darwin`) and

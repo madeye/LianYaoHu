@@ -3,10 +3,11 @@
 #
 #   curl -fsSL https://lyh.maxlv.net/install.sh | bash
 #
-# Downloads the latest release for this platform, verifies its SHA-256 (and
-# its Sigstore signature, when `cosign` is installed), installs the
-# `lianyaohu` and `lyh` binaries into a PATH directory, and installs the
-# root firewall helper (LaunchDaemon on macOS, systemd service on Linux).
+# Downloads the latest release for this platform, verifies its SHA-256 and —
+# whenever `cosign` is installed — requires its Sigstore signature to verify,
+# installs the `lianyaohu` and `lyh` binaries into a PATH directory, and
+# installs the root firewall helper (LaunchDaemon on macOS, systemd service on
+# Linux).
 #
 # Options (pass after `bash -s --` when piping, e.g.
 #   curl -fsSL .../install.sh | bash -s -- --no-helper):
@@ -16,8 +17,10 @@
 #
 # Environment overrides: LIANYAOHU_VERSION, LIANYAOHU_BIN_DIR,
 # LIANYAOHU_NO_HELPER=1, LIANYAOHU_REPO (default madeye/LianYaoHu),
-# LIANYAOHU_REQUIRE_SIGNATURE=1 (fail unless the Sigstore signature verifies;
-# requires `cosign` and a signed release).
+# LIANYAOHU_REQUIRE_SIGNATURE=1 (fail when `cosign` is not installed instead
+# of proceeding with a checksum-only install),
+# LIANYAOHU_SKIP_SIGNATURE=1 (explicitly skip signature verification even
+# when `cosign` is installed).
 set -euo pipefail
 
 REPO="${LIANYAOHU_REPO:-madeye/LianYaoHu}"
@@ -31,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     --version) VERSION="${2:?--version requires a tag}"; shift 2 ;;
     --bin-dir) BIN_DIR="${2:?--bin-dir requires a path}"; shift 2 ;;
     --no-helper) INSTALL_HELPER=0; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 64 ;;
   esac
 done
@@ -89,30 +92,39 @@ echo "install: verifying checksum"
 ) >/dev/null || die "checksum verification failed"
 
 # Signature check: the checksum above ships next to the tarball, so it proves
-# integrity only — a tampered release carries a matching checksum. The
-# Sigstore bundle proves the tarball was built by this repository's release
-# workflow. Verification needs cosign, which most machines lack, so it is
-# best-effort by default; LIANYAOHU_REQUIRE_SIGNATURE=1 makes it mandatory.
-REQUIRE_SIGNATURE="${LIANYAOHU_REQUIRE_SIGNATURE:-0}"
-if have cosign; then
-  if curl -fsSL "${base_url}/${package}.tar.gz.sigstore.json" \
-      -o "${workdir}/${package}.tar.gz.sigstore.json"; then
-    echo "install: verifying Sigstore signature"
-    cosign verify-blob \
-      --bundle "${workdir}/${package}.tar.gz.sigstore.json" \
-      --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/release\.yml@" \
-      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-      "${workdir}/${package}.tar.gz" >/dev/null 2>&1 \
-      || die "Sigstore signature verification failed"
-  elif [[ "$REQUIRE_SIGNATURE" == "1" ]]; then
-    die "no Sigstore bundle published for ${VERSION} and LIANYAOHU_REQUIRE_SIGNATURE=1"
-  else
-    echo "install: note: no Sigstore bundle published for ${VERSION}; skipping signature check"
-  fi
-elif [[ "$REQUIRE_SIGNATURE" == "1" ]]; then
+# integrity only — a tampered release carries a matching checksum. The cosign
+# bundle proves the tarball was built by this repository's release workflow
+# running from a release tag. When cosign is installed, verification is
+# mandatory: a missing or unfetchable bundle, or a failed verification, aborts
+# the install (an attacker who can tamper with a release asset can also delete
+# the bundle, so a missing bundle must not downgrade to a checksum-only
+# install). LIANYAOHU_SKIP_SIGNATURE=1 is the explicit opt-out. Without
+# cosign the check cannot run at all; LIANYAOHU_REQUIRE_SIGNATURE=1 turns
+# that into a hard failure instead of a warning.
+if [[ "${LIANYAOHU_SKIP_SIGNATURE:-0}" == "1" ]]; then
+  echo "install: WARNING: LIANYAOHU_SKIP_SIGNATURE=1 — skipping signature verification" >&2
+elif have cosign; then
+  bundle="${package}.tar.gz.cosign.bundle"
+  curl -fsSL "${base_url}/${bundle}" -o "${workdir}/${bundle}" \
+    || die "could not download the signature bundle ${base_url}/${bundle}
+cosign is installed, so a verified signature is required; refusing to install
+an unsigned or tampered release. Set LIANYAOHU_SKIP_SIGNATURE=1 to skip
+signature verification explicitly."
+  echo "install: verifying Sigstore signature"
+  # The identity regexp is anchored through '@refs/tags/': only this
+  # repository's release workflow, running from a tag ref, verifies.
+  cosign verify-blob \
+    --bundle "${workdir}/${bundle}" \
+    --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "${workdir}/${package}.tar.gz" >/dev/null \
+    || die "Sigstore signature verification failed for ${package}.tar.gz"
+elif [[ "${LIANYAOHU_REQUIRE_SIGNATURE:-0}" == "1" ]]; then
   die "LIANYAOHU_REQUIRE_SIGNATURE=1 but cosign is not installed"
 else
-  echo "install: note: cosign not installed; skipping signature verification (checksum is integrity-only)"
+  echo "install: WARNING: cosign is not installed, so the release signature cannot be verified." >&2
+  echo "install: WARNING: the SHA-256 checksum proves integrity only, not authenticity." >&2
+  echo "install: WARNING: install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) to verify releases." >&2
 fi
 
 tar -C "$workdir" -xzf "${workdir}/${package}.tar.gz"
