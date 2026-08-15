@@ -703,7 +703,13 @@ fn run_session_daemon(
             let profile_path = prepared.tmpdir.join("agent.sb");
             fs::write(&profile_path, prepared.profile.render())?;
             let mut command = Command::new("/usr/bin/sandbox-exec");
-            command.arg("-f").arg(&profile_path).args(&prepared.command);
+            // `--` keeps an option-shaped agent command out of sandbox-exec's
+            // option parser, matching the helper launch path.
+            command
+                .arg("-f")
+                .arg(&profile_path)
+                .arg("--")
+                .args(&prepared.command);
             command
         };
         #[cfg(target_os = "linux")]
@@ -1418,6 +1424,9 @@ fn launch_agent(
     let status = Command::new("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(&profile_path)
+        // `--` keeps an option-shaped agent command out of sandbox-exec's
+        // option parser, matching the helper launch path.
+        .arg("--")
         .args(command)
         .current_dir(cwd)
         .env_clear()

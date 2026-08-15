@@ -967,24 +967,15 @@ fn run_launch_spec(
         .collect::<Vec<_>>()
         .join(",");
 
-    let mut command = Command::new("/bin/launchctl");
+    let mut command = sandbox_exec_command(
+        &helper_exe,
+        uid,
+        session_gid,
+        &groups_csv,
+        &profile_arg,
+        &launch.command,
+    );
     command
-        .arg("asuser")
-        .arg(uid.to_string())
-        .arg(&helper_exe)
-        .arg("drop-exec")
-        .arg(uid.to_string())
-        .arg(session_gid.to_string())
-        .arg(&groups_csv)
-        .arg("--")
-        .arg("/usr/bin/sandbox-exec")
-        .arg("-f")
-        .arg(profile_arg)
-        // Terminate sandbox-exec's own option parsing: without this a spec
-        // command starting with `-p`/`-f` would be consumed as a sandbox-exec
-        // option and could replace the helper-built profile.
-        .arg("--")
-        .args(&launch.command)
         .current_dir(&launch.cwd)
         .env_clear()
         .envs(&launch.environment)
@@ -999,6 +990,42 @@ fn run_launch_spec(
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(1))
+}
+
+/// Builds the `launchctl asuser <uid> <helper> drop-exec ... --
+/// /usr/bin/sandbox-exec -f <profile> -- <client command...>` argv. Factored
+/// out of [`run_launch_spec`] so a unit test can pin the `--` separator
+/// between the helper-built profile arguments and the client command: without
+/// it a spec command starting with `-p`/`-f` would reach sandbox-exec's
+/// option parser and could replace the helper-built profile.
+#[cfg(any(target_os = "macos", test))]
+fn sandbox_exec_command(
+    helper_exe: &Path,
+    uid: u32,
+    session_gid: u32,
+    groups_csv: &str,
+    profile_arg: &str,
+    client_command: &[String],
+) -> Command {
+    let mut command = Command::new("/bin/launchctl");
+    command
+        .arg("asuser")
+        .arg(uid.to_string())
+        .arg(helper_exe)
+        .arg("drop-exec")
+        .arg(uid.to_string())
+        .arg(session_gid.to_string())
+        .arg(groups_csv)
+        .arg("--")
+        .arg("/usr/bin/sandbox-exec")
+        .arg("-f")
+        .arg(profile_arg)
+        // Terminate sandbox-exec's own option parsing: without this a spec
+        // command starting with `-p`/`-f` would be consumed as a sandbox-exec
+        // option and could replace the helper-built profile.
+        .arg("--")
+        .args(client_command);
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -1901,6 +1928,39 @@ mod tests {
         assert!(!injected.status.success());
 
         let _ = fs::remove_dir_all(&tmpdir);
+    }
+
+    // The built argv itself must carry the separator: the runtime test above
+    // self-skips in CI and exercises sandbox-exec directly, so this pins that
+    // run_launch_spec's Command keeps `--` between the helper-built `-f
+    // <profile>` and the client command — a refactor dropping it would fail
+    // here, not only against a live sandbox-exec.
+    #[test]
+    fn sandbox_exec_argv_terminates_option_parsing_before_client_command() {
+        let command = sandbox_exec_command(
+            Path::new("/usr/local/bin/lianyaohu"),
+            501,
+            2_000_000,
+            "20,12",
+            "/var/run/lianyaohu/profile-501.sb",
+            &["-p".to_string(), "(allow default)".to_string()],
+        );
+
+        assert_eq!(command.get_program(), "/bin/launchctl");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let expected_tail = [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/var/run/lianyaohu/profile-501.sb",
+            "--",
+            "-p",
+            "(allow default)",
+        ]
+        .map(ToString::to_string);
+        assert!(args.ends_with(&expected_tail), "{args:?}");
     }
 
     #[test]
