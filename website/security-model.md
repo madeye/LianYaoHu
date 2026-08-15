@@ -435,16 +435,17 @@ or sign unless it is running from a `refs/tags/*` ref (a manual
 `workflow_dispatch` must be dispatched from the tag itself, and its tag
 input must match that ref), so every published bundle is signed as
 `release.yml@refs/tags/<tag>` — the exact identity the installer pins. When
-`cosign` is installed, verification is **mandatory**: the installer refuses a
-release whose bundle is missing, unfetchable, or fails to verify against this
-repository's release workflow running from a tag ref — a missing bundle does
-not silently downgrade to a checksum-only install, because an attacker who
-can tamper with a release asset can also delete the bundle.
-`LIANYAOHU_SKIP_SIGNATURE=1` is the explicit opt-out. Without `cosign` the
-check cannot run at all: the installer proceeds with a loud warning, and
-trust rests on GitHub's account and release infrastructure alone. Install
-`cosign` before running the installer, or set
-`LIANYAOHU_REQUIRE_SIGNATURE=1` to make a missing `cosign` a hard failure.
+`cosign` is installed and the release carries a bundle, verification is
+**mandatory**: a bundle that is present but fails to verify against this
+repository's tag-bound release identity aborts the install, so tampering with
+a *signed* release is caught and cannot be downgraded to a checksum-only
+install. A release that ships **no** bundle (releases predating signing) is
+not refused by default — the installer proceeds with a loud, explicit warning
+that the tarball's authenticity is unverified, rather than failing every
+install until a signed release becomes `latest`. Set
+`LIANYAOHU_REQUIRE_SIGNATURE=1` to refuse anything unverified — a missing
+bundle, or a missing `cosign`, then becomes a hard failure.
+`LIANYAOHU_SKIP_SIGNATURE=1` is the explicit opt-out of the whole check.
 
 Known limits of this model:
 
