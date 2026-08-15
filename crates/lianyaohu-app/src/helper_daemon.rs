@@ -1,5 +1,7 @@
 use lianyaohu_core::env_policy;
-use lianyaohu_core::helper::{HelperRequest, SOCKET_PATH, parse_request, receive_message_with_fds};
+use lianyaohu_core::helper::{
+    HelperRequest, MAX_REQUEST_BYTES, SOCKET_PATH, parse_request, receive_message_with_fds,
+};
 #[cfg(target_os = "macos")]
 use lianyaohu_core::interfaces::{utun_interfaces, validate_utun};
 #[cfg(target_os = "linux")]
@@ -34,10 +36,6 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use std::{mem, ptr, thread};
-
-/// A request is a single short line; refuse anything larger so a client
-/// cannot exhaust memory by streaming bytes without a newline.
-const MAX_REQUEST_BYTES: usize = 4096;
 
 /// Cap how long a single peer may take to send its request / receive its
 /// reply, so one stalled client cannot pin a worker forever.
@@ -263,29 +261,7 @@ impl HelperDaemon {
         network: lianyaohu_core::policy::NetworkPolicy,
     ) -> Result<()> {
         let selected = validated_vpn_interface(interface_name)?;
-
-        // The client-supplied policy (already re-validated by parse_request)
-        // is applied the same way run_session applies the launch spec's
-        // policy: dropping it here would silently install weaker rules than
-        // the client rendered and showed with --print-firewall.
-        #[cfg(target_os = "macos")]
-        {
-            self.acquire_session(
-                PFRuleSet::new_user(
-                    selected.name,
-                    uid,
-                    selected.ipv4_peer_addresses.first().cloned(),
-                )
-                .with_network(network),
-            )
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            self.acquire_session(
-                LinuxFirewallRuleSet::new_user(selected.name, uid).with_network(network),
-            )
-        }
+        self.acquire_session(install_rule_set(uid, &selected, network))
     }
 
     /// Install firewall rules for this rule set, or join the session that
@@ -1212,6 +1188,37 @@ fn supplementary_groups_for_uid(uid: u32, primary_gid: u32) -> Result<Vec<u32>> 
     Ok(groups)
 }
 
+/// Builds the exact rule set an `install` request stores and enforces. The
+/// client-supplied policy (already re-validated by `parse_request`) is applied
+/// the same way `run_session` applies the launch spec's policy: dropping the
+/// `.with_network(network)` here would silently install weaker rules than the
+/// client rendered and showed with `--print-firewall` — pinned by
+/// `install_stores_the_client_network_policy_in_the_rule_set`.
+#[cfg(target_os = "macos")]
+fn install_rule_set(
+    uid: u32,
+    selected: &lianyaohu_core::interfaces::NetworkInterface,
+    network: lianyaohu_core::policy::NetworkPolicy,
+) -> PFRuleSet {
+    PFRuleSet::new_user(
+        selected.name.clone(),
+        uid,
+        selected.ipv4_peer_addresses.first().cloned(),
+    )
+    .with_network(network)
+}
+
+/// See the macOS variant above: this is the stored rule set for `install`,
+/// and the client policy must survive into it.
+#[cfg(target_os = "linux")]
+fn install_rule_set(
+    uid: u32,
+    selected: &lianyaohu_core::interfaces::NetworkInterface,
+    network: lianyaohu_core::policy::NetworkPolicy,
+) -> LinuxFirewallRuleSet {
+    LinuxFirewallRuleSet::new_user(selected.name.clone(), uid).with_network(network)
+}
+
 #[cfg(target_os = "macos")]
 fn validated_vpn_interface(
     interface_name: &str,
@@ -1615,6 +1622,50 @@ mod tests {
         // Everything else keeps the strict platform validation.
         assert!(validated_vpn_interface("en0").is_err());
         assert!(validated_vpn_interface("nonexistent").is_err());
+    }
+
+    // Regression test for the silent policy drop at the daemon install site:
+    // `HelperDaemon::install` stores exactly `install_rule_set(...)`'s
+    // output, so a custom default-deny / lan_allow policy must survive into
+    // the stored rule set and its rendered rules. This fails if the
+    // `.with_network(network)` in install_rule_set is dropped — the stored
+    // set would fall back to the default policy and none of the substrings
+    // below would render.
+    #[test]
+    fn install_stores_the_client_network_policy_in_the_rule_set() {
+        use lianyaohu_core::interfaces::NetworkInterface;
+        use lianyaohu_core::policy::{DestRule, NetAction, NetworkPolicy};
+
+        let network = NetworkPolicy {
+            default_action: NetAction::Deny,
+            allow: vec![DestRule::parse("140.82.112.0/20:443").unwrap()],
+            deny: vec![DestRule::parse("169.254.169.254").unwrap()],
+            lan_allow: vec![DestRule::parse("192.168.1.10:22").unwrap()],
+        };
+        let selected = NetworkInterface {
+            name: "utun5".to_string(),
+            flags: 0,
+            ipv4_addresses: vec!["10.7.0.2".to_string()],
+            ipv4_peer_addresses: vec!["10.7.0.1".to_string()],
+            ipv6_addresses: Vec::new(),
+        };
+
+        let rule_set = install_rule_set(501, &selected, network.clone());
+
+        // The full policy is stored, not a default that ignores the client's
+        // deny/lan_allow lists.
+        assert_eq!(rule_set.network, network);
+        // `install` sessions must stay user-scoped: `uninstall` may release
+        // only user-scoped state.
+        assert!(rule_set.is_user_scoped());
+        // And the policy's rules actually reach the rendered firewall text.
+        let rendered = rule_set.render();
+        for needle in ["140.82.112.0/20", "169.254.169.254", "192.168.1.10"] {
+            assert!(
+                rendered.contains(needle),
+                "stored rule set does not render policy rule {needle}:\n{rendered}"
+            );
+        }
     }
 
     #[test]

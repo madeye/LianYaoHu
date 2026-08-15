@@ -10,6 +10,14 @@ use std::{io, mem, ptr};
 pub const SOCKET_PATH: &str = "/var/run/lianyaohu-helper.sock";
 pub const DAEMON_LABEL: &str = "io.github.madeye.lianyaohu.helper";
 
+/// Upper bound on one helper request. Sized so that a maximal legal
+/// `NetworkPolicy` (`MAX_RULES_PER_LIST` entries in all three lists, long
+/// uncompressed IPv6 forms with port ranges) fits with ample headroom — the
+/// previous 4 KiB cap silently truncated such requests at `recvmsg` and they
+/// died as parse errors. [`receive_message_with_fds`] reports anything larger
+/// as a distinct "too large" error instead of parsing a truncated request.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 pub struct PFHelperClient {
     socket_path: String,
 }
@@ -312,66 +320,102 @@ pub fn send_message_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -
     Ok(())
 }
 
+/// Reads one newline-terminated helper request plus any SCM_RIGHTS payload.
+///
+/// A single `recvmsg` on a stream socket may return only part of the request
+/// (a short read), and a fixed buffer silently cuts an over-long one — either
+/// way a truncated prefix would then be parsed as a *different* request and
+/// rejected with a misleading error. This loops until the terminating newline
+/// (or EOF) arrives, reassembling segmented delivery, and reports a request
+/// that exceeds `max_bytes` before its newline with a distinct "too large"
+/// error instead of parsing the truncated prefix.
 pub fn receive_message_with_fds(
     stream: &UnixStream,
     max_bytes: usize,
     max_fds: usize,
 ) -> io::Result<ReceivedMessage> {
-    let mut bytes = vec![0u8; max_bytes];
+    // One spare byte past the cap: filling it proves the request is over the
+    // limit (would have been truncated), which is reported explicitly below.
+    let mut bytes = vec![0u8; max_bytes + 1];
+    let mut total = 0usize;
     let fd_bytes = max_fds * mem::size_of::<RawFd>();
-    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as _) as usize }];
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_mut_ptr() as *mut libc::c_void,
-        iov_len: bytes.len(),
-    };
-    let mut msg = unsafe { mem::zeroed::<libc::msghdr>() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = control.len() as _;
-
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    bytes.truncate(received as usize);
-
-    // recvmsg has already installed any passed descriptors into this process'
-    // fd table, so every one of them must be wrapped in OwnedFd BEFORE any
-    // validation can bail out; an early return that skips the harvest leaks
-    // the fds for the lifetime of the daemon.
-    //
-    // On a truncated control message the kernel can report the sender's
-    // cmsg_len while delivering fewer bytes, so the fd count is clamped to the
-    // control data actually received (msg_controllen); trusting cmsg_len alone
-    // reads past the buffer and harvests garbage descriptor numbers.
     let mut fds = Vec::new();
     let mut malformed_control = false;
-    unsafe {
-        let control_start = control.as_ptr() as usize;
-        let control_end = control_start + (msg.msg_controllen as usize).min(control.len());
-        let mut header = libc::CMSG_FIRSTHDR(&msg);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                if (*header).cmsg_len < libc::CMSG_LEN(0) as _ {
-                    malformed_control = true;
-                } else {
-                    let data_start = libc::CMSG_DATA(header) as usize;
-                    let claimed_end = (header as usize).saturating_add((*header).cmsg_len as usize);
-                    let data_end = claimed_end.min(control_end);
-                    let count = data_end.saturating_sub(data_start) / mem::size_of::<RawFd>();
-                    let data = libc::CMSG_DATA(header).cast::<RawFd>();
-                    for index in 0..count {
-                        fds.push(OwnedFd::from_raw_fd(*data.add(index)));
+    let mut control_truncated = false;
+
+    loop {
+        let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as _) as usize }];
+        let mut iov = libc::iovec {
+            iov_base: bytes[total..].as_mut_ptr() as *mut libc::c_void,
+            iov_len: bytes.len() - total,
+        };
+        let mut msg = unsafe { mem::zeroed::<libc::msghdr>() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len() as _;
+
+        let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        if received < 0 {
+            // Dropping `fds` closes descriptors harvested from earlier
+            // segments.
+            return Err(io::Error::last_os_error());
+        }
+
+        // recvmsg has already installed any passed descriptors into this
+        // process' fd table, so every one of them must be wrapped in OwnedFd
+        // BEFORE any validation can bail out; an early return that skips the
+        // harvest leaks the fds for the lifetime of the daemon.
+        //
+        // On a truncated control message the kernel can report the sender's
+        // cmsg_len while delivering fewer bytes, so the fd count is clamped to
+        // the control data actually received (msg_controllen); trusting
+        // cmsg_len alone reads past the buffer and harvests garbage
+        // descriptor numbers.
+        unsafe {
+            let control_start = control.as_ptr() as usize;
+            let control_end = control_start + (msg.msg_controllen as usize).min(control.len());
+            let mut header = libc::CMSG_FIRSTHDR(&msg);
+            while !header.is_null() {
+                if (*header).cmsg_level == libc::SOL_SOCKET
+                    && (*header).cmsg_type == libc::SCM_RIGHTS
+                {
+                    if (*header).cmsg_len < libc::CMSG_LEN(0) as _ {
+                        malformed_control = true;
+                    } else {
+                        let data_start = libc::CMSG_DATA(header) as usize;
+                        let claimed_end =
+                            (header as usize).saturating_add((*header).cmsg_len as usize);
+                        let data_end = claimed_end.min(control_end);
+                        let count = data_end.saturating_sub(data_start) / mem::size_of::<RawFd>();
+                        let data = libc::CMSG_DATA(header).cast::<RawFd>();
+                        for index in 0..count {
+                            fds.push(OwnedFd::from_raw_fd(*data.add(index)));
+                        }
                     }
                 }
+                header = libc::CMSG_NXTHDR(&msg, header);
             }
-            header = libc::CMSG_NXTHDR(&msg, header);
+        }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            control_truncated = true;
+        }
+
+        if received == 0 {
+            // EOF: the peer shut down its write side.
+            break;
+        }
+        let segment_end = total + received as usize;
+        let saw_newline = bytes[total..segment_end].contains(&b'\n');
+        total = segment_end;
+        if saw_newline || total > max_bytes {
+            break;
         }
     }
+    bytes.truncate(total);
 
     // Dropping `fds` on these error paths closes everything just harvested.
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+    if control_truncated {
         return Err(io::Error::other(
             "truncated file descriptors in helper request",
         ));
@@ -383,6 +427,11 @@ pub fn receive_message_with_fds(
         return Err(io::Error::other(
             "too many file descriptors in helper request",
         ));
+    }
+    if total > max_bytes {
+        return Err(io::Error::other(format!(
+            "helper request too large (over {max_bytes} bytes)"
+        )));
     }
 
     let message = String::from_utf8(bytes)
@@ -453,6 +502,96 @@ mod tests {
             install_request("utun5", &NetworkPolicy::default()).unwrap(),
             "install utun5\n"
         );
+    }
+
+    // Regression test for the request-size cliff: a policy that is legal
+    // under the documented caps (MAX_RULES_PER_LIST entries in all three
+    // lists, long uncompressed IPv6 forms with port ranges) serializes well
+    // past the old 4 KiB recvmsg buffer, where it was silently truncated and
+    // rejected as a parse error. It must fit MAX_REQUEST_BYTES and round-trip
+    // losslessly through install_request -> parse_request.
+    #[test]
+    fn maximal_network_policy_round_trips_through_the_wire_form() {
+        use crate::policy::{DestRule, MAX_RULES_PER_LIST, NetAction};
+
+        let rule = |space: &str, index: usize| {
+            DestRule::parse(&format!(
+                "[{space}:1111:2222:3333:4444:5555:6666:{index:x}]:8000-8100"
+            ))
+            .unwrap()
+        };
+        let network = NetworkPolicy {
+            default_action: NetAction::Deny,
+            allow: (1..=MAX_RULES_PER_LIST).map(|i| rule("2001", i)).collect(),
+            deny: (1..=MAX_RULES_PER_LIST).map(|i| rule("2606", i)).collect(),
+            // fd00::/8 is inside the fc00::/7 blocked-LAN range, so the
+            // containment check accepts these.
+            lan_allow: (1..=MAX_RULES_PER_LIST).map(|i| rule("fd00", i)).collect(),
+        };
+        network.validate().unwrap();
+
+        let request = install_request("utun5", &network).unwrap();
+        assert!(
+            request.len() > 4096,
+            "request no longer exceeds the old 4 KiB cliff ({} bytes); \
+             grow the test policy",
+            request.len()
+        );
+        assert!(
+            request.len() <= MAX_REQUEST_BYTES,
+            "maximal legal request ({} bytes) exceeds MAX_REQUEST_BYTES",
+            request.len()
+        );
+        assert_eq!(
+            parse_request(&request).unwrap(),
+            HelperRequest::Install {
+                interface_name: "utun5".to_string(),
+                network,
+            }
+        );
+    }
+
+    // The transport must reassemble a request that arrives across several
+    // recvmsg segments instead of parsing a truncated prefix.
+    #[test]
+    fn segmented_request_is_reassembled_by_the_receiver() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let request = format!("install utun5 {}\n", "x".repeat(32 * 1024));
+        let sender = std::thread::spawn({
+            let request = request.clone();
+            move || {
+                let mut left = &left;
+                let _ = left.write_all(request.as_bytes());
+            }
+        });
+
+        let received = receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3).unwrap();
+        sender.join().unwrap();
+        assert_eq!(received.message, request);
+    }
+
+    // An over-cap request must fail with the distinct "too large" error —
+    // never be silently cut at the buffer boundary and parsed as a shorter,
+    // different request.
+    #[test]
+    fn oversized_request_is_rejected_as_too_large_not_truncated() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut left = &left;
+            // No newline: the receiver must hit the cap, not a terminator.
+            let payload = vec![b'a'; MAX_REQUEST_BYTES + 2];
+            // The receiver may hang up mid-write once it detects the
+            // overflow; that error is expected.
+            let _ = left.write_all(&payload);
+        });
+
+        let error = receive_message_with_fds(&right, MAX_REQUEST_BYTES, 3).unwrap_err();
+        assert!(
+            error.to_string().contains("too large"),
+            "expected a too-large rejection, got: {error}"
+        );
+        drop(right);
+        sender.join().unwrap();
     }
 
     #[test]
