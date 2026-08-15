@@ -493,6 +493,19 @@ struct ValidatedLaunch {
 
 fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
     spec.validate()?;
+    // The command is exec'd through option-parsing wrappers (sandbox-exec on
+    // macOS). The `--` separator in run_launch_spec is the primary guard;
+    // refusing option-shaped executables here keeps a crafted spec from even
+    // reaching a wrapper's argv parser.
+    let executable = spec
+        .command
+        .first()
+        .ok_or_else(|| err("launch spec command is empty"))?;
+    if executable.is_empty() || executable.starts_with('-') {
+        return Err(err(format!(
+            "launch spec executable {executable:?} must not be empty or start with '-'"
+        )));
+    }
     let home = home_directory_for_uid(uid)?;
     let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
     let cwd = validated_directory("working directory", Path::new(&spec.cwd), None)?;
@@ -798,6 +811,10 @@ fn run_launch_spec(
         .arg("/usr/bin/sandbox-exec")
         .arg("-f")
         .arg(profile_arg)
+        // Terminate sandbox-exec's own option parsing: without this a spec
+        // command starting with `-p`/`-f` would be consumed as a sandbox-exec
+        // option and could replace the helper-built profile.
+        .arg("--")
         .args(&launch.command)
         .current_dir(&launch.cwd)
         .env_clear()
@@ -1596,6 +1613,65 @@ mod tests {
             BTreeMap::from([("TMPDIR".to_string(), tmpdir.to_string_lossy().to_string())]),
             "(version 1)",
         )
+    }
+
+    #[test]
+    fn validate_launch_rejects_option_shaped_executable() {
+        let uid = unsafe { libc::getuid() };
+        let tmpdir = owned_tmpdir();
+
+        // A command whose argv[0] parses as a sandbox-exec option must be
+        // refused: `-p '(allow default)'` would replace the helper profile.
+        for command in [
+            vec![
+                "-p".to_string(),
+                "(allow default)".to_string(),
+                "/bin/echo".to_string(),
+            ],
+            vec!["-f".to_string(), "/tmp/evil.sb".to_string()],
+            vec![String::new()],
+        ] {
+            let mut spec = base_spec(&tmpdir);
+            spec.command = command.clone();
+            assert!(validate_launch(&spec, uid).is_err(), "{command:?}");
+        }
+
+        let _ = fs::remove_dir_all(&tmpdir);
+    }
+
+    // sandbox-exec must treat everything after `--` as the command, so an
+    // injected `-p '(allow default)'` cannot reach its option parser: with the
+    // separator in place the `-p` is exec'd as a (nonexistent) program and the
+    // launch fails instead of running under the injected profile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_exec_separator_stops_option_parsing() {
+        if std::env::var_os("CI").is_some() {
+            eprintln!("skipping sandbox-exec runtime test in CI");
+            return;
+        }
+        let tmpdir = owned_tmpdir();
+        let profile_path = tmpdir.join("permissive.sb");
+        fs::write(&profile_path, "(version 1)\n(allow default)\n").unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        // The separator itself is accepted and the command still runs.
+        let plain = run(&["--", "/bin/echo", "ok"]);
+        assert!(plain.status.success(), "{plain:?}");
+
+        // The injection attempt fails: `-p` is not a runnable command.
+        let injected = run(&["--", "-p", "(allow default)", "/bin/echo"]);
+        assert!(!injected.status.success());
+
+        let _ = fs::remove_dir_all(&tmpdir);
     }
 
     #[test]
