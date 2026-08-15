@@ -145,7 +145,10 @@ hook. For caller uid `U`, socket owner `O`, and interface `tun0`/`wg0`, the
 generated chain policy (`LYH-<uid>`, or `LYH-U-<uid>` for the user-scoped
 fallback) is:
 
-1. Return immediately for loopback.
+1. Return immediately for loopback. This exempts stub-resolver DNS
+   (`127.0.0.53`/`127.0.0.1`); the stub's upstream queries are not owner
+   `O` and follow the system routing table (see the security model's DNS
+   section).
 2. Reject LAN, carrier-grade NAT, link-local, multicast, and IPv6
    unique-local/link-local/multicast destinations.
 3. Return for traffic already leaving the selected VPN interface.

@@ -214,7 +214,8 @@ can send traffic.
 
 On Linux, the installed iptables/ip6tables chains:
 
-- allow loopback traffic to continue through the host firewall;
+- allow loopback traffic to continue through the host firewall (this exempts
+  stub-resolver DNS such as `127.0.0.53` — see *DNS resolution* below);
 - reject traffic to private, carrier-grade NAT, link-local, multicast, and IPv6
   unique-local/link-local/multicast ranges;
 - allow traffic already leaving the selected VPN interface to continue through
@@ -254,10 +255,25 @@ not by the agent process. Because the PF rules match the agent's group, they do
 not apply to mDNSResponder: its DNS queries follow the system's routing table
 rather than being steered by the agent's `route-to` rule.
 
-In the default configuration this is not a leak — the launcher refuses to start
-unless the selected VPN is already the default IPv4 route, so resolver queries
-traverse the same tunnel. The confinement of DNS therefore depends on that
-default-route invariant:
+Linux has the same exception in a different shape: the firewall chain's first
+rule is `-o lo -j RETURN`, and libc resolvers typically send DNS to a local
+stub — `127.0.0.53` (systemd-resolved) or `127.0.0.1` (dnsmasq/unbound) — so
+the agent's queries leave via loopback and never reach the VPN/LAN rules. The
+stub daemon's own upstream queries are then sent by *its* UID, which the
+`-m owner` match does not cover; they follow the system routing table, exactly
+like mDNSResponder on macOS.
+
+In the default configuration this is not a leak through the routing table —
+the launcher refuses to start unless the selected VPN is already the default
+IPv4 route, so resolver queries that follow that table traverse the same
+tunnel. The confinement of DNS therefore depends on that default-route
+invariant, and on the resolver actually using it:
+
+- On Linux, systemd-resolved can be configured with **per-link DNS servers**
+  bound to a physical NIC (common with DHCP-provided resolvers). Those
+  upstream queries are sent out that link, not the default route, so they
+  leave the tunnel even when the default-route preflight passed. Check
+  `resolvectl status` if DNS metadata must stay inside the tunnel.
 
 - On macOS with `--allow-non-default-route`, the agent's own connections are
   still pinned to the `utun` by `route-to`, but its DNS lookups can leave over

@@ -135,6 +135,12 @@ impl LinuxFirewallRuleSet {
         let args =
             |parts: &[&str]| -> Vec<String> { parts.iter().map(ToString::to_string).collect() };
 
+        // The loopback RETURN also exempts stub-resolver DNS (127.0.0.53 /
+        // 127.0.0.1): the stub daemon's upstream queries are sent by its own
+        // UID, so the owner match never sees them and they follow the system
+        // routing table — the Linux analogue of macOS mDNSResponder. This is
+        // documented in website/security-model.md (DNS resolution); scoping
+        // the rule would break resolution outright rather than confine it.
         let mut commands = vec![
             args(&["-w", "-N", &chain]),
             args(&["-w", "-F", &chain]),
