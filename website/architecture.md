@@ -28,7 +28,7 @@ launcher and the helper, so both sides always render identical rules:
 | Module | Responsibility |
 |---|---|
 | `interfaces` | Enumerate interfaces via `getifaddrs`, collect IPv4/IPv6 and point-to-point peer addresses; supported VPN interfaces are `utun*` on macOS and `tun*`/`wg*` on Linux. |
-| `route` | Ask the platform route tool which interface would carry `1.1.1.1` (`/sbin/route -n get` on macOS, `ip route get` on Linux). |
+| `route` | Query the routing table for where all unbound IPv4 traffic leaves: the unscoped default routes (`netstat -rn -f inet` on macOS, `ip -4 route show default` on Linux) plus the kernel's pick for each half of the address space (`route -n get` / `ip route get` for `0.0.0.1` and `128.0.0.1`). |
 | `policy` | Typed sandbox policy shared by launcher and helper: `SandboxPolicy` (network + path customization), the `DestRule` grammar (`ADDR[/PREFIX][:PORT[-PORT]]`, parsed into `IpAddr`/prefix/port — never free text), the blocked-LAN constants, list caps, and lexical path validation. |
 | `config` | Layered TOML configuration: `ConfigFile` schema (`deny_unknown_fields` throughout), XDG global path + upward `.lianyaohu.toml` discovery, merge with per-key provenance, widening detection/stripping, and the hash-pinned trust store (`trusted.toml`). |
 | `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow loopback-only bind/inbound, outbound TCP/UDP, and the mDNSResponder socket). Applies the path policy: extra writable/read-only subpaths, narrow-home mode, and user deny rules appended last (seatbelt is last-match-wins). |
