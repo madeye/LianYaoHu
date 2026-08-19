@@ -468,7 +468,7 @@ this trust model is not acceptable for your environment.
 ### What CI proves about the supply chain
 
 These are enforcement branches in shell, so CI tests them like code rather
-than trusting review. Every push and pull request runs:
+than trusting review. Every push to `main` and every pull request runs:
 
 - `scripts/lint-shell.sh` — `bash -n` and `shellcheck` over every shell script
   in the repository — and `actionlint` over the workflows.
@@ -491,6 +491,9 @@ than trusting review. Every push and pull request runs:
   tampered blob and a wrong OIDC issuer are both refused, and — the failure
   that once shipped a release nobody could install — that the CI run's own
   non-tag identity is refused by the exact pattern `install.sh` enforces.
+  Pull requests from forks receive no OIDC token, so this round trip is
+  skipped there; it still runs on every push to `main` and on every
+  same-repository pull request.
 
 The tag binding itself lives in `scripts/release-tag.sh` (invoked by the
 release workflow) precisely so it can be unit-tested: branch refs,
