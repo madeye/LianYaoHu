@@ -219,13 +219,6 @@ pub fn query_ipv4_egress() -> Result<Ipv4Egress> {
     Ok(Ipv4Egress::default())
 }
 
-/// Interface carrying unbound IPv4 traffic, for display in the pickers.
-pub fn default_ipv4_interface() -> Result<Option<String>> {
-    Ok(query_ipv4_egress()?
-        .egress_interface()
-        .map(ToString::to_string))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

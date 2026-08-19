@@ -13,6 +13,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lianyaohu_core::interfaces::NetworkInterface;
+use lianyaohu_core::route::Ipv4Egress;
 use lianyaohu_core::{Result, err};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -56,7 +57,7 @@ fn restore_terminal() {
 /// Detail-pane lines shared by the quick-pick and the config editor.
 pub(crate) fn interface_detail_lines(
     interface: &NetworkInterface,
-    egress_interface: Option<&str>,
+    egress: &Ipv4Egress,
 ) -> Vec<String> {
     if interface.is_proxy_only() {
         return vec![
@@ -83,13 +84,21 @@ pub(crate) fn interface_detail_lines(
     } else {
         interface.ipv6_addresses.join(", ")
     };
-    // Whether this interface carries all IPv4 egress — the same question the
-    // launch preflight asks, so the picker never shows "yes" for something
-    // the launcher would then refuse.
-    let egress = match egress_interface {
-        Some(name) if name == interface.name => "yes (carries IPv4 egress)".to_string(),
-        Some(name) => format!("no (traffic leaves over {name})"),
-        None => "unknown".to_string(),
+    // Whether this interface carries all IPv4 egress — decided by the same
+    // predicate as the launch preflight (`carries_all_ipv4`), so the picker
+    // never shows "yes" for a state the launcher would then refuse. In
+    // particular, `egress_interface()` alone is not enough: when the two
+    // halves of the address space disagree it falls back to the first
+    // default-route entry, which may name this very interface even though
+    // part of the traffic leaves elsewhere.
+    let egress = if egress.carries_all_ipv4(&interface.name) {
+        "yes (carries IPv4 egress)".to_string()
+    } else {
+        match egress.egress_interface() {
+            Some(name) if name != interface.name => format!("no (traffic leaves over {name})"),
+            Some(_) => "no (IPv4 egress is split)".to_string(),
+            None => "unknown".to_string(),
+        }
     };
     vec![
         format!("state:        {state}"),
@@ -150,5 +159,53 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utun(name: &str) -> NetworkInterface {
+        NetworkInterface {
+            name: name.to_string(),
+            flags: (libc::IFF_UP | libc::IFF_RUNNING) as u32,
+            ipv4_addresses: vec!["10.7.0.2".to_string()],
+            ipv4_peer_addresses: vec!["10.7.0.1".to_string()],
+            ipv6_addresses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn split_egress_never_shows_yes_even_when_the_default_entry_matches() {
+        // 0.0.0.0/1 leaves over utun4 (which also holds the default route),
+        // but 128.0.0.0/1 leaves over en0. The launcher refuses this state,
+        // so the detail pane must not claim utun4 carries IPv4 egress —
+        // `egress_interface()` alone would fall back to the default-route
+        // entry and name utun4 here.
+        let egress = Ipv4Egress {
+            default_interfaces: vec!["utun4".to_string()],
+            low_half: Some("utun4".to_string()),
+            high_half: Some("en0".to_string()),
+        };
+        let lines = interface_detail_lines(&utun("utun4"), &egress).join("\n");
+        assert!(!lines.contains("yes"), "{lines}");
+        assert!(lines.contains("no (IPv4 egress is split)"), "{lines}");
+
+        // A consistent tunnel still reads "yes", and another candidate reads
+        // "no" naming where traffic actually leaves.
+        let egress = Ipv4Egress {
+            default_interfaces: vec!["en0".to_string()],
+            low_half: Some("utun4".to_string()),
+            high_half: Some("utun4".to_string()),
+        };
+        let lines = interface_detail_lines(&utun("utun4"), &egress).join("\n");
+        assert!(lines.contains("yes (carries IPv4 egress)"), "{lines}");
+        let lines = interface_detail_lines(&utun("utun9"), &egress).join("\n");
+        assert!(lines.contains("no (traffic leaves over utun4)"), "{lines}");
+
+        // Nothing known at all reads "unknown".
+        let lines = interface_detail_lines(&utun("utun4"), &Ipv4Egress::default()).join("\n");
+        assert!(lines.contains("ipv4 egress:  unknown"), "{lines}");
     }
 }

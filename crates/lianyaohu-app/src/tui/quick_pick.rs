@@ -31,7 +31,7 @@ struct Model {
     interfaces: Vec<NetworkInterface>,
     selected: usize,
     save: bool,
-    default_route: Option<String>,
+    egress: route::Ipv4Egress,
 }
 
 enum Step {
@@ -43,13 +43,13 @@ enum Step {
 impl Model {
     /// The picker always appends the synthetic "none" (proxy-only) entry, so
     /// selection works even with no VPN interface up at all.
-    fn new(mut interfaces: Vec<NetworkInterface>, default_route: Option<String>) -> Self {
+    fn new(mut interfaces: Vec<NetworkInterface>, egress: route::Ipv4Egress) -> Self {
         interfaces.push(NetworkInterface::proxy_only());
         Self {
             interfaces,
             selected: 0,
             save: false,
-            default_route,
+            egress,
         }
     }
 
@@ -104,7 +104,7 @@ impl Model {
     /// Replaces the interface list with a fresh enumeration (plus the
     /// synthetic "none" entry), keeping the selection pinned to the same
     /// interface name when it still exists.
-    fn refresh(&mut self, mut interfaces: Vec<NetworkInterface>, default_route: Option<String>) {
+    fn refresh(&mut self, mut interfaces: Vec<NetworkInterface>, egress: route::Ipv4Egress) {
         interfaces.push(NetworkInterface::proxy_only());
         let current = self.selected_interface().name.clone();
         self.selected = interfaces
@@ -112,11 +112,11 @@ impl Model {
             .position(|interface| interface.name == current)
             .unwrap_or(0);
         self.interfaces = interfaces;
-        self.default_route = default_route;
+        self.egress = egress;
     }
 
     fn detail_lines(&self) -> Vec<String> {
-        super::interface_detail_lines(self.selected_interface(), self.default_route.as_deref())
+        super::interface_detail_lines(self.selected_interface(), &self.egress)
     }
 
     fn keybar(&self) -> Line<'static> {
@@ -197,8 +197,8 @@ fn draw(frame: &mut Frame, model: &Model) {
 /// proxy-only entry is always offered, so an empty list is fine). The caller
 /// has already checked that stdin/stdout are a TTY.
 pub fn quick_pick(interfaces: &[NetworkInterface]) -> Result<QuickPickOutcome> {
-    let default_route = route::default_ipv4_interface().unwrap_or(None);
-    let mut model = Model::new(interfaces.to_vec(), default_route);
+    let egress = route::query_ipv4_egress().unwrap_or_default();
+    let mut model = Model::new(interfaces.to_vec(), egress);
 
     let mut guard = TerminalGuard::inline(VIEW_HEIGHT)?;
     let outcome = run_loop(&mut guard, &mut model);
@@ -228,8 +228,8 @@ fn run_loop(guard: &mut TerminalGuard, model: &mut Model) -> Result<QuickPickOut
         } else {
             next_tick = Instant::now() + TICK;
             if let Ok(interfaces) = vpn_interfaces() {
-                let default_route = route::default_ipv4_interface().unwrap_or(None);
-                model.refresh(interfaces, default_route);
+                let egress = route::query_ipv4_egress().unwrap_or_default();
+                model.refresh(interfaces, egress);
                 guard.terminal.draw(|frame| draw(frame, model))?;
             }
         }
@@ -256,13 +256,21 @@ mod tests {
         (libc::IFF_UP | libc::IFF_RUNNING) as u32
     }
 
+    fn egress_all(name: &str) -> route::Ipv4Egress {
+        route::Ipv4Egress {
+            default_interfaces: vec![name.to_string()],
+            low_half: Some(name.to_string()),
+            high_half: Some(name.to_string()),
+        }
+    }
+
     fn sample_model() -> Model {
         Model::new(
             vec![
                 interface("utun3", 0, &[], &[]),
                 interface("utun5", up_flags(), &["10.7.0.2"], &["10.7.0.1"]),
             ],
-            Some("utun5".to_string()),
+            egress_all("utun5"),
         )
     }
 
@@ -297,7 +305,7 @@ mod tests {
 
     #[test]
     fn none_entry_selects_proxy_only_mode() {
-        let mut model = Model::new(Vec::new(), None);
+        let mut model = Model::new(Vec::new(), route::Ipv4Egress::default());
         assert_eq!(model.interfaces.len(), 1);
         match model.update(press(KeyCode::Enter)) {
             Step::Done(QuickPickOutcome::Chosen { name, .. }) => assert_eq!(name, "none"),
@@ -357,16 +365,16 @@ mod tests {
                 interface("utun4", 0, &[], &[]),
                 interface("utun5", up_flags(), &["10.7.0.2"], &["10.7.0.1"]),
             ],
-            None,
+            route::Ipv4Egress::default(),
         );
         assert_eq!(model.selected, 2);
         assert_eq!(model.selected_interface().name, "utun5");
 
         // A vanished selection falls back to the top; an empty refresh still
         // offers the proxy-only entry.
-        model.refresh(vec![interface("utun9", 0, &[], &[])], None);
+        model.refresh(vec![interface("utun9", 0, &[], &[])], Default::default());
         assert_eq!(model.selected, 0);
-        model.refresh(Vec::new(), None);
+        model.refresh(Vec::new(), Default::default());
         assert_eq!(model.selected_interface().name, "none");
     }
 
