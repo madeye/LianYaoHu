@@ -184,6 +184,8 @@ cargo run -p lianyaohu-app -- --vpn tun0 --shared-user-firewall -- claude
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+scripts/lint-shell.sh
+scripts/tests/run.sh
 scripts/e2e-linux-tart.sh
 ```
 
@@ -192,6 +194,15 @@ parsing, route-output parsing, and selected runtime sandbox denials. The Linux
 Tart e2e boots an Ubuntu VM, installs the helper, creates a temporary `tun0`,
 and verifies group-scoped firewall, filesystem, and process-syscall
 enforcement around a real launched process.
+
+`scripts/lint-shell.sh` runs `bash -n` plus `shellcheck` over every shell
+script in the repository. `scripts/tests/run.sh` runs the shell test suites in
+`scripts/tests/`: they exercise `install.sh` (checksum and Sigstore signature
+enforcement, including that a present-but-invalid signature aborts the
+install), `uninstall.sh` (prefer the shipped teardown script, pin the remote
+fetch to a release tag, never fall back to a branch), the release tag guard,
+and the CI sign→verify round trip. They use stubs and temporary directories
+only — nothing is installed, and no network call is made.
 
 ## Releases
 

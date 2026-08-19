@@ -44,6 +44,9 @@ sudo rm -f /usr/local/libexec/lianyaohu-helper
 sudo rm -f /usr/local/libexec/lianyaohu-uninstall-helper.sh
 sudo rm -f /var/run/lianyaohu-helper.sock
 
+# The redirect is meant to be performed by this unprivileged shell into a temp
+# file we own; only the directory read needs sudo.
+# shellcheck disable=SC2024
 if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >"$tmp_group" 2>/dev/null; then
   existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' "$tmp_group")"
   if [[ "$existing_gid" == "$GROUP_GID" ]]; then

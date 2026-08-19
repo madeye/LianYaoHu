@@ -41,45 +41,25 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Checks out the run's own ref. The guard below refuses to go any
+      # further unless that ref is a release tag, so every later step runs
+      # against the tagged tree.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Sigstore/Fulcio derives the certificate identity from the workflow's
+      # *own* ref (github.ref). install.sh pins that identity to
+      # ...release.yml@refs/tags/, so a run on a branch ref would sign as
+      # @refs/heads/<branch> and every cosign-equipped install of that release
+      # would hard-fail. The guard lives in a script so CI can unit-test it:
+      # scripts/tests/test-release-tag.sh.
       - name: Resolve release tag
         id: release
         shell: bash
         env:
           DISPATCH_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
-        run: |
-          # Sigstore/Fulcio derives the certificate identity from the
-          # workflow's *own* ref (github.ref), not the ref checked out below.
-          # install.sh pins the identity to ...release.yml@refs/tags/, so a
-          # run on a branch ref would sign as @refs/heads/<branch> and every
-          # cosign-equipped install of that release would hard-fail. Refuse
-          # to build and sign from anything but a tag ref.
-          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
-            echo "::error::Release must run from a tag ref, got '${GITHUB_REF}'." \
-              "For workflow_dispatch, select the tag itself as the run's ref."
-            exit 1
-          fi
-
-          tag="${GITHUB_REF_NAME}"
-
-          if [[ -n "${DISPATCH_TAG}" && "${DISPATCH_TAG}" != "${tag}" ]]; then
-            echo "::error::Dispatched tag input '${DISPATCH_TAG}' does not match the run's tag ref '${tag}'"
-            exit 1
-          fi
-
-          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tag must look like v0.1.0, got '${tag}'"
-            exit 1
-          fi
-
-          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
-
-      # The resolve step guarantees this equals the run's own ref
-      # (refs/tags/<tag>); the explicit ref just makes the intent obvious.
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.release.outputs.tag }}
-          fetch-depth: 0
+        run: scripts/release-tag.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -108,6 +88,11 @@ jobs:
       - name: Test
         run: cargo test
 
+      # The install/uninstall scripts this release ships and points users at
+      # are covered by the same suites CI runs.
+      - name: Shell script tests
+        run: scripts/tests/run.sh
+
       - name: Build release binaries
         run: cargo build --release --locked -p lianyaohu-app
 
@@ -119,12 +104,14 @@ jobs:
           scripts/package-release.sh "${{ steps.release.outputs.version }}" "$target" target/release dist
           asset="dist/lianyaohu-${{ steps.release.outputs.version }}-${target}.tar.gz"
           checksum="${asset}.sha256"
-          echo "asset=${asset}" >>"$GITHUB_OUTPUT"
-          echo "checksum=${checksum}" >>"$GITHUB_OUTPUT"
-          # `cosign sign-blob --bundle` emits cosign's legacy bundle format,
-          # not the sigstore.json interchange format, so the asset name says
-          # so. install.sh downloads and verifies this exact name.
-          echo "bundle=${asset}.cosign.bundle" >>"$GITHUB_OUTPUT"
+          {
+            echo "asset=${asset}"
+            echo "checksum=${checksum}"
+            # `cosign sign-blob --bundle` emits cosign's legacy bundle format,
+            # not the sigstore.json interchange format, so the asset name says
+            # so. install.sh downloads and verifies this exact name.
+            echo "bundle=${asset}.cosign.bundle"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1

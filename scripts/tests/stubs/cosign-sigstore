@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# A miniature cosign that implements just enough of `sign-blob`/`verify-blob`
+# to exercise scripts/tests/sigstore-roundtrip.sh offline.
+#
+# The "bundle" it writes is three lines — blob digest, signing identity, OIDC
+# issuer — and `verify-blob` succeeds only when all three match what is being
+# asked for. That mirrors the three ways a real verification fails: tampered
+# blob, wrong identity, wrong issuer.
+#
+# The identity to sign as comes from $LYH_STUB_SIGNING_IDENTITY.
+set -uo pipefail
+
+digest_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+command="${1:-}"
+shift || true
+
+bundle=""
+identity=""
+identity_regexp=""
+issuer=""
+blob=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bundle)
+      bundle="$2"
+      shift 2
+      ;;
+    --certificate-identity)
+      identity="$2"
+      shift 2
+      ;;
+    --certificate-identity-regexp)
+      identity_regexp="$2"
+      shift 2
+      ;;
+    --certificate-oidc-issuer)
+      issuer="$2"
+      shift 2
+      ;;
+    --yes | -y)
+      shift
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      blob="$1"
+      shift
+      ;;
+  esac
+done
+
+case "$command" in
+  sign-blob)
+    {
+      digest_of "$blob"
+      printf '%s\n' "${LYH_STUB_SIGNING_IDENTITY:?cosign stub: LYH_STUB_SIGNING_IDENTITY is not set}"
+      printf '%s\n' "https://token.actions.githubusercontent.com"
+    } >"$bundle"
+    echo "cosign stub: signed ${blob}"
+    ;;
+  verify-blob)
+    if [[ ! -f "$bundle" ]]; then
+      echo "cosign stub: no such bundle: $bundle" >&2
+      exit 1
+    fi
+    signed_digest="$(sed -n '1p' "$bundle")"
+    signed_identity="$(sed -n '2p' "$bundle")"
+    signed_issuer="$(sed -n '3p' "$bundle")"
+
+    if [[ "$(digest_of "$blob")" != "$signed_digest" ]]; then
+      echo "cosign stub: blob digest does not match the bundle" >&2
+      exit 1
+    fi
+    if [[ "$issuer" != "$signed_issuer" ]]; then
+      echo "cosign stub: certificate issuer mismatch" >&2
+      exit 1
+    fi
+    if [[ -n "$identity" && "$identity" != "$signed_identity" ]]; then
+      echo "cosign stub: certificate identity mismatch" >&2
+      exit 1
+    fi
+    if [[ -n "$identity_regexp" ]] && [[ ! "$signed_identity" =~ $identity_regexp ]]; then
+      echo "cosign stub: certificate identity does not match the regexp" >&2
+      exit 1
+    fi
+    echo "Verified OK"
+    ;;
+  *)
+    echo "cosign stub: unsupported command '${command}'" >&2
+    exit 64
+    ;;
+esac

@@ -464,3 +464,35 @@ involves no network fetch. When it must fetch the script, it pins the fetch
 to a resolved release tag and aborts if no tag resolves — it never falls back
 to a moving branch tip. Review the scripts before piping them to `bash` if
 this trust model is not acceptable for your environment.
+
+### What CI proves about the supply chain
+
+These are enforcement branches in shell, so CI tests them like code rather
+than trusting review. Every push and pull request runs:
+
+- `scripts/lint-shell.sh` — `bash -n` and `shellcheck` over every shell script
+  in the repository — and `actionlint` over the workflows.
+- `scripts/tests/run.sh` on macOS and Linux, driving the real `install.sh` and
+  `uninstall.sh` with stubbed `curl`/`cosign` and a temporary install
+  directory. It asserts that a present-but-invalid signature aborts the
+  install with nothing written, that a corrupted tarball fails the checksum,
+  that `LIANYAOHU_REQUIRE_SIGNATURE=1` refuses a missing bundle *and* a
+  missing `cosign`, that the verification is issued with the tag-anchored
+  identity and the GitHub Actions OIDC issuer, and that the uninstaller
+  prefers the shipped teardown script, pins any remote fetch to a resolved
+  release tag, and aborts rather than running an unpinned branch script.
+  The identity pattern used in those assertions is read out of `install.sh`
+  itself, so loosening the pin fails the tests.
+- A sign→publish→download→verify round trip against the real, pinned `cosign`
+  (the same pinned action version the release workflow uses, asserted equal by
+  a test). One job signs a fixture blob with the workflow's own Sigstore
+  identity and publishes it as an artifact; a separate job downloads it and
+  checks that the bundle verifies against the identity that signed it, that a
+  tampered blob and a wrong OIDC issuer are both refused, and — the failure
+  that once shipped a release nobody could install — that the CI run's own
+  non-tag identity is refused by the exact pattern `install.sh` enforces.
+
+The tag binding itself lives in `scripts/release-tag.sh` (invoked by the
+release workflow) precisely so it can be unit-tested: branch refs,
+pull-request refs, mismatched `workflow_dispatch` inputs and malformed tags
+are all asserted to abort the release before anything is built or signed.

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Test stub for curl.
+#
+# Serves files from $LYH_STUB_STATE/files by URL basename, answers the
+# "resolve the latest release" HEAD request from $LYH_STUB_STATE/latest_location,
+# and appends every requested URL to $LYH_STUB_STATE/curl.log so tests can
+# assert exactly what the scripts under test fetched.
+#
+# Unknown URLs exit 22, which is what `curl -f` returns for an HTTP error.
+set -uo pipefail
+
+state="${LYH_STUB_STATE:?curl stub: LYH_STUB_STATE is not set}"
+
+out=""
+url=""
+head_only=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o | --output)
+      out="${2:-}"
+      shift 2
+      ;;
+    -w | --write-out)
+      shift 2
+      ;;
+    -I | --head)
+      head_only=1
+      shift
+      ;;
+    -*I*)
+      # Bundled short flags such as -fsSLI.
+      head_only=1
+      shift
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+
+printf '%s\n' "$url" >>"$state/curl.log"
+
+if [[ "$head_only" == "1" ]]; then
+  if [[ -f "$state/latest_location" ]]; then
+    # Stands in for -w '%{url_effective}': the final, redirected URL.
+    cat "$state/latest_location"
+    exit 0
+  fi
+  exit 22
+fi
+
+name="${url##*/}"
+if [[ -f "$state/files/$name" ]]; then
+  if [[ -n "$out" ]]; then
+    cp "$state/files/$name" "$out"
+  else
+    cat "$state/files/$name"
+  fi
+  exit 0
+fi
+
+echo "curl stub: no fixture for ${url}" >&2
+exit 22

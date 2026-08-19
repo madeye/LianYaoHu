@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Test stub for cosign.
+#
+# Records its full argument list in $LYH_STUB_STATE/cosign.log (one invocation
+# per line) and exits with the status in $LYH_STUB_STATE/cosign_exit (default
+# 0), so tests can drive both the "signature verifies" and "signature fails to
+# verify" branches of install.sh and assert the exact flags it passed.
+set -uo pipefail
+
+state="${LYH_STUB_STATE:?cosign stub: LYH_STUB_STATE is not set}"
+
+printf '%s\n' "$*" >>"$state/cosign.log"
+
+status=0
+if [[ -f "$state/cosign_exit" ]]; then
+  status="$(cat "$state/cosign_exit")"
+fi
+
+if [[ "$status" != "0" ]]; then
+  echo "cosign stub: simulated verification failure" >&2
+fi
+
+exit "$status"
