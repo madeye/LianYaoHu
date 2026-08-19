@@ -67,8 +67,12 @@ The configuration layer can add to — or narrow — the default grants:
   re-validates them like the launch roots: canonicalized against the real
   filesystem, never `/`, and writable extras must be **owned by the caller**
   and outside a protected-prefix denylist (`/etc`, `/usr`, `/System`,
-  `/Library`, `/var/db`, …). Read-only extras may not reach into — or
-  contain — another user's home: the helper checks the standard home roots
+  `/Library`, `/var/db`, …). No extra path — writable or read-only — may
+  reach into or contain another user's home. Ownership alone would not
+  settle that: a caller who owns an *ancestor* of another user's home (the
+  nonstandard layouts below) could otherwise route that home into the
+  sandbox through the ancestor. The helper therefore checks the standard
+  home roots
   (`/Users`, `/home`, `/root`, `/var/root`, and the APFS
   `/System/Volumes/Data/Users` alias) resolved through symlinks, plus every
   user's home directory from the local passwd database (service-account
@@ -158,10 +162,10 @@ existence or ownership oracle for paths the
 caller cannot traverse. It rebuilds the sandbox profile
 server-side from inputs it validates itself — the home directory from the
 passwd database for the authenticated peer UID, and a working directory and
-temporary directory that must be real directories owned by the caller (the
-working directory becomes a read+write grant, so it is additionally refused
-when it sits inside — or contains — another user's home, the same check the
-read-only extras get) — and re-sanitizes the launch environment with the same
+temporary directory that must be real directories owned by the caller (both
+become read+write grants, so both are additionally refused when they sit
+inside — or contain — another user's home, the same check the extra path
+grants get) — and re-sanitizes the launch environment with the same
 privacy and injection blocklists the launcher applies. The client's profile
 text is never consumed. A custom sandbox policy travels as typed fields in
 the versioned launch spec and is re-validated field by field: destination
