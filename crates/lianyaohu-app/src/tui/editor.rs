@@ -2287,7 +2287,7 @@ mod tests {
         editor.screen = Screen::Interface;
         let rendered = render(&editor);
         assert!(rendered.contains("utun5 [up]"));
-        assert!(rendered.contains("yes (matches)"));
+        assert!(rendered.contains("yes (carries IPv4 egress)"), "{rendered}");
 
         editor.screen = Screen::Proxy;
         let rendered = render(&editor);

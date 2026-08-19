@@ -56,7 +56,7 @@ fn restore_terminal() {
 /// Detail-pane lines shared by the quick-pick and the config editor.
 pub(crate) fn interface_detail_lines(
     interface: &NetworkInterface,
-    default_route: Option<&str>,
+    egress_interface: Option<&str>,
 ) -> Vec<String> {
     if interface.is_proxy_only() {
         return vec![
@@ -83,16 +83,19 @@ pub(crate) fn interface_detail_lines(
     } else {
         interface.ipv6_addresses.join(", ")
     };
-    let default_route = match default_route {
-        Some(name) if name == interface.name => "yes (matches)".to_string(),
-        Some(name) => format!("no (default is {name})"),
+    // Whether this interface carries all IPv4 egress — the same question the
+    // launch preflight asks, so the picker never shows "yes" for something
+    // the launcher would then refuse.
+    let egress = match egress_interface {
+        Some(name) if name == interface.name => "yes (carries IPv4 egress)".to_string(),
+        Some(name) => format!("no (traffic leaves over {name})"),
         None => "unknown".to_string(),
     };
     vec![
-        format!("state:         {state}"),
-        format!("ipv4:          {ipv4}"),
-        format!("ipv6:          {ipv6}"),
-        format!("default route: {default_route}"),
+        format!("state:        {state}"),
+        format!("ipv4:         {ipv4}"),
+        format!("ipv6:         {ipv6}"),
+        format!("ipv4 egress:  {egress}"),
     ]
 }
 

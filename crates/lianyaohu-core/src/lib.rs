@@ -22,7 +22,7 @@
 //! - [`launch`] / [`helper`] — the versioned launch spec and the root-helper
 //!   wire protocol over a Unix socket.
 //! - [`interfaces`] / [`route`] — VPN interface enumeration/validation and
-//!   default-route probing.
+//!   the routing-table check that the VPN carries all IPv4 egress.
 //!
 //! The security model and architecture are documented at
 //! <https://lyh.maxlv.net/security-model> and

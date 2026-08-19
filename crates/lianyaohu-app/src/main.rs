@@ -378,8 +378,8 @@ fn prepare(options: &Options) -> Result<Prepare> {
     // Proxy-only mode has no VPN interface, so the default-route preflight
     // is meaningless: the firewall blocks direct egress regardless of routes.
     if require_default_route && !selected_interface.is_proxy_only() {
-        let default_route = route::default_ipv4_interface()?;
-        check_default_route(default_route.as_deref(), &selected_interface.name)?;
+        let egress = route::query_ipv4_egress()?;
+        check_default_route(&egress, &selected_interface.name)?;
     }
 
     Ok(Prepare::Ready(Box::new(Prepared {
@@ -400,17 +400,19 @@ fn prepare(options: &Options) -> Result<Prepare> {
     })))
 }
 
-/// Default-route preflight: fail closed when the system default IPv4 route
-/// does not use the selected VPN interface. On macOS, PF `route-to` pins the
-/// agent's own TCP/UDP to the utun, but mDNSResponder is not group-matched
-/// and follows the system routing table, so DNS metadata would leave over the
-/// real default interface. Only the explicit `--allow-non-default-route`
-/// flag (or its config-file equivalent) may bypass this check.
-fn check_default_route(default_route: Option<&str>, selected: &str) -> Result<()> {
-    if default_route == Some(selected) {
+/// Default-route preflight: fail closed unless the selected VPN interface
+/// carries *all* unbound IPv4 traffic — both halves of the address space, so
+/// that neither a physical default route nor a leftover host route can carry
+/// traffic out of the tunnel. On macOS, PF `route-to` pins the agent's own
+/// TCP/UDP to the utun, but mDNSResponder is not group-matched and follows the
+/// system routing table, so DNS metadata would leave over the real default
+/// interface. Only the explicit `--allow-non-default-route` flag (or its
+/// config-file equivalent) may bypass this check.
+fn check_default_route(egress: &route::Ipv4Egress, selected: &str) -> Result<()> {
+    if egress.carries_all_ipv4(selected) {
         return Ok(());
     }
-    let default_route_name = default_route.unwrap_or("<unknown>");
+    let observed = egress.describe();
     #[cfg(target_os = "macos")]
     let detail = "PF route-to would still pin the agent's own connections to the utun, but \
                   mDNSResponder DNS follows the system routing table and would leak over the \
@@ -419,7 +421,7 @@ fn check_default_route(default_route: Option<&str>, selected: &str) -> Result<()
     let detail = "Linux firewall support cannot route traffic by itself; configure the VPN as \
                   the default route or pass --allow-non-default-route for diagnostics only";
     Err(err(format!(
-        "default IPv4 route uses {default_route_name}, not selected VPN interface {selected} \
+        "IPv4 traffic does not leave over the selected VPN interface {selected} ({observed}) \
          ({detail})"
     )))
 }
@@ -1607,7 +1609,8 @@ options:
                               Alias: --no-pf.
   --shared-user-firewall      Use current-UID firewall rules instead of helper-managed group isolation.
                               Alias: --shared-user-pf.
-  --allow-non-default-route   Do not require the system default route to use the selected VPN.
+  --allow-non-default-route   Do not require the selected VPN to carry all IPv4 egress (the
+                              routes for 0.0.0.0/1 and 128.0.0.0/1 must otherwise resolve to it).
                               WARNING: on macOS this permits DNS leaks — mDNSResponder follows the
                               system routing table even though PF route-to pins the agent's own
                               traffic to the utun.
@@ -1631,12 +1634,23 @@ mod tests {
 
     #[test]
     fn default_route_preflight_fails_closed_on_mismatch() {
+        let egress = |default: &[&str], low: Option<&str>, high: Option<&str>| route::Ipv4Egress {
+            default_interfaces: default.iter().map(ToString::to_string).collect(),
+            low_half: low.map(ToString::to_string),
+            high_half: high.map(ToString::to_string),
+        };
+
         // The VPN carrying the default route passes.
-        check_default_route(Some("utun5"), "utun5").unwrap();
+        check_default_route(&egress(&["utun5"], Some("utun5"), Some("utun5")), "utun5").unwrap();
+
+        // So does a split-default ("def1") tunnel, where the physical default
+        // route stays in place but 0.0.0.0/1 + 128.0.0.0/1 go to the tunnel.
+        check_default_route(&egress(&["en0"], Some("utun5"), Some("utun5")), "utun5").unwrap();
 
         // A non-VPN default route is always a hard error — there is no
         // auto-skip; only --allow-non-default-route bypasses the call site.
-        let error = check_default_route(Some("en0"), "utun5").unwrap_err();
+        let error =
+            check_default_route(&egress(&["en0"], Some("en0"), Some("en0")), "utun5").unwrap_err();
         let message = error.to_string();
         assert!(message.contains("en0"), "message: {message}");
         assert!(message.contains("utun5"), "message: {message}");
@@ -1645,8 +1659,18 @@ mod tests {
             "message: {message}"
         );
 
-        // An undetectable default route also fails closed.
-        assert!(check_default_route(None, "utun5").is_err());
+        // A VPN host route for a resolver (the #72 bug: `route get 1.1.1.1`
+        // answered utun5 while the default route was en0) must not pass: both
+        // halves of the address space still resolve to en0.
+        assert!(check_default_route(&egress(&["en0"], Some("en0"), Some("en0")), "utun5").is_err());
+
+        // Half the address space leaking over en0 fails too.
+        assert!(
+            check_default_route(&egress(&["en0"], Some("utun5"), Some("en0")), "utun5").is_err()
+        );
+
+        // An undetectable routing state also fails closed.
+        assert!(check_default_route(&route::Ipv4Egress::default(), "utun5").is_err());
     }
 
     #[test]

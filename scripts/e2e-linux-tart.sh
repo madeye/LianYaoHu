@@ -109,7 +109,10 @@ guest "
   sudo ip link set tun0 up
   sudo ip route replace 0.0.0.0/1 dev tun0
   sudo ip route replace 128.0.0.0/1 dev tun0
-  ip route get 1.1.1.1 | grep -q ' dev tun0 '
+  # Both halves of the IPv4 space must resolve to tun0 — that is exactly what
+  # the launcher's route preflight checks.
+  ip route get 0.0.0.1 | grep -q ' dev tun0 '
+  ip route get 128.0.0.1 | grep -q ' dev tun0 '
   curl -fsS --max-time 5 http://${HOST_BIND}:${HOST_PORT}/README.md >/tmp/lyh-host-probe
   sudo rm -rf /var/lyh-outside-sandbox
   sudo mkdir -m 0777 /var/lyh-outside-sandbox

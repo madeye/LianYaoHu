@@ -390,7 +390,7 @@ mod tests {
         assert!(rendered.contains("1. utun3 [down]"));
         assert!(rendered.contains("2. utun5 [up]"));
         assert!(rendered.contains("3. none [proxy-only]"));
-        assert!(rendered.contains("state:         DOWN"), "{rendered}");
+        assert!(rendered.contains("state:        DOWN"), "{rendered}");
         assert!(rendered.contains("save as default: off"));
 
         // Selecting the up interface shows its addresses and route match.
@@ -407,7 +407,7 @@ mod tests {
             rendered.push('\n');
         }
         assert!(rendered.contains("10.7.0.2 -> 10.7.0.1"), "{rendered}");
-        assert!(rendered.contains("yes (matches)"));
+        assert!(rendered.contains("yes (carries IPv4 egress)"), "{rendered}");
         assert!(rendered.contains("save as default: ON"));
     }
 }
