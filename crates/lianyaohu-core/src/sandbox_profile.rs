@@ -46,6 +46,11 @@ impl SandboxProfile {
 (allow process*)
 (allow signal (target self))
 
+; Blanket stat()/readlink() access: path traversal and tool startup break
+; without it. It is NOT overridden by the later file-read* denies, so any path
+; whose mere existence, size, timestamps, or symlink target is sensitive must
+; be listed in a deny rule that names file-read-metadata explicitly (see the
+; identity and user deny blocks at the end of the profile).
 (allow file-read-metadata)
 (allow file-read-data (literal "/"))
 
@@ -284,7 +289,17 @@ impl SandboxProfile {
              ; come AFTER the $HOME writable allow, the /private/etc read allow, and\n\
              ; any user read-only allows above, or those allows override them. Only\n\
              ; the user paths.deny block may follow.\n\
-             (deny file-read* file-write*\n    \
+             ;\n\
+             ; file-read-metadata is named explicitly on top of the file-read*\n\
+             ; wildcard: the blanket (allow file-read-metadata) near the top of the\n\
+             ; profile is not overridden by a file-read* deny, so without naming the\n\
+             ; metadata operation here `readlink /etc/localtime` and `stat\n\
+             ; /etc/localtime` still report the host zone even though reading the\n\
+             ; file's contents is denied. A rule that names the metadata operation\n\
+             ; wins over the wildcard regardless of order, which is also why the\n\
+             ; timezone-database deny above must NOT name it — that would kill\n\
+             ; stat() on the UTC data files carved back out for ICU/Bun.\n\
+             (deny file-read* file-read-metadata file-write*\n    \
              (literal \"/etc/localtime\")\n    \
              (literal \"/private/etc/localtime\")\n    \
              (literal \"/Library/Preferences/.GlobalPreferences.plist\")\n    \
@@ -295,7 +310,11 @@ impl SandboxProfile {
             out.push_str(
                 "\n; Denied paths from the user policy. Seatbelt is last-match-wins, so\n\
                  ; these must remain the final rules to override every allow above.\n\
-                 (deny file-read* file-write*",
+                 ; file-read-metadata is named explicitly for the same reason as the\n\
+                 ; identity block above: without it the blanket metadata allow keeps\n\
+                 ; stat() working on denied paths, leaking their existence, size, and\n\
+                 ; timestamps.\n\
+                 (deny file-read* file-read-metadata file-write*",
             );
             for path in &self.paths.deny {
                 let path = scheme_string(path);
@@ -378,6 +397,18 @@ mod tests {
             "(deny file-read*\n    (subpath \"/var/db/timezone\")\n    (subpath \"/private/var/db/timezone\"))"
         ));
         assert!(!profile.contains("(allow file-read*\n    (subpath \"/var/db/timezone\")"));
+        // The blanket metadata allow is not overridden by a file-read* deny, so
+        // the identity block must name file-read-metadata explicitly or the
+        // host zone still leaks through `readlink`/`stat` on /etc/localtime.
+        assert!(profile.contains("(deny file-read* file-read-metadata file-write*"));
+        // ... while the timezone-database deny must NOT name it: a metadata
+        // deny there is not undone by the UTC allow that follows, which would
+        // break stat() on the UTC data files ICU/Bun read at startup.
+        assert!(
+            !profile.contains(
+                "(deny file-read* file-read-metadata\n    (subpath \"/var/db/timezone\")"
+            )
+        );
         assert!(profile.contains(r#"(remote tcp "*:*")"#));
         assert!(profile.contains(r#"(remote udp "*:*")"#));
     }
@@ -408,7 +439,7 @@ mod tests {
         // Seatbelt is last-match-wins: if the timezone/identity denials sit
         // before the blanket $HOME write allow or the /private/etc read allow,
         // those allows silently override them and the denials are dead rules.
-        let deny_block = r#"(deny file-read* file-write*
+        let deny_block = r#"(deny file-read* file-read-metadata file-write*
     (literal "/etc/localtime")
     (literal "/private/etc/localtime")
     (literal "/Library/Preferences/.GlobalPreferences.plist")
@@ -574,10 +605,10 @@ mod tests {
             r#"(allow file-read*
     (subpath "/Volumes/DATA/reference"))"#
         ));
-        // Deny rules cover read and write, and are the FINAL rules in the
-        // profile — seatbelt is last-match-wins, so anything after them would
-        // override the denial.
-        let deny_block = r#"(deny file-read* file-write*
+        // Deny rules cover data reads, metadata (stat/readlink) and writes, and
+        // are the FINAL rules in the profile — seatbelt is last-match-wins, so
+        // anything after them would override the denial.
+        let deny_block = r#"(deny file-read* file-read-metadata file-write*
     (literal "/Users/example/.ssh")
     (subpath "/Users/example/.ssh")
     (literal "/Users/example/.aws")
@@ -864,6 +895,81 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn generated_profile_blocks_timezone_symlink_metadata() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // Denying only the data read leaves the host zone name readable via
+        // metadata: `readlink /etc/localtime` returns the zoneinfo target and
+        // `stat` follows the link. Both must fail while unrelated metadata
+        // (the /var -> private/var symlink, `ls /`) keeps working.
+        let readlink = run_in_sandbox(&["/usr/bin/readlink", "/etc/localtime"]);
+        let readlink_private = run_in_sandbox(&["/usr/bin/readlink", "/private/etc/localtime"]);
+        let stat = run_in_sandbox(&["/usr/bin/stat", "-f", "%i", "/etc/localtime"]);
+        let control_readlink = run_in_sandbox(&["/usr/bin/readlink", "/var"]);
+        let control_ls = run_in_sandbox(&["/bin/ls", "/"]);
+
+        assert_ne!(
+            readlink.status, 0,
+            "readlink /etc/localtime leaked the host zone: {}",
+            readlink.output
+        );
+        assert!(
+            !readlink.output.contains("zoneinfo"),
+            "readlink /etc/localtime leaked the host zone: {}",
+            readlink.output
+        );
+        assert_ne!(
+            readlink_private.status, 0,
+            "readlink /private/etc/localtime leaked the host zone: {}",
+            readlink_private.output
+        );
+        assert_ne!(
+            stat.status, 0,
+            "stat /etc/localtime was permitted: {}",
+            stat.output
+        );
+        assert_eq!(
+            control_readlink.status, 0,
+            "unrelated readlink broke: {}",
+            control_readlink.output
+        );
+        assert_eq!(
+            control_ls.status, 0,
+            "unrelated directory listing broke: {}",
+            control_ls.output
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn utc_carve_out_keeps_metadata_readable() {
+        if skip_sandbox_runtime_tests_in_ci() {
+            return;
+        }
+
+        // The timezone-database deny must stay file-read* only: naming
+        // file-read-metadata there is not undone by the UTC allow that follows,
+        // so ICU/JavaScriptCore would fail to stat the UTC data it reads at
+        // startup.
+        let Some(utc) = find_utc_timezone_file() else {
+            eprintln!("skipping UTC metadata probe; no UTC zoneinfo file found");
+            return;
+        };
+        let utc = utc.to_string_lossy().to_string();
+
+        let stat = run_in_sandbox(&["/usr/bin/stat", "-f", "%z", &utc]);
+
+        assert_eq!(
+            stat.status, 0,
+            "UTC carve-out lost stat() access: {}",
+            stat.output
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn generated_profile_blocks_home_timezone_preferences() {
         if skip_sandbox_runtime_tests_in_ci() {
             return;
@@ -908,6 +1014,19 @@ mod tests {
                     .into(),
             ],
         );
+        let global_prefs_stat = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/stat".into(),
+                "-f".into(),
+                "%z".into(),
+                prefs
+                    .join(".GlobalPreferences.plist")
+                    .to_string_lossy()
+                    .into(),
+            ],
+        );
         let write_attempt = run_profile(
             &profile,
             &tmpdir,
@@ -930,6 +1049,11 @@ mod tests {
         assert_ne!(
             global_prefs.status, 0,
             "$HOME .GlobalPreferences.plist was readable despite the deny"
+        );
+        assert_ne!(
+            global_prefs_stat.status, 0,
+            "$HOME .GlobalPreferences.plist was stat-able despite the deny: {}",
+            global_prefs_stat.output
         );
         assert_ne!(
             by_host.status, 0,
@@ -1299,11 +1423,31 @@ mod tests {
                 ssh_dir.join("secret").to_string_lossy().into(),
             ],
         );
+        let denied_stat = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/stat".into(),
+                "-f".into(),
+                "%z".into(),
+                ssh_dir.join("secret").to_string_lossy().into(),
+            ],
+        );
         let allowed = run_profile(
             &profile,
             &tmpdir,
             vec![
                 "/bin/cat".into(),
+                home.join("readable").to_string_lossy().into(),
+            ],
+        );
+        let allowed_stat = run_profile(
+            &profile,
+            &tmpdir,
+            vec![
+                "/usr/bin/stat".into(),
+                "-f".into(),
+                "%z".into(),
                 home.join("readable").to_string_lossy().into(),
             ],
         );
@@ -1313,6 +1457,18 @@ mod tests {
             denied.status, 0,
             "deny path was readable despite writable home"
         );
+        // Metadata too: the blanket (allow file-read-metadata) would otherwise
+        // leak the existence, size, and timestamps of every denied path.
+        assert_ne!(
+            denied_stat.status, 0,
+            "deny path was stat-able despite the deny: {}",
+            denied_stat.output
+        );
         assert_eq!(allowed.status, 0, "control read failed: {}", allowed.output);
+        assert_eq!(
+            allowed_stat.status, 0,
+            "control stat failed: {}",
+            allowed_stat.output
+        );
     }
 }
