@@ -43,12 +43,20 @@ and many build tools fail hard without it, so the machine name is visible to
 the agent; stronger identifiers such as `kern.uuid` remain blocked and
 `HOSTNAME` is still stripped from the environment.
 
-Timezone preference files are explicitly denied and the launched environment
-sets `TZ=UTC`. One caveat: in the default wide-home mode these are path-based
-denials inside a writable tree, so an in-sandbox process can evade them by
-renaming a parent directory (e.g. `mv ~/Library ~/L2`) and reading the files
-under the new path. Narrow-home mode keeps those parents read-only, which
-closes the rename route.
+On macOS, timezone and identity preference files (`/etc/localtime`, the
+`.GlobalPreferences.plist` pair, `~/Library/Preferences/ByHost`) are explicitly
+denied and the launched environment sets `TZ=UTC`. The deny covers *metadata*
+as well as file contents, so `readlink /etc/localtime` and `stat
+/etc/localtime` fail instead of reporting the host zone; the profile allows
+`stat` broadly (path traversal and tool startup need it), and that blanket
+allow is only overridden by a deny rule that names the metadata operation.
+One caveat: in the default wide-home mode these are path-based denials inside a
+writable tree, so an in-sandbox process can evade them by renaming a parent
+directory (e.g. `mv ~/Library ~/L2`) and reading the files under the new path.
+Narrow-home mode keeps those parents read-only, which closes the rename route.
+On Linux, Landlock has no deny-inside-allow, so `/etc` is read-only as a whole
+and these files are not denied; only `TZ=UTC` and the environment scrubbing
+apply.
 
 By default the helper runs the guarded process with the caller's UID and the
 dedicated `_lianyaohu` effective GID. On macOS, the sandbox profile describes
@@ -95,7 +103,9 @@ The configuration layer can add to — or narrow — the default grants:
   rejection.
 - **Denied paths** (`paths.deny`, e.g. `~/.ssh`) are rendered as the *final*
   seatbelt rules, so they override every allow — the entries become
-  unreadable and unwritable even inside the writable `$HOME`. **Linux cannot
+  unreadable and unwritable even inside the writable `$HOME`, and `stat` on
+  them fails too, so their existence, size, and timestamps stay hidden.
+  **Linux cannot
   enforce these**: Landlock has no deny-inside-allow, so the launcher warns
   at startup and `--print-profile` reports them as unenforced. Do not move a
   macOS config to Linux and assume `~/.ssh` is still protected.
