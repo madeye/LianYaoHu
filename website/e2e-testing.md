@@ -12,7 +12,9 @@ The script builds an aarch64 Linux binary with `cargo zigbuild`, clones or
 reuses an Ubuntu Tart VM (`LIANYAOHU_TART_VM` can override the generated VM
 name), mounts this repo into the guest, installs the helper as a systemd
 service, creates a temporary point-to-point `tun0`, and adds `/1` routes so
-`ip route get 1.1.1.1` selects `tun0`. It also creates a world-readable and
+both halves of the IPv4 space (`ip route get 0.0.0.1` and
+`ip route get 128.0.0.1`) select `tun0` — the invariant the launcher's route
+preflight checks. It also creates a world-readable and
 world-writable directory under `/var` so ordinary Unix permissions would allow
 access if Landlock were not active.
 
@@ -133,7 +135,8 @@ Bring up the VPN and route the default IPv4 path through it:
 sudo shadowvpn-client -c client.json    # creates utun4: 10.9.0.2 -> 10.9.0.1
 sudo route -n add -net 0.0.0.0/1 10.9.0.1
 sudo route -n add -net 128.0.0.0/1 10.9.0.1
-route -n get 1.1.1.1   # must report interface: utun4
+route -n get 0.0.0.1     # must report interface: utun4
+route -n get 128.0.0.1   # must report interface: utun4
 ```
 
 ## The test
@@ -200,15 +203,19 @@ your time if you don't know them:
 
 - **Routes die with the utun.** If the VPN client restarts, the kernel
   silently drops the `/1` routes — re-add them after every client start, or
-  traffic silently reverts to `en0`. LianYaoHu's default-route preflight
-  refuses to launch in that state, which is exactly the point of the check.
+  traffic silently reverts to `en0`. LianYaoHu's route preflight refuses to
+  launch in that state — including when only one of the two `/1` routes
+  survives — which is exactly the point of the check.
 
 - **Stale cloned routes.** macOS keeps `WASCLONED` per-host routes created
   under the old default route; they can pin a specific destination to `en0`
   even after the `/1` routes exist (`route -n get <ip>` shows `IFSCOPE`
-  `WASCLONED` on `en0`; delete with `route -n delete -host <ip>`). The PF
-  `block ... on ! utunN` rule still stops that traffic for the agent group —
-  defense in depth working as designed.
+  `WASCLONED` on `en0`; delete with `route -n delete -host <ip>`). The route
+  preflight deliberately does not fail on these — it checks the two halves of
+  the address space, not every host route — and the PF `block ... on ! utunN`
+  rule stops that traffic for the agent group anyway: defense in depth working
+  as designed. The system resolver is not covered by that rule, so delete
+  stale host routes if DNS metadata must stay inside the tunnel.
 
 - **`--shared-user-pf` can cut your own SSH session.** The current default
   dedicated-group path does not match the desktop user's SSH sockets. If you

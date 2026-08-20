@@ -20,6 +20,7 @@ use lianyaohu_core::config::{self, ConfigFile, PROJECT_FILE_NAME, expand_tilde, 
 use lianyaohu_core::env_policy::{NO_PROXY_KEYS, NO_PROXY_VALUE, PROXY_ENV_KEYS};
 use lianyaohu_core::interfaces::{NetworkInterface, vpn_interfaces};
 use lianyaohu_core::policy::{DestRule, LAN4_BLOCKED, LAN6_BLOCKED, lexically_normalized_absolute};
+use lianyaohu_core::route;
 use lianyaohu_core::{Result, err};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -214,7 +215,7 @@ struct Editor {
     menu_selected: usize,
     iface_selected: usize,
     interfaces: Vec<NetworkInterface>,
-    default_route: Option<String>,
+    egress: route::Ipv4Egress,
     net_pane: usize,
     net_selected: [usize; 3],
     path_pane: usize,
@@ -1070,7 +1071,7 @@ impl Editor {
             })
             .unwrap_or(0);
         self.interfaces = interfaces;
-        self.default_route = lianyaohu_core::route::default_ipv4_interface().unwrap_or(None);
+        self.egress = route::query_ipv4_egress().unwrap_or_default();
     }
 }
 
@@ -1335,12 +1336,10 @@ fn draw_interface(frame: &mut Frame, editor: &Editor, area: Rect) {
     );
 
     let detail: Vec<Line> = match editor.interfaces.get(editor.iface_selected) {
-        Some(interface) => {
-            super::interface_detail_lines(interface, editor.default_route.as_deref())
-                .into_iter()
-                .map(Line::from)
-                .collect()
-        }
+        Some(interface) => super::interface_detail_lines(interface, &editor.egress)
+            .into_iter()
+            .map(Line::from)
+            .collect(),
         None => vec![Line::from("no active VPN interfaces")],
     };
     let title = editor
@@ -1752,7 +1751,7 @@ pub fn run_config_editor(home: &str, xdg: Option<&str>, cwd: &Path) -> Result<()
         menu_selected: 0,
         iface_selected: 0,
         interfaces: Vec::new(),
-        default_route: None,
+        egress: route::Ipv4Egress::default(),
         net_pane: 0,
         net_selected: [0; 3],
         path_pane: 0,
@@ -1830,7 +1829,11 @@ mod tests {
                 ipv4_peer_addresses: vec!["10.7.0.1".to_string()],
                 ipv6_addresses: Vec::new(),
             }],
-            default_route: Some("utun5".to_string()),
+            egress: route::Ipv4Egress {
+                default_interfaces: vec!["utun5".to_string()],
+                low_half: Some("utun5".to_string()),
+                high_half: Some("utun5".to_string()),
+            },
             net_pane: 0,
             net_selected: [0; 3],
             path_pane: 0,
@@ -2287,7 +2290,7 @@ mod tests {
         editor.screen = Screen::Interface;
         let rendered = render(&editor);
         assert!(rendered.contains("utun5 [up]"));
-        assert!(rendered.contains("yes (matches)"));
+        assert!(rendered.contains("yes (carries IPv4 egress)"), "{rendered}");
 
         editor.screen = Screen::Proxy;
         let rendered = render(&editor);

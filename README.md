@@ -63,7 +63,8 @@ lyh --vpn utun5 -- claude
 By default it:
 
 - prompts for a supported VPN interface at startup;
-- requires the default IPv4 route to use the selected VPN interface;
+- requires the selected VPN interface to carry all IPv4 egress (the routes for
+  `0.0.0.0/1` and `128.0.0.0/1` must both resolve to it);
 - on macOS, applies `sandbox-exec` and a PF anchor scoped to the launched
   process group;
 - on Linux, applies a Landlock/seccomp sandbox and iptables/ip6tables OUTPUT

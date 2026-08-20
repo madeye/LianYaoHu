@@ -28,7 +28,7 @@ launcher and the helper, so both sides always render identical rules:
 | Module | Responsibility |
 |---|---|
 | `interfaces` | Enumerate interfaces via `getifaddrs`, collect IPv4/IPv6 and point-to-point peer addresses; supported VPN interfaces are `utun*` on macOS and `tun*`/`wg*` on Linux. |
-| `route` | Ask the platform route tool which interface would carry `1.1.1.1` (`/sbin/route -n get` on macOS, `ip route get` on Linux). |
+| `route` | Query the routing table for where all unbound IPv4 traffic leaves: the unscoped default routes (`netstat -rn -f inet` on macOS, `ip -4 route show default` on Linux) plus the kernel's pick for each half of the address space (`route -n get` / `ip route get` for `0.0.0.1` and `128.0.0.1`). |
 | `policy` | Typed sandbox policy shared by launcher and helper: `SandboxPolicy` (network + path customization), the `DestRule` grammar (`ADDR[/PREFIX][:PORT[-PORT]]`, parsed into `IpAddr`/prefix/port — never free text), the blocked-LAN constants, list caps, and lexical path validation. |
 | `config` | Layered TOML configuration: `ConfigFile` schema (`deny_unknown_fields` throughout), XDG global path + upward `.lianyaohu.toml` discovery, merge with per-key provenance, widening detection/stripping, and the hash-pinned trust store (`trusted.toml`). |
 | `sandbox_profile` | macOS: render the `sandbox-exec` SBPL profile (deny-default; writable access to `$HOME`, `$PWD`, and a per-launch tmpdir; deny raw/system sockets, socket ioctls, inbound, bind, broad sysctl; allow loopback-only bind/inbound, outbound TCP/UDP, and the mDNSResponder socket). Applies the path policy: extra writable/read-only subpaths, narrow-home mode, and user deny rules appended last (seatbelt is last-match-wins). |
@@ -57,8 +57,12 @@ launcher and the helper, so both sides always render identical rules:
 4. Build the default group-scoped firewall rules for helper launches, or the
    current-UID rules when `--shared-user-firewall` is selected. macOS includes
    the utun's point-to-point IPv4 peer (if any) as the PF `route-to` gateway.
-5. Route preflight: refuse to launch unless the default IPv4 route uses the
-   selected VPN interface (unless `--allow-non-default-route`).
+5. Route preflight: refuse to launch unless the selected VPN interface carries
+   all IPv4 egress — the kernel's route for both `0.0.0.0/1` and
+   `128.0.0.0/1` must resolve to it, which covers a plain default route
+   through the tunnel and the split-default ("def1") layout alike, and cannot
+   be satisfied by a host route for a single address (unless
+   `--allow-non-default-route`).
 6. Sanitize the environment (`env_policy::sanitize`).
 7. By default, write a launch spec and ask the helper to install group-scoped
    firewall rules, drop to `uid=caller_uid,gid=_lianyaohu` with the caller's
@@ -175,5 +179,5 @@ The same escape has to defeat several independent mechanisms:
 |---|---|---|
 | Process sandbox | macOS: `sandbox-exec` SBPL profile; Linux: Landlock + seccomp-BPF | raw/system sockets, socket ioctls or kernel APIs, bind/inbound (loopback listeners allowed on macOS), filesystem and sysctl probing |
 | Packet filter | macOS: group-scoped PF anchor; Linux: group-scoped iptables/ip6tables chains | LAN egress, egress on any non-selected interface |
-| Route preflight | default-route check at launch | starting the agent while traffic would bypass the VPN |
+| Route preflight | whole-IPv4-space route check at launch | starting the agent while traffic would bypass the VPN |
 | Environment | `env_policy::sanitize` | host/session identity leaking into the agent process |

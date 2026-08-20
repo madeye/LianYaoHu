@@ -142,7 +142,24 @@ process loads at startup, so they are not accepted from the caller.
 
 The launcher asks the user to choose a supported VPN interface (`utun*` on
 macOS, `tun*` or `wg*` on Linux) and rejects startup unless that interface is
-up, has an address, and is the default IPv4 route.
+up, has an address, and carries all IPv4 egress.
+
+"Carries all IPv4 egress" is checked against the routing table itself, not
+against the route to one sample address: the kernel's chosen interface for
+both halves of the address space (`0.0.0.0/1` and `128.0.0.0/1`) must be the
+selected VPN. That accepts a plain default route through the tunnel and the
+common split-default ("def1") layout — `0.0.0.0/1` + `128.0.0.0/1` pushed
+through the tunnel while the physical default route stays in place — and it
+cannot be satisfied by a host route, so a split-tunnel VPN that only pins its
+own resolver (say a `/32` for `1.1.1.1`) fails the check instead of passing
+it. Interface-scoped default routes (macOS `IFSCOPE`) are ignored, since they
+only apply to sockets already bound to that interface. The launcher also
+reports the unscoped default routes it found, for diagnosis.
+
+Routes more specific than a `/1` can still pin an individual destination to
+another interface (macOS keeps `WASCLONED` per-host routes across a default
+route change, for instance). The preflight does not enumerate those; the
+firewall rules are what stops the agent's own traffic from following them.
 
 When firewall enforcement is enabled, the launcher asks the root helper to run
 the session. The root helper listens on `/var/run/lianyaohu-helper.sock`,
@@ -343,10 +360,10 @@ existing HTTP/SOCKS proxy, an `ssh -D` tunnel — can relay the agent's traffic
 outward under its own UID, outside the owner-scoped rules.
 
 In the default configuration this is not a leak through the routing table —
-the launcher refuses to start unless the selected VPN is already the default
-IPv4 route, so resolver queries that follow that table traverse the same
-tunnel. The confinement of DNS therefore depends on that default-route
-invariant, and on the resolver actually using it:
+the launcher refuses to start unless the selected VPN already carries all IPv4
+egress (see [Network](#network)), so resolver queries that follow that table
+traverse the same tunnel. The confinement of DNS therefore depends on that
+routing invariant, and on the resolver actually using it:
 
 - On Linux, systemd-resolved can be configured with **per-link DNS servers**
   bound to a physical NIC (common with DHCP-provided resolvers). Those
@@ -361,11 +378,17 @@ invariant, and on the resolver actually using it:
 - On Linux with `--allow-non-default-route`, neither DNS nor other traffic is
   route-steered by LianYaoHu; the firewall can block non-selected egress, but it
   cannot make another interface carry the default route.
-- If the system default route changes while the agent runs, DNS can leave the
-  tunnel even though the agent's sockets remain pinned.
-- Only the default **IPv4** route is probed. If the system also has an IPv6
+- If the routing table changes while the agent runs, DNS can leave the
+  tunnel even though the agent's sockets remain pinned. The preflight is a
+  check at launch, not a monitor.
+- A route more specific than a `/1` — a stale macOS `WASCLONED` per-host route
+  on `en0`, or a resolver address a split-tunnel VPN pins elsewhere — can
+  still carry the system resolver's queries for that one destination out of
+  the tunnel. The preflight cannot enumerate every such route; only the
+  agent's own traffic is covered, by the firewall rules.
+- Only **IPv4** routing is checked. If the system also has an IPv6
   default route on a physical interface, RDNSS-learned resolvers and AAAA
-  transport can leave over it even when the IPv4 default is the tunnel;
+  transport can leave over it even when IPv4 egress is the tunnel;
   IPv6 confinement of the system resolver is out of scope.
 
 ## Configuration Trust

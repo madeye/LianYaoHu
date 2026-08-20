@@ -57,7 +57,10 @@ lyh --vpn utun5 -- claude
 By default it:
 
 - prompts for a supported VPN interface at startup;
-- requires the default IPv4 route to use the selected VPN interface;
+- requires the selected VPN interface to carry all IPv4 egress — both halves
+  of the address space (`0.0.0.0/1` and `128.0.0.0/1`), so a plain default
+  route through the tunnel and the common split-default ("def1") layout both
+  pass, while a physical default route does not;
 - on macOS, applies `sandbox-exec` and a PF anchor scoped to the launched
   process group;
 - on Linux, applies a Landlock/seccomp sandbox and iptables/ip6tables OUTPUT
@@ -224,7 +227,7 @@ options:
   --narrow-home               Writable $HOME becomes agent state dirs only.
   --no-firewall               Do not install the firewall guard. Alias: --no-pf.
   --shared-user-firewall      Use current-UID firewall rules. Alias: --shared-user-pf.
-  --allow-non-default-route   Do not require the default route to use the selected VPN.
+  --allow-non-default-route   Do not require the selected VPN to carry all IPv4 egress.
   --helper-status             Query the root firewall helper status for this user.
   --print-profile             Print the generated sandbox profile/summary and exit.
   --print-firewall            Print generated firewall rules and exit. Alias: --print-pf.
