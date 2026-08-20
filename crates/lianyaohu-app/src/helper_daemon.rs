@@ -521,8 +521,9 @@ struct PeerCredentials {
 /// untrusted — any local user can connect to the helper socket — so the
 /// sandbox policy roots are derived server-side: the home directory comes
 /// from the passwd database for the authenticated peer UID, cwd/tmpdir must
-/// be real directories (tmpdir owned by the caller), the environment is
-/// re-sanitized with the same policy the client claims to have applied, and
+/// be real caller-owned directories outside every foreign home, the
+/// environment is re-sanitized with the same policy the client claims to
+/// have applied, and
 /// the sandbox policy is re-validated field by field (widenings need caller
 /// ownership; see validate_policy). The client's sandbox_profile text is
 /// ignored entirely.
@@ -537,6 +538,21 @@ struct ValidatedLaunch {
 }
 
 fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
+    let home = home_directory_for_uid(uid)?;
+    let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
+    let home_roots = home_directory_roots();
+    validate_launch_against_homes(spec, uid, &home, &home_roots)
+}
+
+/// The body of `validate_launch` with the caller's home and the host's home
+/// roots injected, so tests can exercise the foreign-home rejections against a
+/// synthetic layout instead of the machine's real passwd database.
+fn validate_launch_against_homes(
+    spec: &LaunchSpec,
+    uid: u32,
+    home: &str,
+    home_roots: &[HomeRoot],
+) -> Result<ValidatedLaunch> {
     spec.validate()?;
     // The command is exec'd through option-parsing wrappers (sandbox-exec on
     // macOS). The `--` separator in run_launch_spec is the primary guard;
@@ -551,27 +567,40 @@ fn validate_launch(spec: &LaunchSpec, uid: u32) -> Result<ValidatedLaunch> {
             "launch spec executable {executable:?} must not be empty or start with '-'"
         )));
     }
-    let home = home_directory_for_uid(uid)?;
-    let home = validated_directory("home directory", Path::new(&home), Some(uid))?;
-    let home_roots = home_directory_roots();
-    let cwd = validated_cwd(Path::new(&spec.cwd), uid, &home, &home_roots)?;
+    let cwd = validated_writable_root(
+        "working directory",
+        Path::new(&spec.cwd),
+        uid,
+        home,
+        home_roots,
+    )?;
     let tmpdir = spec
         .environment
         .get("TMPDIR")
         .ok_or_else(|| err("launch environment is missing TMPDIR"))?;
-    let tmpdir = validated_directory("temporary directory", Path::new(tmpdir), Some(uid))?;
-    let policy = validate_policy(spec.policy.as_ref(), uid, &home, &home_roots)?;
+    // The tmpdir is a read+write grant on both platforms, so it gets the same
+    // foreign-home treatment as the cwd: a caller who owns an ancestor of
+    // another user's home must not be able to route that home into the
+    // sandbox through TMPDIR.
+    let tmpdir = validated_writable_root(
+        "temporary directory",
+        Path::new(tmpdir),
+        uid,
+        home,
+        home_roots,
+    )?;
+    let policy = validate_policy(spec.policy.as_ref(), uid, home, home_roots)?;
 
     // Treat the entire client environment as untrusted extras: privacy and
     // injection blocklists apply, and the sandbox roots are pinned to the
     // values validated above.
     let environment =
-        env_policy::sanitize(&BTreeMap::new(), &home, &cwd, &tmpdir, &spec.environment);
+        env_policy::sanitize(&BTreeMap::new(), home, &cwd, &tmpdir, &spec.environment);
 
     Ok(ValidatedLaunch {
         command: spec.command.clone(),
         cwd,
-        home,
+        home: home.to_string(),
         tmpdir,
         environment,
         policy,
@@ -775,9 +804,10 @@ impl ForeignHomeConflict {
 /// Detects a grant that reaches into — or wholly contains — a home-directory
 /// tree that is not the caller's own. Both directions matter: a grant at or
 /// below a foreign home reads part of it, and a grant ABOVE a home root
-/// (`/export/home`, macOS `/System/Volumes/Data`) reads every home below it
-/// just the same, because read-only extras render as recursive subpath
-/// allows with no counter-deny. The contains direction only counts roots
+/// (`/export/home`, macOS `/System/Volumes/Data`) reaches every home below it
+/// just the same, because every grant checked here — read-only extras, the
+/// cwd, the tmpdir, and extra writable paths — renders as a recursive subpath
+/// allow with no counter-deny. The contains direction only counts roots
 /// that are plausibly real user homes (`user_home`), so a system service
 /// account homed under `/Library` or `/var` does not make those system
 /// prefixes ungrantable; the descent direction applies to every root.
@@ -806,8 +836,8 @@ fn foreign_home_conflict(
 /// tightenings (deny entries, narrow-home state dirs) only need grammar and
 /// containment checks — worst case the client restricts itself. Widenings are
 /// held to the same standard as the launch roots: canonicalized against the
-/// real filesystem, and extra writable paths must be owned by the caller and
-/// outside system prefixes.
+/// real filesystem, and extra writable paths must be owned by the caller,
+/// outside system prefixes, and outside every other user's home.
 fn validate_policy(
     spec_policy: Option<&SandboxPolicy>,
     uid: u32,
@@ -823,7 +853,18 @@ fn validate_policy(
 
     let mut writable = Vec::new();
     for entry in &policy.paths.writable {
-        let canonical = validated_directory("extra writable path", Path::new(entry), Some(uid))?;
+        // Owner check plus the same foreign-home containment the read-only
+        // extras get: ownership alone still lets a caller who owns an
+        // ANCESTOR of another user's home (nonstandard `/export/home`
+        // layouts) hand that home to the sandbox — and here with write
+        // access, not just read.
+        let canonical = validated_writable_root(
+            "extra writable path",
+            Path::new(entry),
+            uid,
+            caller_home,
+            home_roots,
+        )?;
         if WRITABLE_SYSTEM_DENYLIST
             .iter()
             .any(|prefix| path_has_prefix(&canonical, prefix))
@@ -920,30 +961,39 @@ fn validated_state_dir(entry: &str, uid: u32, caller_home: &str) -> Result<Strin
     Ok(entry.to_string())
 }
 
-/// Validates the client-supplied working directory. The cwd is rendered as a
-/// read+write grant on both platforms, so it is held to the same standard as
-/// the other widenings: it must be owned by the caller — otherwise
-/// `cwd = /Users/<other>` would hand the sandbox another user's home tree,
-/// sidestepping every check on the policy path fields — and it may not reach
-/// into or contain another user's home. The ownership requirement means a
-/// launch from a shared workdir owned by a different account is refused;
-/// launch from a directory you own instead (the sandbox never grants more
-/// than the caller's own DAC access anyway, but the helper does not hand out
-/// grants over trees the caller does not own).
-fn validated_cwd(
+/// Validates a client-supplied directory that renders as a recursive
+/// read+write grant: the working directory, the per-launch tmpdir, and every
+/// extra writable path. All three are held to the same standard as the other
+/// widenings.
+///
+/// It must be owned by the caller — otherwise `cwd = /Users/<other>` would
+/// hand the sandbox another user's home tree, sidestepping every check on the
+/// policy path fields. The ownership requirement means a launch from a shared
+/// workdir owned by a different account is refused; launch from a directory
+/// you own instead (the sandbox never grants more than the caller's own DAC
+/// access anyway, but the helper does not hand out grants over trees the
+/// caller does not own).
+///
+/// Ownership alone is not enough: a caller who owns an ANCESTOR of another
+/// user's home — the nonstandard `/export/home`-style layouts this helper
+/// supports — could otherwise route that home into the sandbox through the
+/// ancestor. So the grant must also neither reach into nor contain another
+/// user's home, exactly the check the read-only extras get.
+fn validated_writable_root(
+    what: &str,
     path: &Path,
     uid: u32,
     caller_home: &str,
     home_roots: &[HomeRoot],
 ) -> Result<String> {
-    let cwd = validated_directory("working directory", path, Some(uid))?;
-    if let Some(conflict) = foreign_home_conflict(&cwd, caller_home, home_roots) {
+    let canonical = validated_directory(what, path, Some(uid))?;
+    if let Some(conflict) = foreign_home_conflict(&canonical, caller_home, home_roots) {
         return Err(err(format!(
-            "working directory {cwd} {} another user's home directory",
+            "{what} {canonical} {} another user's home directory",
             conflict.description()
         )));
     }
-    Ok(cwd)
+    Ok(canonical)
 }
 
 fn validated_directory(what: &str, path: &Path, required_owner: Option<u32>) -> Result<String> {
@@ -2500,16 +2550,111 @@ mod tests {
         fs::create_dir_all(alice.join("project")).unwrap();
         let roots = user_home_roots(&[alice.to_str().unwrap()]);
 
+        let cwd = |path: &Path| {
+            validated_writable_root("working directory", path, uid, caller_home, &roots)
+        };
+
         // A caller-owned directory outside anyone's home is accepted.
-        assert!(validated_cwd(&caller_home_dir, uid, caller_home, &roots).is_ok());
+        assert!(cwd(&caller_home_dir).is_ok());
         // Inside another user's home: rejected even when caller-owned.
-        let error = validated_cwd(&alice.join("project"), uid, caller_home, &roots).unwrap_err();
+        let error = cwd(&alice.join("project")).unwrap_err();
         assert!(error.to_string().contains("another user's home"), "{error}");
         // Containing another user's home: rejected.
-        assert!(validated_cwd(&base.join("homes"), uid, caller_home, &roots).is_err());
+        assert!(cwd(&base.join("homes")).is_err());
         // Not owned by the caller: rejected (root-owned /usr).
-        let error = validated_cwd(Path::new("/usr"), uid, caller_home, &roots).unwrap_err();
+        let error = cwd(Path::new("/usr")).unwrap_err();
         assert!(error.to_string().contains("not owned by uid"), "{error}");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // Extra writable paths render as recursive read+write grants, so the
+    // foreign-home containment check applies there too: owning an ANCESTOR of
+    // another user's home (the `/export/home` layouts the docs advertise) must
+    // not let a caller hand that home to the sandbox.
+    #[test]
+    fn writable_extras_are_rejected_inside_or_above_foreign_homes() {
+        let uid = unsafe { libc::getuid() };
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home_dir = base.join("me");
+        fs::create_dir_all(&caller_home_dir).unwrap();
+        let caller_home = caller_home_dir.to_str().unwrap();
+        let alice = base.join("export/home/alice");
+        fs::create_dir_all(alice.join("docs")).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        let validate = |writable: &Path| {
+            let mut policy = SandboxPolicy::default();
+            policy.paths.writable = vec![writable.to_string_lossy().into_owned()];
+            validate_policy(Some(&policy), uid, caller_home, &roots)
+        };
+
+        // The caller's own tree stays writable.
+        assert!(validate(&caller_home_dir).is_ok());
+        // Inside another user's home: rejected even though the caller owns it.
+        let error = validate(&alice.join("docs")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is inside another user's home directory"),
+            "{error}"
+        );
+        // An owned ancestor of another user's home: rejected as well.
+        let error = validate(&base.join("export/home")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contains another user's home directory"),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    // TMPDIR is a read+write grant as well, and the client supplies it, so it
+    // gets the same containment check as the cwd and the writable extras.
+    #[test]
+    fn tmpdir_is_rejected_inside_or_above_foreign_homes() {
+        let uid = unsafe { libc::getuid() };
+        let base = owned_tmpdir().canonicalize().unwrap();
+        let caller_home_dir = base.join("me");
+        fs::create_dir_all(&caller_home_dir).unwrap();
+        let caller_home = caller_home_dir.to_str().unwrap();
+        let alice = base.join("export/home/alice");
+        fs::create_dir_all(alice.join("tmp")).unwrap();
+        let roots = user_home_roots(&[alice.to_str().unwrap()]);
+
+        let validate = |tmpdir: &Path| {
+            let mut spec = base_spec(tmpdir);
+            spec.cwd = caller_home.to_string();
+            validate_launch_against_homes(&spec, uid, caller_home, &roots)
+        };
+
+        // A tmpdir the caller owns outside every foreign home still works.
+        fs::create_dir_all(caller_home_dir.join("tmp-ok")).unwrap();
+        let launch = validate(&caller_home_dir.join("tmp-ok")).unwrap();
+        assert_eq!(
+            launch.environment.get("TMPDIR").map(String::as_str),
+            caller_home_dir.join("tmp-ok").to_str()
+        );
+
+        // Inside another user's home: rejected even when caller-owned.
+        let error = validate(&alice.join("tmp")).unwrap_err();
+        assert!(
+            error.to_string().contains("temporary directory")
+                && error
+                    .to_string()
+                    .contains("is inside another user's home directory"),
+            "{error}"
+        );
+        // An owned ancestor of another user's home: rejected as well.
+        let error = validate(&base.join("export/home")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contains another user's home directory"),
+            "{error}"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
