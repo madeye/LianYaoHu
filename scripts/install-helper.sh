@@ -98,6 +98,9 @@ sudo install -m 755 "$ROOT/scripts/uninstall-helper.sh" "$UNINSTALL_HELPER"
 # Remove the split-binary helper from installs that predate the merged binary.
 sudo rm -f /usr/local/libexec/lianyaohu-helper
 
+# The redirect is meant to be performed by this unprivileged shell into a temp
+# file we own; only the directory read needs sudo.
+# shellcheck disable=SC2024
 if sudo dscl . -read "/Groups/${GROUP_NAME}" PrimaryGroupID >"$tmp_group" 2>/dev/null; then
   existing_gid="$(awk '/PrimaryGroupID:/ {print $2; exit}' "$tmp_group")"
   if [[ "$existing_gid" != "$GROUP_GID" ]]; then

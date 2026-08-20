@@ -18,7 +18,10 @@
 #
 # Environment overrides: LIANYAOHU_BIN_DIR, LIANYAOHU_REPO (default
 # madeye/LianYaoHu), LIANYAOHU_REF (tag for the helper teardown script,
-# default: the latest release tag; setting it forces the remote fetch).
+# default: the latest release tag; setting it forces the remote fetch),
+# LIANYAOHU_LOCAL_TEARDOWN (path to the teardown script a package installed;
+# for tests and staged installs — it grants no privilege the caller does not
+# already have, since anyone who can set it can also set LIANYAOHU_REPO/REF).
 set -euo pipefail
 
 REPO="${LIANYAOHU_REPO:-madeye/LianYaoHu}"
@@ -30,7 +33,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --bin-dir) BIN_DIR="${2:?--bin-dir requires a path}"; shift 2 ;;
     --keep-helper) REMOVE_HELPER=0; shift ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 64 ;;
   esac
 done
@@ -39,7 +42,7 @@ die() { echo "uninstall: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 have curl || die "curl is required"
 
-LOCAL_TEARDOWN="/usr/local/libexec/lianyaohu-uninstall-helper.sh"
+LOCAL_TEARDOWN="${LIANYAOHU_LOCAL_TEARDOWN:-/usr/local/libexec/lianyaohu-uninstall-helper.sh}"
 
 as_root() {
   if [[ -w "$BIN_DIR" ]]; then

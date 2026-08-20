@@ -9,6 +9,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -31,3 +34,73 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  # The installer, the uninstaller and the release tag guard are shell, and
+  # they carry security-enforcing branches (signature verification, pinned
+  # teardown fetches, the tag-only release guard). Lint and test them like code.
+  shell-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+      - name: Lint shell scripts (bash -n + shellcheck)
+        run: scripts/lint-shell.sh --require-shellcheck
+      - name: Lint workflows (actionlint)
+        # actionlint also runs shellcheck over every `run:` block.
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+
+  shell-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Runs against stubs and temporary directories only: nothing is installed
+      # and no network call is made.
+      - name: Shell script tests
+        run: scripts/tests/run.sh
+
+  # Sign a fixture blob with the same pinned cosign the release workflow uses,
+  # publish it as an artifact, download it in a separate job and verify it.
+  # Fork pull requests get no OIDC token, so the round trip is skipped there.
+  sigstore-sign:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: Sign the fixture blob
+        run: scripts/tests/sigstore-roundtrip.sh sign roundtrip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sigstore-roundtrip
+          path: roundtrip/
+          if-no-files-found: error
+
+  sigstore-verify:
+    needs: sigstore-sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: sigstore-roundtrip
+          path: roundtrip
+      - name: Verify the downloaded bundle
+        run: scripts/tests/sigstore-roundtrip.sh verify roundtrip
